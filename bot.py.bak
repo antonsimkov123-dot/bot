@@ -1,0 +1,438 @@
+import sqlite3
+
+# === SQLite ===
+def init_db():
+    conn = sqlite3.connect("trades.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            trade_type TEXT,
+            symbol TEXT,
+            entry_price REAL,
+            stop_loss REAL,
+            targets TEXT,
+            percent REAL,
+            entry_date TEXT,
+            exit_price REAL,
+            pnl REAL,
+            profit_percent REAL
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+init_db()
+
+import matplotlib.pyplot as plt
+import pandas as pd
+from collections import defaultdict
+import statistics
+
+import asyncio
+import logging
+from aiogram import Bot, Dispatcher, types
+from aiogram.filters import CommandStart
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+TOKEN = os.getenv("TOKEN")
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=TOKEN)
+dp = Dispatcher()
+
+class TradeState(StatesGroup):
+    confirming = State()
+    choosing_type = State()
+    entering_entry = State()
+    entering_stop = State()
+    entering_target = State()
+    entering_percent = State()
+    entering_date = State()
+
+# Временное хранилище
+user_data = {}
+
+@dp.message(CommandStart())
+async def start(message: types.Message, state: FSMContext):
+    await message.answer("Привет! Добро пожаловать в трейдинг-бота MORI.")
+
+Что хочешь сделать?",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                             [InlineKeyboardButton(text="➕ Добавить сделку", callback_data="add_trade")],
+                             [InlineKeyboardButton(text="✅ Закрыть сделку", callback_data="close_trade")],
+                             [InlineKeyboardButton(text="📊 Отчёты", callback_data="reports")],
+                             [InlineKeyboardButton(text="📈 Графики", callback_data="charts")],
+                             [InlineKeyboardButton(text="📤 Выгрузить сделки", callback_data="export_csv")],
+                         ]))
+
+@dp.callback_query(lambda c: c.data == "add_trade")
+async def process_add_trade(callback_query: types.CallbackQuery, state: FSMContext):
+    await state.set_state(TradeState.choosing_type)
+    await bot.send_message(callback_query.from_user.id, "Выберите тип сделки:",
+                           reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                               [InlineKeyboardButton(text="🟩 Long", callback_data="long")],
+                               [InlineKeyboardButton(text="🟥 Short", callback_data="short")]
+                           ]))
+
+@dp.callback_query(lambda c: c.data in ["long", "short"])
+async def process_trade_type(callback_query: types.CallbackQuery, state: FSMContext):
+    trade_type = callback_query.data
+    await state.update_data(trade_type=trade_type)
+    await state.set_state(TradeState.entering_entry)
+    await bot.send_message(callback_query.from_user.id, f"Выбран тип: {trade_type.upper()}
+Введите цену входа:")
+
+@dp.message(TradeState.entering_entry)
+async def process_entry_price(message: types.Message, state: FSMContext):
+    await state.update_data(entry_price=message.text)
+    await state.set_state(TradeState.entering_stop)
+    await message.answer("Теперь укажи стоп-лосс:")
+
+@dp.message(TradeState.entering_stop)
+async def process_stop_loss(message: types.Message, state: FSMContext):
+    await state.update_data(stop_loss=message.text)
+    await state.set_state(TradeState.entering_target)
+    await message.answer("Теперь цель (тейк-профит):")
+
+
+
+@dp.message(TradeState.entering_target)
+async def process_target(message: types.Message, state: FSMContext):
+    raw_targets = message.text
+    targets = [t.strip() for t in raw_targets.split(",") if t.strip()]
+    if not targets:
+        await message.answer("Пожалуйста, укажи хотя бы одну цель. Можно в формате: 0.75, 0.9, 1.2")
+        return
+    await state.update_data(targets=targets)
+    await state.set_state(TradeState.entering_percent)
+
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="5%"), KeyboardButton(text="10%")],
+            [KeyboardButton(text="15%"), KeyboardButton(text="Свое значение")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    await message.answer("Укажи процент от депозита, который используешь:", reply_markup=keyboard)
+
+@dp.message(TradeState.entering_percent)
+async def process_percent(message: types.Message, state: FSMContext):
+    percent = message.text
+    if percent == "Свое значение":
+        await message.answer("Введи своё значение % вручную:")
+        return
+    await state.update_data(percent=percent)
+    await state.set_state(TradeState.entering_date)
+    await message.answer("Дата входа? (например: 2025-08-01):", reply_markup=types.ReplyKeyboardRemove())
+
+@dp.message(TradeState.entering_percent)
+async def process_percent(message: types.Message, state: FSMContext):
+    percent = message.text
+    if percent == "Свое значение":
+        await message.answer("Введи своё значение % вручную:")
+        return
+    await state.update_data(percent=percent)
+    await state.set_state(TradeState.entering_date)
+
+    keyboard = ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="📅 Сегодня"), KeyboardButton(text="📆 Вчера")],
+            [KeyboardButton(text="✍️ Указать вручную")]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+    await message.answer("Выбери дату входа:", reply_markup=keyboard)
+
+@dp.message(TradeState.entering_date)
+async def process_date(message: types.Message, state: FSMContext):
+    text = message.text.strip()
+    if text == "📅 Сегодня":
+        date_str = datetime.now().strftime("%Y-%m-%d")
+    elif text == "📆 Вчера":
+        date_str = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+    elif text == "✍️ Указать вручную":
+        await message.answer("Введи дату вручную в формате YYYY-MM-DD:", reply_markup=types.ReplyKeyboardRemove())
+        return
+    else:
+        # Ручной ввод
+        date_str = text
+
+    
+    await state.update_data(date=date_str)
+    data = await state.get_data()
+    trade_text = (
+        f"📌 Проверь сделку:
+"
+        f"Тип: {data['trade_type'].upper()}
+"
+        f"Вход: {data['entry_price']}
+"
+        f"Стоп: {data['stop_loss']}
+"
+        f"Цели: {", ".join(data['targets'])}
+"
+        f"Доля от депо: {data.get('percent', '—')}
+"
+        f"Дата: {data['date']}"
+    )
+    keyboard = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_trade")],
+        [InlineKeyboardButton(text="🔁 Изменить", callback_data="edit_trade")]
+    ])
+    await message.answer(trade_text, reply_markup=keyboard)
+    await state.set_state(TradeState.confirming)
+
+
+async def process_target(message: types.Message, state: FSMContext):
+    await state.update_data(target=message.text)
+    await state.set_state(TradeState.entering_date)
+    await message.answer("Дата входа? (например: 2025-08-01):")
+
+@dp.message(TradeState.entering_date)
+async def process_date(message: types.Message, state: FSMContext):
+    await state.update_data(date=message.text)
+    data = await state.get_data()
+    trade_text = (
+        f"📌 Сделка добавлена:
+"
+        f"Тип: {data['trade_type'].upper()}
+"
+        f"Вход: {data['entry_price']}
+"
+        f"Стоп: {data['stop_loss']}
+"
+        f"Цель: {data['target']}
+"
+        f"Дата: {data['date']}"
+    )
+    await message.answer(trade_text)
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data == "reports")
+async def show_reports(callback_query: types.CallbackQuery):
+    user_id = callback_query.from_user.id
+    conn = sqlite3.connect("trades.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT symbol, pnl, entry_date FROM trades WHERE user_id = ? AND exit_price IS NOT NULL", (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        await bot.send_message(user_id, "Нет завершённых сделок для отчёта.")
+        return
+
+    from collections import defaultdict
+    import statistics
+    from datetime import datetime, timedelta
+
+    now = datetime.now()
+    week_ago = now - timedelta(days=7)
+    month_ago = now - timedelta(days=30)
+
+    pnl_week = []
+    pnl_month = []
+    win = 0
+    loss = 0
+    coin_stats = defaultdict(list)
+
+    for symbol, pnl, date_str in rows:
+        try:
+            date = datetime.strptime(date_str, "%Y-%m-%d")
+        except:
+            continue
+        if date >= week_ago:
+            pnl_week.append(pnl)
+        if date >= month_ago:
+            pnl_month.append(pnl)
+
+        if pnl > 0:
+            win += 1
+        else:
+            loss += 1
+
+        coin_stats[symbol].append(pnl)
+
+    week_total = sum(pnl_week)
+    month_total = sum(pnl_month)
+
+    best = max(coin_stats.items(), key=lambda x: statistics.mean(x[1])) if coin_stats else ("—", [0])
+    worst = min(coin_stats.items(), key=lambda x: statistics.mean(x[1])) if coin_stats else ("—", [0])
+
+    report = (
+        f"📅 За неделю: {week_total:+.2f}%
+"
+        f"📅 За месяц: {month_total:+.2f}%
+"
+        f"✅ Побед: {win} | ❌ Убытков: {loss}
+"
+        f"🏆 Лучший коин: {best[0]} ({statistics.mean(best[1]):+.1f}%)
+"
+        f"🚨 Худший коин: {worst[0]} ({statistics.mean(worst[1]):+.1f}%)"
+    )
+    await bot.send_message(user_id, report)
+
+@dp.callback_query(lambda c: c.data == "charts")
+async def show_charts(callback_query: types.CallbackQuery):
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    user_id = callback_query.from_user.id
+    conn = sqlite3.connect("trades.db")
+    df = pd.read_sql_query(
+        "SELECT trade_type, pnl, entry_date FROM trades WHERE user_id = ? AND exit_price IS NOT NULL",
+        conn,
+        params=(user_id,)
+    )
+    conn.close()
+
+    if df.empty:
+        await bot.send_message(user_id, "Нет завершённых сделок для анализа.")
+        return
+
+    df["entry_date"] = pd.to_datetime(df["entry_date"], errors="coerce")
+    df = df.dropna(subset=["entry_date", "pnl"])
+    df["week"] = df["entry_date"].dt.to_period("W").astype(str)
+
+    # График 1: PNL по неделям
+    weekly_pnl = df.groupby("week")["pnl"].sum()
+    fig1, ax1 = plt.subplots()
+    weekly_pnl.plot(kind="bar", ax=ax1)
+    ax1.set_title("📊 PNL по неделям")
+    ax1.set_ylabel("% прибыли")
+    fig1.tight_layout()
+    path1 = "/mnt/data/sql_pnl_weekly.png"
+    fig1.savefig(path1)
+    plt.close(fig1)
+
+    # График 2: Частота стопов
+    df["is_loss"] = df["pnl"] < 0
+    stop_freq = df["is_loss"].value_counts()
+    fig2, ax2 = plt.subplots()
+    stop_freq.plot(kind="bar", ax=ax2)
+    ax2.set_title("⚠️ Частота стопов")
+    ax2.set_xticklabels(["Прибыль", "Убыток"], rotation=0)
+    fig2.tight_layout()
+    path2 = "/mnt/data/sql_stop_freq.png"
+    fig2.savefig(path2)
+    plt.close(fig2)
+
+    # График 3: Винрейт по типу сделки
+    win_by_type = df[df["pnl"] > 0].groupby("trade_type").size()
+    total_by_type = df.groupby("trade_type").size()
+    winrate = (win_by_type / total_by_type * 100).fillna(0)
+    fig3, ax3 = plt.subplots()
+    winrate.plot(kind="bar", ax=ax3)
+    ax3.set_title("🏆 Винрейт по типу сделки")
+    ax3.set_ylabel("% побед")
+    fig3.tight_layout()
+    path3 = "/mnt/data/sql_winrate_type.png"
+    fig3.savefig(path3)
+    plt.close(fig3)
+
+    await bot.send_photo(user_id, photo=types.FSInputFile(path1), caption="📊 PNL по неделям")
+    await bot.send_photo(user_id, photo=types.FSInputFile(path2), caption="⚠️ Частота стопов")
+    await bot.send_photo(user_id, photo=types.FSInputFile(path3), caption="🏆 Винрейт по типу сделки")
+
+        await bot.send_photo(user_id, photo=types.FSInputFile(path3), caption="🏆 Винрейт по типу сделки")
+
+    await bot.send_photo(user_id, photo=types.FSInputFile(path1), caption="📊 PNL по неделям")
+    await bot.send_photo(user_id, photo=types.FSInputFile(path2), caption="⚠️ Частота стопов")
+
+class CloseTradeState(StatesGroup):
+    choosing_trade = State()
+    entering_exit_price = State()
+
+@dp.callback_query(lambda c: c.data == "close_trade")
+async def start_close_trade(callback_query: types.CallbackQuery, state: FSMContext):
+    user_id = callback_query.from_user.id
+    conn = sqlite3.connect("trades.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, trade_type, entry_price, symbol FROM trades WHERE user_id = ? AND exit_price IS NULL", (user_id,))
+    rows = cursor.fetchall()
+    conn.close()
+
+    if not rows:
+        await bot.send_message(user_id, "❌ У тебя нет активных сделок.")
+        return
+
+    buttons = []
+    for row in rows:
+        trade_id, trade_type, entry_price, symbol = row
+        label = f"{trade_type.upper()} {symbol} @ {entry_price}"
+        buttons.append([InlineKeyboardButton(text=label, callback_data=f"choose_trade_{trade_id}")])
+    markup = InlineKeyboardMarkup(inline_keyboard=buttons)
+    await bot.send_message(user_id, "Выбери сделку для закрытия:", reply_markup=markup)
+    await state.set_state(CloseTradeState.choosing_trade)
+
+@dp.callback_query(lambda c: c.data.startswith("choose_trade_"))
+async def choose_trade_db(callback_query: types.CallbackQuery, state: FSMContext):
+    trade_id = int(callback_query.data.split("_")[-1])
+    await state.update_data(trade_id=trade_id)
+    await state.set_state(CloseTradeState.entering_exit_price)
+    await bot.send_message(callback_query.from_user.id, "Введи цену выхода:")
+
+@dp.message(CloseTradeState.entering_exit_price)
+async def enter_exit_db(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    trade_id = data["trade_id"]
+    exit_price = float(message.text.replace(",", "."))
+
+    conn = sqlite3.connect("trades.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT entry_price, trade_type, percent FROM trades WHERE id = ?", (trade_id,))
+    row = cursor.fetchone()
+    if not row:
+        await message.answer("❌ Сделка не найдена.")
+        return
+    entry_price, trade_type, percent = row
+    pnl = ((exit_price - entry_price) / entry_price) * (100 if trade_type == "long" else -100)
+    profit = round(pnl * percent / 100, 2)
+
+    cursor.execute(
+        "UPDATE trades SET exit_price = ?, pnl = ?, profit_percent = ? WHERE id = ?",
+        (exit_price, pnl, profit, trade_id)
+    )
+    conn.commit()
+    conn.close()
+
+    await message.answer(
+        f"📉 Сделка закрыта
+"
+        f"Тип: {trade_type.upper()}
+"
+        f"Вход: {entry_price} → Выход: {exit_price}
+"
+        f"PNL: {'+' if pnl > 0 else ''}{pnl:.2f}%
+"
+        f"📊 Прибыль по {percent}% от депо: {profit}%"
+    )
+    await state.clear()
+
+@dp.callback_query(lambda c: c.data == "export_csv")
+async def export_csv(callback_query: types.CallbackQuery):
+    import pandas as pd
+
+    user_id = callback_query.from_user.id
+    conn = sqlite3.connect("trades.db")
+    df = pd.read_sql_query("SELECT * FROM trades WHERE user_id = ?", conn, params=(user_id,))
+    conn.close()
+
+    if df.empty:
+        await bot.send_message(user_id, "Нет данных для экспорта.")
+        return
+
+    file_path = f"/mnt/data/trades_{user_id}.csv"
+    df.to_csv(file_path, index=False)
+
+    await bot.send_document(user_id, document=types.FSInputFile(file_path), caption="📤 Вот твоя выгрузка всех сделок.")
