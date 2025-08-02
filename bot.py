@@ -44,8 +44,10 @@ def init_db() -> None:
             exit_date TEXT,
             pnl REAL,
             profit_percent REAL,
-            comment TEXT
-            
+            comment TEXT,
+            signals TEXT,
+            signal_stars INTEGER
+
         )
         """
     )
@@ -78,6 +80,12 @@ def add_missing_columns() -> None:
             conn.commit()
         if "risk_percent" not in columns:
             cur.execute("ALTER TABLE trades ADD COLUMN risk_percent REAL")
+            conn.commit()
+        if "signals" not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN signals TEXT")
+            conn.commit()
+        if "signal_stars" not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN signal_stars INTEGER")
             conn.commit()
 
         cur.execute("PRAGMA table_info(reminders)")
@@ -127,8 +135,9 @@ class TradeState(StatesGroup):
     entering_percent = State()
     choosing_date = State()
     entering_date_manual = State()
-    confirming = State()
     entering_comment = State()
+    choosing_signals = State()
+    confirming = State()
     
 
 class CloseTradeState(StatesGroup):
@@ -196,6 +205,49 @@ def describe_reminder(t: str, period: int, next_run: str) -> str:
         "воскресеньям",
     ]
     return f"По {names[weekday]} в {t}"
+
+
+# ---------- SIGNALS ----------
+SIGNAL_OPTIONS = [
+    ("Закреп 2–3 свечей", 6),
+    ("Дивергенция RSI или MACD на дневке", 6),
+    ("Поглощение на дневке", 5),
+    ("0.618 FIBO (пробой/отработка)", 5),
+    ("Пробой канала или трендовой", 5),
+    ("Ретест пробитого уровня на объёмах", 5),
+    ("MACD пересекает сигнальную / 0", 3),
+    ("Рост объёмов", 3),
+    ("Поддержка от мувингов (50/200)", 2),
+    ("Боллинджер: выход за границу", 2),
+    ("Формация ГиП / инверсная", 2),
+    ("Сигналы только на 1H", 1),
+    ("Мелкая дивергенция RSI на 1H", 1),
+    ("Стагнация объёмов", 1),
+    ("Локальные уровни без объёма", 1),
+]
+
+SIGNALS_TEXT = (
+    "📍 Укажи сигналы, по которым ты входишь в сделку.\n"
+    "🔻 Нажимай по одному, сколько нужно.\n\n"
+    "🔥 Очень важные (★★★★★ и ★★★★):\n"
+    "• Закреп 2–3 свечей — ★★★★★★\n"
+    "• Дивергенция RSI или MACD на дневке — ★★★★★★\n"
+    "• Поглощение на дневке — ★★★★★\n"
+    "• 0.618 FIBO (пробой/отработка) — ★★★★★\n"
+    "• Пробой канала или трендовой — ★★★★★\n"
+    "• Ретест пробитого уровня на объёмах — ★★★★★\n\n"
+    "🟡 Средние (★★★ и ★★):\n"
+    "• MACD пересекает сигнальную / 0 — ★★★\n"
+    "• Рост объёмов — ★★★\n"
+    "• Поддержка от мувингов (50/200) — ★★\n"
+    "• Боллинджер: выход за границу — ★★\n"
+    "• Формация ГиП / инверсная — ★★\n\n"
+    "⚪️ Слабые (★):\n"
+    "• Сигналы только на 1H — ★\n"
+    "• Мелкая дивергенция RSI на 1H — ★\n"
+    "• Стагнация объёмов — ★\n"
+    "• Локальные уровни без объёма — ★"
+)
 
 
 def list_open_trades(uid: int) -> str:
@@ -277,6 +329,15 @@ def with_back(kb: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
     rows = list(kb.inline_keyboard)
     rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def signals_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text=f"{name} — {'★'*stars}", callback_data=f"sig_{idx}")]
+        for idx, (name, stars) in enumerate(SIGNAL_OPTIONS)
+    ]
+    buttons.append([InlineKeyboardButton(text="🛑 Завершить выбор", callback_data="signals_done")])
+    return with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
 
 async def go_home(user_id: int, state: FSMContext):
     await state.clear()
@@ -679,17 +740,55 @@ async def add_trade_manual_date(msg: types.Message, state: FSMContext):
     await msg.answer("💬 Комментарий (опционально, или -):")
     await state.set_state(TradeState.entering_comment)
 
+
+async def start_signals_choice(uid: int, state: FSMContext):
+    await state.update_data(signals=[], signals_total=0)
+    await bot.send_message(uid, SIGNALS_TEXT, reply_markup=signals_keyboard())
+    await state.set_state(TradeState.choosing_signals)
+
 @dp.message(TradeState.entering_comment)
 async def add_trade_comment(msg: types.Message, state: FSMContext):
     comment = msg.text.strip()
     if comment == "-" or comment == "":
         comment = None
     await state.update_data(comment=comment)
-    await show_trade_summary(msg.from_user.id, state)
+    await start_signals_choice(msg.from_user.id, state)
+
+
+@dp.callback_query(TradeState.choosing_signals, lambda c: c.data.startswith("sig_"))
+async def add_signal(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    idx = int(cb.data.split("_")[1])
+    name, stars = SIGNAL_OPTIONS[idx]
+    data = await state.get_data()
+    signals = data.get("signals", [])
+    total = data.get("signals_total", 0)
+    if name not in signals:
+        signals.append(name)
+        total += stars
+        await state.update_data(signals=signals, signals_total=total)
+        await cb.message.answer(f"✅ Сигнал добавлен: “{name}” ({'★'*stars})")
+    else:
+        await cb.message.answer(f"⚠️ Сигнал уже выбран: “{name}”")
+    await cb.message.answer("Выбирай дальше:", reply_markup=signals_keyboard())
+
+
+@dp.callback_query(TradeState.choosing_signals, F.data == "signals_done")
+async def signals_done(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await show_trade_summary(cb.from_user.id, state)
 
 async def show_trade_summary(uid: int, state: FSMContext):
     data = await state.get_data()
-    text = (f"<b>Сводка сделки</b>\n\n"
+    total = data.get('signals_total', 0)
+    if total < 6:
+        rating = f"⚠️ Мало сигналов: всего ★{total}. Сделка рискованная."
+    elif total < 10:
+        rating = f"⚖️ Умеренно сильная сделка: ★{total}"
+    else:
+        rating = f"🔥 Отличный сетап: ★{total}"
+    text = (rating + "\n\n" +
+            f"<b>Сводка сделки</b>\n\n"
             f"Тип: {data['trade_type'].upper()}\n"
             f"Тикер: {data['symbol']}\n"
             f"Вход: {data['entry_price']}\n"
@@ -700,6 +799,8 @@ async def show_trade_summary(uid: int, state: FSMContext):
             f"Дата: {data['entry_date']}")
     if data.get('comment'):
         text += f"\nКомментарий: {data['comment']}"
+    if data.get('signals'):
+        text += "\nСигналы: " + ", ".join(data['signals'])
     kb = with_back(
         InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_add"),
                               InlineKeyboardButton(text="🔁 Изменить", callback_data="add_trade")]]
@@ -714,9 +815,10 @@ async def add_trade_save(cb: types.CallbackQuery, state: FSMContext):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT INTO trades (user_id, trade_type, symbol, entry_price, stop_loss, "
-            "targets, percent, risk_percent, entry_date, comment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "targets, percent, risk_percent, entry_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
             (cb.from_user.id, data['trade_type'], data['symbol'], data['entry_price'],
-             data['stop_loss'], data['targets'], data['percent'], data['risk'], data['entry_date'], data.get('comment'))
+             data['stop_loss'], data['targets'], data['percent'], data['risk'], data['entry_date'],
+             data.get('comment'), ";".join(data.get('signals', [])), data.get('signals_total', 0))
         )
     await cb.message.answer("✅ Сделка сохранена.")
     await go_home(cb.from_user.id, state)
@@ -778,17 +880,17 @@ async def close_trade_finish(msg: types.Message, state: FSMContext):
     close_pct = data['close_percent']
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
-        user_id, t_type, sym, entry_price, sl, tgt, percent, entry_date, comment = cur.execute(
-            "SELECT user_id, trade_type, symbol, entry_price, stop_loss, targets, percent, entry_date, comment FROM trades WHERE id=?",
-            (tid,)
+        user_id, t_type, sym, entry_price, sl, tgt, percent, entry_date, comment, signals, sstars = cur.execute(
+            "SELECT user_id, trade_type, symbol, entry_price, stop_loss, targets, percent, entry_date, comment, signals, signal_stars FROM trades WHERE id=?",
+            (tid,),
         ).fetchone()
         pnl = ((exit_price - entry_price) / entry_price) * (100 if t_type.lower() == "long" else -100)
         profit = round(pnl * close_pct / 100, 2)
         exit_date = datetime.now().strftime("%Y-%m-%d")
         risk_close = calc_risk(entry_price, sl, close_pct, t_type)
         cur.execute(
-            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, stop_loss, targets, percent, risk_percent, entry_date, exit_price, exit_date, pnl, profit_percent, comment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (user_id, t_type, sym, entry_price, sl, tgt, close_pct, risk_close, entry_date, exit_price, exit_date, pnl, profit, comment)
+            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, stop_loss, targets, percent, risk_percent, entry_date, exit_price, exit_date, pnl, profit_percent, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (user_id, t_type, sym, entry_price, sl, tgt, close_pct, risk_close, entry_date, exit_price, exit_date, pnl, profit, comment, signals, sstars),
         )
         remaining = percent - close_pct
         if remaining <= 0:
