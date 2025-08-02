@@ -65,6 +65,16 @@ def init_db() -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS auto_reports (
+            user_id INTEGER PRIMARY KEY,
+            report_time TEXT,
+            period_days INTEGER,
+            next_run TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -119,6 +129,17 @@ def add_missing_columns() -> None:
             cur.execute("DROP TABLE reminders_old")
             conn.commit()
 
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS auto_reports (
+                user_id INTEGER PRIMARY KEY,
+                report_time TEXT,
+                period_days INTEGER,
+                next_run TEXT
+            )
+            """
+        )
+
 init_db()
 add_missing_columns()      # ← вызов
 
@@ -171,6 +192,11 @@ class ReminderDelState(StatesGroup):
 
 class ClearAllState(StatesGroup):
     confirming = State()
+
+
+class AutoReportState(StatesGroup):
+    entering_time = State()
+    choosing_period = State()
 
 # ---------- HELPERS ----------
 def is_float(text: str) -> bool:
@@ -310,21 +336,72 @@ def list_open_trades(uid: int) -> str:
     return "\n".join(lines)
 
 
+def build_auto_report(uid: int, days: int) -> str:
+    start = datetime.now() - timedelta(days=days)
+    df = pd.read_sql_query(
+        "SELECT symbol, pnl, signals FROM trades WHERE user_id=? AND exit_price IS NOT NULL AND exit_date>=? AND COALESCE(is_deleted,0)=0",
+        sqlite3.connect(DB_PATH),
+        params=(uid, start.isoformat()),
+    )
+    if df.empty:
+        return "Сделок за период нет."
+    count = len(df)
+    avg_profit = df["pnl"].mean()
+    winrate = (df["pnl"] > 0).sum() / count * 100
+    coin_mean = df.groupby("symbol")["pnl"].mean()
+    best = coin_mean.idxmax()
+    worst = coin_mean.idxmin()
+    signal_counts = defaultdict(int)
+    for s in df["signals"].dropna():
+        for sig in s.split(","):
+            sig = sig.strip()
+            if sig:
+                signal_counts[sig] += 1
+    top_signal = max(signal_counts, key=signal_counts.get) if signal_counts else "—"
+    period_text = "день" if days == 1 else "неделю"
+    text = (
+        f"📊 Отчёт за {period_text}\n"
+        f"Сделок: {count}\n"
+        f"Средний % прибыли: {avg_profit:+.2f}%\n"
+        f"Winrate: {winrate:.1f}%\n"
+        f"Лучший коин: {best} ({coin_mean[best]:+.1f}%)\n"
+        f"Худший коин: {worst} ({coin_mean[worst]:+.1f}%)\n"
+        f"Самый частый сетап: {top_signal}"
+    )
+    return text
+
+
 async def show_reminders_menu(uid: int, message: types.Message) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             "SELECT id, remind_time, period_days, next_run FROM reminders WHERE user_id=?",
             (uid,),
         ).fetchall()
+        rep = conn.execute(
+            "SELECT report_time, period_days, next_run FROM auto_reports WHERE user_id=?",
+            (uid,),
+        ).fetchone()
     lines = ["🔔 Твои активные напоминания:"]
     for rid, t, period, next_run in rows:
         lines.append(f"• {clock_emoji(t)} {describe_reminder(t, period, next_run)}")
     if not rows:
         lines.append("У тебя нет активных напоминаний.")
-    row = [InlineKeyboardButton(text="➕ Добавить", callback_data="add_reminder")]
+    lines.append("")
+    if rep:
+        lines.append(
+            f"📊 Автоотчёт: {clock_emoji(rep[0])} {describe_reminder(rep[0], rep[1], rep[2])}"
+        )
+    else:
+        lines.append("📊 Автоотчёт: отключен")
+    kb_rows = [
+        [
+            InlineKeyboardButton(text="➕ Добавить", callback_data="add_reminder"),
+            InlineKeyboardButton(text="📊 Автоотчёт", callback_data="auto_report"),
+        ]
+    ]
     if rows:
-        row.append(InlineKeyboardButton(text="❌ Удалить напоминание", callback_data="del_reminder"))
-    kb_rows = [row, [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]]
+        kb_rows.append([InlineKeyboardButton(text="❌ Удалить напоминание", callback_data="del_reminder")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")])
     kb = with_back(InlineKeyboardMarkup(inline_keyboard=kb_rows))
     await message.answer("\n".join(lines), reply_markup=kb)
 
@@ -354,6 +431,30 @@ async def reminder_scheduler():
                 conn.commit()
         await asyncio.sleep(60)
 
+
+async def report_scheduler():
+    while True:
+        now = datetime.now()
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT user_id, period_days, next_run FROM auto_reports WHERE next_run<=?",
+                (now.isoformat(),),
+            ).fetchall()
+        for uid, period, next_run in rows:
+            text = build_auto_report(uid, period)
+            try:
+                await bot.send_message(uid, text)
+            except Exception:
+                pass
+            next_time = datetime.fromisoformat(next_run) + timedelta(days=period)
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "UPDATE auto_reports SET next_run=? WHERE user_id=?",
+                    (next_time.isoformat(), uid),
+                )
+                conn.commit()
+        await asyncio.sleep(60)
+
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -362,7 +463,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📊 Отчёты", callback_data="reports"),
             ],
             [
-                InlineKeyboardButton(text="🔔 Напоминания", callback_data="reminders"),
+                InlineKeyboardButton(text="📅 Напоминания", callback_data="reminders"),
                 InlineKeyboardButton(text="🧹 Очистить всё", callback_data="clear_all"),
             ],
         ]
@@ -547,6 +648,67 @@ async def reminder_save(cb: types.CallbackQuery, state: FSMContext):
     )
     await state.clear()
     await show_reminders_menu(cb.from_user.id, cb.message)
+
+
+@dp.callback_query(F.data == "auto_report")
+async def auto_report_start(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="reminders")]])
+    await cb.message.answer(
+        "Введите время автоотчёта (HH:MM):",
+        reply_markup=with_back(kb),
+    )
+    await state.set_state(AutoReportState.entering_time)
+
+
+@dp.message(AutoReportState.entering_time)
+async def auto_report_time(msg: types.Message, state: FSMContext):
+    if not is_time(msg.text):
+        await msg.answer("Формат HH:MM")
+        return
+    await state.update_data(report_time=msg.text.strip())
+    kb = with_back(
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Ежедневно", callback_data="arep_1"), InlineKeyboardButton(text="Еженедельно", callback_data="arep_7")],
+                [InlineKeyboardButton(text="Отключить", callback_data="arep_off")],
+            ]
+        )
+    )
+    await msg.answer("Периодичность автоотчёта:", reply_markup=kb)
+    await state.set_state(AutoReportState.choosing_period)
+
+
+@dp.callback_query(AutoReportState.choosing_period, lambda c: c.data.startswith("arep_"))
+async def auto_report_save(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    choice = cb.data.split("_")[1]
+    uid = cb.from_user.id
+    if choice == "off":
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM auto_reports WHERE user_id=?", (uid,))
+            conn.commit()
+        await cb.message.answer("Автоотчёты отключены.")
+    else:
+        period = int(choice)
+        data = await state.get_data()
+        t = datetime.strptime(data["report_time"], "%H:%M").time()
+        now = datetime.now()
+        next_run = datetime.combine(now.date(), t)
+        if next_run <= now:
+            next_run += timedelta(days=period)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO auto_reports (user_id, report_time, period_days, next_run) VALUES (?,?,?,?)",
+                (uid, data["report_time"], period, next_run.isoformat()),
+            )
+            conn.commit()
+        names = {1: "ежедневно", 7: "еженедельно"}
+        await cb.message.answer(
+            f"Автоотчёт в {data['report_time']} {names[period]} включён."
+        )
+    await state.clear()
+    await show_reminders_menu(uid, cb.message)
 
 
 @dp.callback_query(F.data == "del_reminder")
@@ -1343,6 +1505,7 @@ async def clear_all_confirm(msg: types.Message, state: FSMContext):
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute("DELETE FROM trades WHERE user_id=?", (uid,))
             conn.execute("DELETE FROM reminders WHERE user_id=?", (uid,))
+            conn.execute("DELETE FROM auto_reports WHERE user_id=?", (uid,))
             conn.commit()
         await msg.answer("Все данные очищены.")
     else:
@@ -1523,6 +1686,7 @@ async def charts(cb: types.CallbackQuery):
 # ---------- RUN ----------
 async def main():
     asyncio.create_task(reminder_scheduler())
+    asyncio.create_task(report_scheduler())
     await dp.start_polling(bot)
 
 
