@@ -43,7 +43,7 @@ def init_db() -> None:
             exit_date TEXT,
             pnl REAL,
             profit_percent REAL,
-            commet TEXT
+            comment TEXT
             
         )
         """
@@ -193,7 +193,7 @@ async def show_history(cb: types.CallbackQuery):
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT symbol, trade_type, entry_price, exit_price, pnl, exit_date FROM trades "
+            "SELECT symbol, trade_type, entry_price, exit_price, pnl, exit_date, comment FROM trades "
             "WHERE user_id=? AND exit_price IS NOT NULL",
             (uid,),
         ).fetchall()
@@ -201,10 +201,11 @@ async def show_history(cb: types.CallbackQuery):
         await cb.message.answer("История сделок пуста.")
         return
     lines = []
-    for sym, t_type, entry, exit_price, pnl, exit_date in rows:
-        lines.append(
-            f"{sym} {t_type.upper()} | {entry} → {exit_price} | {pnl:+.2f}% | {exit_date}"
-        )
+    for sym, t_type, entry, exit_price, pnl, exit_date, comm in rows:
+        line = f"{sym} {t_type.upper()} | {entry} → {exit_price} | {pnl:+.2f}% | {exit_date}"
+        if comm:
+            line += f"\n💬 {comm}"
+        lines.append(line)
     text = "\n".join(lines)
     kb = with_back(InlineKeyboardMarkup(inline_keyboard=[]))
     await cb.message.answer("📜 История сделок:\n" + text, reply_markup=kb)
@@ -267,8 +268,7 @@ async def edit_save(msg: types.Message, state: FSMContext):
 
     await msg.answer("✅ Обновлено.")
     await state.clear()
-    await msg.answer("💬 Комментарий (опционально, или -):")
-    await state.set_state(TradeState.entering_comment)
+    await go_home(msg.from_user.id, state)
 
 # ---------- ADD TRADE ----------
 @dp.callback_query(lambda c: c.data == "add_trade")
@@ -350,7 +350,8 @@ async def add_trade_date(cb: types.CallbackQuery, state: FSMContext):
         await state.set_state(TradeState.entering_date_manual)
         return
     await state.update_data(entry_date=date_str)
-    await show_trade_summary(cb.from_user.id, state)
+    await bot.send_message(cb.from_user.id, "💬 Комментарий (опционально, или -):")
+    await state.set_state(TradeState.entering_comment)
 
 @dp.message(TradeState.entering_date_manual)
 async def add_trade_manual_date(msg: types.Message, state: FSMContext):
@@ -360,6 +361,15 @@ async def add_trade_manual_date(msg: types.Message, state: FSMContext):
         await msg.answer("Неверный формат.")
         return
     await state.update_data(entry_date=msg.text.strip())
+    await msg.answer("💬 Комментарий (опционально, или -):")
+    await state.set_state(TradeState.entering_comment)
+
+@dp.message(TradeState.entering_comment)
+async def add_trade_comment(msg: types.Message, state: FSMContext):
+    comment = msg.text.strip()
+    if comment == "-" or comment == "":
+        comment = None
+    await state.update_data(comment=comment)
     await show_trade_summary(msg.from_user.id, state)
 
 async def show_trade_summary(uid: int, state: FSMContext):
@@ -372,6 +382,8 @@ async def show_trade_summary(uid: int, state: FSMContext):
             f"Цели: {data['targets']}\n"
             f"% от депо: {data['percent']}\n"
             f"Дата: {data['entry_date']}")
+    if data.get('comment'):
+        text += f"\nКомментарий: {data['comment']}"
     kb = with_back(
         InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_add"),
                               InlineKeyboardButton(text="🔁 Изменить", callback_data="add_trade")]]
@@ -386,9 +398,9 @@ async def add_trade_save(cb: types.CallbackQuery, state: FSMContext):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT INTO trades (user_id, trade_type, symbol, entry_price, stop_loss, "
-            "targets, percent, entry_date) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "targets, percent, entry_date, comment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (cb.from_user.id, data['trade_type'], data['symbol'], data['entry_price'],
-             data['stop_loss'], data['targets'], data['percent'], data['entry_date'])
+             data['stop_loss'], data['targets'], data['percent'], data['entry_date'], data.get('comment'))
         )
     await cb.message.answer("✅ Сделка сохранена.")
     await go_home(cb.from_user.id, state)
