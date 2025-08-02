@@ -226,6 +226,8 @@ SIGNAL_OPTIONS = [
     ("Локальные уровни без объёма", 1),
 ]
 
+SIGNAL_STARS = {name: stars for name, stars in SIGNAL_OPTIONS}
+
 SIGNALS_TEXT = (
     "📍 Укажи сигналы, по которым ты входишь в сделку.\n"
     "🔻 Нажимай по одному, сколько нужно.\n\n"
@@ -247,7 +249,26 @@ SIGNALS_TEXT = (
     "• Мелкая дивергенция RSI на 1H — ★\n"
     "• Стагнация объёмов — ★\n"
     "• Локальные уровни без объёма — ★"
+    "\nШкала силы: ≤4 слабая • 5–7 умеренная • 8–11 сильная • 12+ очень сильная"
 )
+
+
+def signal_stats(names: list[str]) -> tuple[int, int, int, int]:
+    total = sum(SIGNAL_STARS.get(n, 0) for n in names)
+    strong = sum(1 for n in names if SIGNAL_STARS.get(n, 0) >= 4)
+    medium = sum(1 for n in names if 2 <= SIGNAL_STARS.get(n, 0) <= 3)
+    weak = sum(1 for n in names if SIGNAL_STARS.get(n, 0) <= 1)
+    return total, strong, medium, weak
+
+
+def strength_label(total: int) -> str:
+    if total <= 4:
+        return "Слабая"
+    if total <= 7:
+        return "Умеренная"
+    if total <= 11:
+        return "Сильная"
+    return "Очень сильная"
 
 
 def list_open_trades(uid: int) -> str:
@@ -354,11 +375,16 @@ def format_trade(data: dict) -> str:
     if data.get('comment'):
         text += f"\nКомментарий: {data['comment']}"
     sigs = data.get('signals')
-    if sigs:
-        if isinstance(sigs, str):
-            sigs = [s for s in sigs.split(';') if s]
-        if sigs:
-            text += "\nСигналы: " + ", ".join(sigs)
+    if isinstance(sigs, str):
+        sigs = [s for s in sigs.split(';') if s]
+    sigs = sigs or []
+    lines = [f"• {s} — {'★'*SIGNAL_STARS.get(s, 0)}" for s in sigs] or ["—"]
+    total, strong, medium, weak = signal_stats(sigs)
+    lines.append(f"Всего звёзд: {total}")
+    lines.append(f"Сильные: {strong}, Средние: {medium}, Слабые: {weak}")
+    lines.append(f"Сила сделки: {strength_label(total)}")
+    lines.append("Шкала: ≤4 Слабая, 5–7 Умеренная, 8–11 Сильная, 12+ Очень сильная")
+    text += "\nСигналы:\n" + "\n".join(lines)
     return text
 
 async def go_home(user_id: int, state: FSMContext):
@@ -810,14 +836,21 @@ async def add_signal(cb: types.CallbackQuery, state: FSMContext):
     name, stars = SIGNAL_OPTIONS[idx]
     data = await state.get_data()
     signals = data.get("signals", [])
-    total = data.get("signals_total", 0)
     if name not in signals:
         signals.append(name)
-        total += stars
-        await state.update_data(signals=signals, signals_total=total)
-        await cb.message.answer(f"✅ Сигнал добавлен: “{name}” ({'★'*stars})")
+        await state.update_data(signals=signals)
+        total, strong, medium, weak = signal_stats(signals)
+        await state.update_data(signals_total=total)
+        summary = (
+            f"✅ Сигнал добавлен: \"{name}\" ({'★'*stars})\n\n"
+            f"Всего: ★{total}\n"
+            f"Сильные: {strong}, Средние: {medium}, Слабые: {weak}\n"
+            f"Сила сделки: {strength_label(total)}\n"
+            "Шкала: ≤4 Слабая, 5–7 Умеренная, 8–11 Сильная, 12+ Очень сильная"
+        )
+        await cb.message.answer(summary)
     else:
-        await cb.message.answer(f"⚠️ Сигнал уже выбран: “{name}”")
+        await cb.message.answer(f"⚠️ Сигнал уже выбран: \"{name}\"")
     await cb.message.answer("Выбирай дальше:", reply_markup=signals_keyboard())
 
 
@@ -828,14 +861,7 @@ async def signals_done(cb: types.CallbackQuery, state: FSMContext):
 
 async def show_trade_summary(uid: int, state: FSMContext):
     data = await state.get_data()
-    total = data.get('signals_total', 0)
-    if total < 6:
-        rating = f"⚠️ Мало сигналов: всего ★{total}. Сделка рискованная."
-    elif total < 10:
-        rating = f"⚖️ Умеренно сильная сделка: ★{total}"
-    else:
-        rating = f"🔥 Отличный сетап: ★{total}"
-    text = rating + "\n\n<b>Сводка сделки</b>\n\n" + format_trade(data)
+    text = "<b>Сводка сделки</b>\n\n" + format_trade(data)
     kb = with_back(
         InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_add"),
                               InlineKeyboardButton(text="🔁 Изменить", callback_data="add_trade")]]
