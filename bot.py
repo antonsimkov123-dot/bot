@@ -1158,6 +1158,7 @@ async def show_trade_summary(uid: int, state: FSMContext):
     kb = with_back(
         InlineKeyboardMarkup(
             inline_keyboard=[
+                [InlineKeyboardButton(text="💡 Оценить сетап", callback_data="signals_eval")],
                 [InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_add"),
                  InlineKeyboardButton(text="🔁 Изменить", callback_data="add_trade")]
             ]
@@ -1165,6 +1166,32 @@ async def show_trade_summary(uid: int, state: FSMContext):
     )
     await bot.send_message(uid, text, reply_markup=kb)
     await state.set_state(TradeState.confirming)
+
+
+@dp.callback_query(TradeState.confirming, F.data == "signals_eval")
+async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    data = await state.get_data()
+    signals = data.get("signals", [])
+    total = sum(SIGNAL_STARS.get(n, 0) for n in signals)
+    strong = sum(1 for n in signals if SIGNAL_STARS.get(n, 0) >= 3)
+    risk = data.get("risk")
+    parts = [f"⭐️ Звёзд: {total}", f"🔥 Сильных сигналов: {strong}"]
+    if risk is not None:
+        parts.append(f"🛑 Риск по стопу: {risk:.1f}%")
+    text = "\n".join(parts) + "\n\n"
+    if strong < 2 or total < 6:
+        text += (
+            f"⚠️ Внимание: Мало сильных сигналов ({strong} из 3).\n"
+            f"Всего {total} звёзд — сделка выглядит слабой.\n"
+            "Уверен, что хочешь продолжать?"
+        )
+    else:
+        text += (
+            "💡 Отличная сделка: сильные сигналы + адекватный риск.\n"
+            "Совет: убедись, что нет сопротивления выше цели."
+        )
+    await cb.message.answer(text)
 
 
 async def save_trade(cb: types.CallbackQuery, state: FSMContext) -> None:
