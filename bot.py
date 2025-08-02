@@ -522,6 +522,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📈 Профиль", callback_data="profile")],
+            [InlineKeyboardButton(text="🏆 Рейтинг трейдеров", callback_data="rating")],
             [
                 InlineKeyboardButton(text="📦 Сделки", callback_data="trades_menu"),
                 InlineKeyboardButton(text="📊 Отчёты", callback_data="reports"),
@@ -794,6 +795,98 @@ async def show_profile(cb: types.CallbackQuery, state: FSMContext):
         f"🏅 Ранг: {rank}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]])
+    await cb.message.answer(text, reply_markup=with_back(kb))
+
+
+# ---------- RATING ----------
+async def build_trader_rating() -> tuple[str, InlineKeyboardMarkup]:
+    month_start = datetime.now().replace(day=1).strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT user_id,
+                   SUM(pnl) AS total_pnl,
+                   SUM(CASE WHEN pnl>0 THEN 1 ELSE 0 END) AS wins,
+                   SUM(CASE WHEN pnl<=0 THEN 1 ELSE 0 END) AS losses
+            FROM trades
+            WHERE exit_price IS NOT NULL AND exit_date>=? AND COALESCE(is_deleted,0)=0
+            GROUP BY user_id
+            ORDER BY total_pnl DESC, wins DESC
+            LIMIT 10
+            """,
+            (month_start,),
+        ).fetchall()
+    lines = ["🏆 ТОП-10 трейдеров месяца:\n"]
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    if rows:
+        for i, (uid, total, wins, losses) in enumerate(rows, 1):
+            chat = await bot.get_chat(uid)
+            name = chat.username or chat.full_name or str(uid)
+            wl = wins + losses
+            winrate = wins * 100 / wl if wl else 0
+            lines.append(
+                f"{i}. {name} — {total:+.2f}% | ✅ {wins} | ❌ {losses} | {winrate:.0f}%"
+            )
+            kb_rows.append(
+                [InlineKeyboardButton(text=f"{i}. {name}", callback_data=f"rank_{uid}")]
+            )
+    else:
+        lines = ["Нет данных для рейтинга."]
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")])
+    return "\n".join(lines), with_back(InlineKeyboardMarkup(inline_keyboard=kb_rows))
+
+
+async def build_trader_details(uid: int) -> str:
+    chat = await bot.get_chat(uid)
+    name = chat.username or chat.full_name or str(uid)
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT pnl FROM trades WHERE user_id=? AND exit_price IS NOT NULL AND COALESCE(is_deleted,0)=0",
+            (uid,),
+        ).fetchall()
+        last = conn.execute(
+            """
+            SELECT symbol, pnl, exit_date FROM trades
+            WHERE user_id=? AND exit_price IS NOT NULL AND COALESCE(is_deleted,0)=0
+            ORDER BY exit_date DESC LIMIT 1
+            """,
+            (uid,),
+        ).fetchone()
+    pnls = [r[0] for r in rows]
+    wins = [p for p in pnls if p > 0]
+    losses = [p for p in pnls if p < 0]
+    avg_profit = sum(wins) / len(wins) if wins else 0
+    avg_loss = sum(losses) / len(losses) if losses else 0
+    winrate = len(wins) * 100 / len(pnls) if pnls else 0
+    if last:
+        lsym, lpnl, ldate = last
+        last_text = f"Последняя сделка: {lsym} ({lpnl:+.2f}%) — {ldate}"
+    else:
+        last_text = "Последняя сделка: —"
+    return (
+        f"{name}\n"
+        f"Средняя прибыль: {avg_profit:+.2f}%\n"
+        f"Средний убыток: {avg_loss:+.2f}%\n"
+        f"Общий winrate: {winrate:.1f}%\n"
+        f"{last_text}"
+    )
+
+
+@dp.callback_query(F.data == "rating")
+async def rating_menu(cb: types.CallbackQuery):
+    await cb.answer()
+    text, kb = await build_trader_rating()
+    await cb.message.answer(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data.startswith("rank_"))
+async def rating_detail(cb: types.CallbackQuery):
+    await cb.answer()
+    uid = int(cb.data.split("_", 1)[1])
+    text = await build_trader_details(uid)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="rating")]]
+    )
     await cb.message.answer(text, reply_markup=with_back(kb))
 
 
