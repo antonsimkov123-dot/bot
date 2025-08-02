@@ -52,7 +52,8 @@ def init_db() -> None:
     cur.execute(
         """
         CREATE TABLE IF NOT EXISTS reminders (
-            user_id INTEGER PRIMARY KEY,
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
             remind_time TEXT,
             period_days INTEGER,
             next_run TEXT
@@ -77,6 +78,28 @@ def add_missing_columns() -> None:
             conn.commit()
         if "risk_percent" not in columns:
             cur.execute("ALTER TABLE trades ADD COLUMN risk_percent REAL")
+            conn.commit()
+
+        cur.execute("PRAGMA table_info(reminders)")
+        rem_cols = {row[1] for row in cur.fetchall()}
+        if "id" not in rem_cols:
+            cur.execute("ALTER TABLE reminders RENAME TO reminders_old")
+            cur.execute(
+                """
+                CREATE TABLE reminders (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    remind_time TEXT,
+                    period_days INTEGER,
+                    next_run TEXT
+                )
+                """
+            )
+            cur.execute(
+                "INSERT INTO reminders (user_id, remind_time, period_days, next_run) "
+                "SELECT user_id, remind_time, period_days, next_run FROM reminders_old"
+            )
+            cur.execute("DROP TABLE reminders_old")
             conn.commit()
 
 init_db()
@@ -121,6 +144,11 @@ class ReminderState(StatesGroup):
     entering_time = State()
     choosing_period = State()
 
+
+class ReminderDelState(StatesGroup):
+    choosing_reminder = State()
+    confirming = State()
+
 # ---------- HELPERS ----------
 def is_float(text: str) -> bool:
     try:
@@ -146,6 +174,30 @@ def calc_risk(entry: float, stop: float, pct: float, t_type: str) -> float:
     return round(risk, 2)
 
 
+def clock_emoji(time_str: str) -> str:
+    hour = int(time_str.split(":")[0])
+    clocks = ["🕛", "🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛"]
+    return clocks[hour % 12]
+
+
+def describe_reminder(t: str, period: int, next_run: str) -> str:
+    if period == 1:
+        return f"Каждый день в {t}"
+    if period == 2:
+        return f"Через день в {t}"
+    weekday = datetime.fromisoformat(next_run).weekday()
+    names = [
+        "понедельникам",
+        "вторникам",
+        "средам",
+        "четвергам",
+        "пятницам",
+        "субботам",
+        "воскресеньям",
+    ]
+    return f"По {names[weekday]} в {t}"
+
+
 def list_open_trades(uid: int) -> str:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
@@ -160,15 +212,33 @@ def list_open_trades(uid: int) -> str:
     return "\n".join(lines)
 
 
+async def show_reminders_menu(uid: int, message: types.Message) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT id, remind_time, period_days, next_run FROM reminders WHERE user_id=?",
+            (uid,),
+        ).fetchall()
+    lines = ["🔔 Твои активные напоминания:"]
+    for rid, t, period, next_run in rows:
+        lines.append(f"• {clock_emoji(t)} {describe_reminder(t, period, next_run)}")
+    if not rows:
+        lines.append("У тебя нет активных напоминаний.")
+    kb_rows = [[InlineKeyboardButton(text="➕ Добавить", callback_data="add_reminder")]]
+    if rows:
+        kb_rows.append([InlineKeyboardButton(text="❌ Удалить напоминание", callback_data="del_reminder")])
+    kb = with_back(InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    await message.answer("\n".join(lines), reply_markup=kb)
+
+
 async def reminder_scheduler():
     while True:
         now = datetime.now()
         with sqlite3.connect(DB_PATH) as conn:
             rows = conn.execute(
-                "SELECT user_id, period_days, next_run FROM reminders WHERE next_run<=?",
+                "SELECT id, user_id, period_days, next_run FROM reminders WHERE next_run<=?",
                 (now.isoformat(),),
             ).fetchall()
-        for uid, period, next_run in rows:
+        for rid, uid, period, next_run in rows:
             trades_text = list_open_trades(uid)
             msg = "Проверь, не пора ли закрыть сделку?"
             if trades_text:
@@ -181,7 +251,7 @@ async def reminder_scheduler():
                 pass
             next_time = datetime.fromisoformat(next_run) + timedelta(days=period)
             with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("UPDATE reminders SET next_run=? WHERE user_id=?", (next_time.isoformat(), uid))
+                conn.execute("UPDATE reminders SET next_run=? WHERE id=?", (next_time.isoformat(), rid))
                 conn.commit()
         await asyncio.sleep(60)
 
@@ -193,7 +263,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🗑 Удалить сделку", callback_data="delete_trade")],
             [InlineKeyboardButton(text="📊 Отчёты", callback_data="reports")],
             [InlineKeyboardButton(text="📈 Графики", callback_data="charts")],
-            [InlineKeyboardButton(text="🔔 Напоминание", callback_data="reminder")],
+            [InlineKeyboardButton(text="🔔 Напоминания", callback_data="reminders")],
             [InlineKeyboardButton(text="📤 Выгрузить сделки", callback_data="export_csv")],
             [InlineKeyboardButton(text="📂 Текущие сделки", callback_data="active")],
             [InlineKeyboardButton(text="📜 История сделок", callback_data="history")],
@@ -227,10 +297,20 @@ async def cb_menu(cb: types.CallbackQuery, state: FSMContext):
     await go_home(cb.from_user.id, state)
 
 # ---------- REMINDER ----------
-@dp.callback_query(F.data == "reminder")
+@dp.callback_query(F.data == "reminders")
+async def reminders_overview(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.clear()
+    await show_reminders_menu(cb.from_user.id, cb.message)
+
+
+@dp.callback_query(F.data == "add_reminder")
 async def reminder_start(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    await cb.message.answer("Введите время напоминания (HH:MM):", reply_markup=with_back(InlineKeyboardMarkup(inline_keyboard=[])))
+    await cb.message.answer(
+        "Введите время напоминания (HH:MM):",
+        reply_markup=with_back(InlineKeyboardMarkup(inline_keyboard=[])),
+    )
     await state.set_state(ReminderState.entering_time)
 
 
@@ -265,14 +345,83 @@ async def reminder_save(cb: types.CallbackQuery, state: FSMContext):
         next_run += timedelta(days=period)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO reminders (user_id, remind_time, period_days, next_run) VALUES (?, ?, ?, ?)",
+            "INSERT INTO reminders (user_id, remind_time, period_days, next_run) VALUES (?, ?, ?, ?)",
             (cb.from_user.id, data["remind_time"], period, next_run.isoformat()),
         )
         conn.commit()
     names = {1: "ежедневно", 2: "через день", 7: "раз в неделю"}
-    await cb.message.answer(f"Напоминание на {data['remind_time']} {names[period]} сохранено.")
+    await cb.message.answer(
+        f"Напоминание на {data['remind_time']} {names[period]} сохранено."
+    )
     await state.clear()
-    await go_home(cb.from_user.id, state)
+    await show_reminders_menu(cb.from_user.id, cb.message)
+
+
+@dp.callback_query(F.data == "del_reminder")
+async def reminder_delete_list(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.clear()
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT id, remind_time, period_days, next_run FROM reminders WHERE user_id=?",
+            (cb.from_user.id,),
+        ).fetchall()
+    if not rows:
+        await cb.message.answer("У тебя нет активных напоминаний.")
+        return
+    buttons = [
+        [InlineKeyboardButton(text=describe_reminder(t, p, nr), callback_data=f"delr_{rid}")]
+        for rid, t, p, nr in rows
+    ]
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="reminders")])
+    kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
+    await cb.message.answer("Выбери напоминание для удаления:", reply_markup=kb)
+    await state.set_state(ReminderDelState.choosing_reminder)
+
+
+@dp.callback_query(ReminderDelState.choosing_reminder, lambda c: c.data.startswith("delr_"))
+async def reminder_delete_confirm(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    rid = int(cb.data.split("_")[1])
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT remind_time, period_days, next_run FROM reminders WHERE id=? AND user_id=?",
+            (rid, cb.from_user.id),
+        ).fetchone()
+    if not row:
+        await cb.message.answer("Напоминание не найдено.")
+        await state.clear()
+        return
+    desc = describe_reminder(row[0], row[1], row[2])
+    await state.update_data(del_id=rid)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да, удалить", callback_data="confirm_delr")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="del_reminder")],
+        ]
+    )
+    kb = with_back(kb)
+    await cb.message.answer(
+        f"Вы точно хотите удалить напоминание «{desc}»?",
+        reply_markup=kb,
+    )
+    await state.set_state(ReminderDelState.confirming)
+
+
+@dp.callback_query(ReminderDelState.confirming, F.data == "confirm_delr")
+async def reminder_delete(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    data = await state.get_data()
+    rid = data.get("del_id")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "DELETE FROM reminders WHERE id=? AND user_id=?",
+            (rid, cb.from_user.id),
+        )
+        conn.commit()
+    await cb.message.answer("🗑 Напоминание удалено.")
+    await state.clear()
+    await show_reminders_menu(cb.from_user.id, cb.message)
 # ---------- TRADE -------------
 @dp.callback_query(F.data == "active")
 async def show_active(cb: types.CallbackQuery):
