@@ -599,25 +599,37 @@ async def export_csv(cb: types.CallbackQuery):
 async def reports(cb: types.CallbackQuery):
     uid = cb.from_user.id
     df = pd.read_sql_query(
-        "SELECT symbol, pnl, entry_date FROM trades WHERE user_id=? AND exit_price IS NOT NULL",
+        "SELECT symbol, pnl, entry_date, exit_date FROM trades WHERE user_id=? AND exit_price IS NOT NULL",
         sqlite3.connect(DB_PATH), params=(uid,))
     if df.empty:
         await cb.message.answer("Нет завершённых сделок.")
         return
     df["entry_date"] = pd.to_datetime(df["entry_date"], errors="coerce")
+    df["exit_date"] = pd.to_datetime(df["exit_date"], errors="coerce")
     now = datetime.now()
     pnl_week = df[df["entry_date"] >= now - timedelta(days=7)]["pnl"].sum()
     pnl_month = df[df["entry_date"] >= now - timedelta(days=30)]["pnl"].sum()
     wins = (df["pnl"] > 0).sum()
     losses = (df["pnl"] <= 0).sum()
+    winrate = wins / len(df) * 100 if len(df) else 0
+    avg_profit = df[df["pnl"] > 0]["pnl"].mean() if wins else 0
+    avg_loss = df[df["pnl"] < 0]["pnl"].mean() if losses else 0
+    durations = (df["exit_date"] - df["entry_date"]).dt.days
+    avg_duration = durations.mean() if not durations.empty else 0
     coin_mean = df.groupby("symbol")["pnl"].mean()
     best = coin_mean.idxmax() if not coin_mean.empty else "—"
     worst = coin_mean.idxmin() if not coin_mean.empty else "—"
-    text = (f"📅 Неделя: {pnl_week:+.2f}%\n"
-            f"📅 Месяц: {pnl_month:+.2f}%\n"
-            f"✅ Побед: {wins} | ❌ Убытков: {losses}\n"
-            f"🏆 Лучший: {best} ({coin_mean.max():+.1f}%)\n"
-            f"🚨 Худший: {worst} ({coin_mean.min():+.1f}%)")
+    text = (
+        f"📅 Неделя: {pnl_week:+.2f}%\n"
+        f"📅 Месяц: {pnl_month:+.2f}%\n"
+        f"✅ Побед: {wins} | ❌ Убытков: {losses}\n"
+        f"📈 Средний профит: {avg_profit:+.2f}%\n"
+        f"📉 Средний убыток: {avg_loss:+.2f}%\n"
+        f"🥇 Winrate: {winrate:.1f}%\n"
+        f"⏱ Средняя длительность: {avg_duration:.1f} дн.\n"
+        f"🏆 Лучший: {best} ({coin_mean.max():+.1f}%)\n"
+        f"🚨 Худший: {worst} ({coin_mean.min():+.1f}%)"
+    )
     await cb.message.answer(text)
 
 # ---------- CHARTS ----------
