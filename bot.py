@@ -191,6 +191,38 @@ add_missing_columns()      # ← вызов
 bot = Bot(BOT_TOKEN, parse_mode="HTML")
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
+
+CHANNEL_USERNAME = "@CryptoLens_MarketMinds"
+
+
+async def is_subscribed(uid: int) -> bool:
+    try:
+        member = await bot.get_chat_member(CHANNEL_USERNAME, uid)
+        return member.status in {"member", "administrator", "creator"}
+    except Exception:
+        return False
+
+
+async def require_subscription(message: types.Message, uid: int) -> bool:
+    if await is_subscribed(uid):
+        return True
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")]]
+    )
+    await message.answer(
+        "🔒 Чтобы использовать эту функцию, подпишитесь на канал @CryptoLens_MarketMinds и нажмите кнопку «🔄 Проверить подписку».",
+        reply_markup=kb,
+    )
+    return False
+
+
+@dp.callback_query(F.data == "check_sub")
+async def recheck_subscription(cb: types.CallbackQuery):
+    await cb.answer()
+    if await is_subscribed(cb.from_user.id):
+        await cb.message.answer("✅ Подписка подтверждена. Теперь можно пользоваться этой функцией.")
+    else:
+        await require_subscription(cb.message, cb.from_user.id)
 # -------- RESTART
 @dp.callback_query(F.data == "restart")
 async def cb_restart(cb: types.CallbackQuery, state: FSMContext):
@@ -875,6 +907,8 @@ async def build_trader_details(uid: int) -> str:
 @dp.callback_query(F.data == "rating")
 async def rating_menu(cb: types.CallbackQuery):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     text, kb = await build_trader_rating()
     await cb.message.answer(text, reply_markup=kb)
 
@@ -882,6 +916,8 @@ async def rating_menu(cb: types.CallbackQuery):
 @dp.callback_query(F.data.startswith("rank_"))
 async def rating_detail(cb: types.CallbackQuery):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     uid = int(cb.data.split("_", 1)[1])
     text = await build_trader_details(uid)
     kb = InlineKeyboardMarkup(
@@ -1090,6 +1126,8 @@ async def reminder_delete(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "danger_day")
 async def danger_day_start(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -1500,6 +1538,8 @@ async def show_trade_summary(uid: int, state: FSMContext):
 @dp.callback_query(TradeState.confirming, F.data == "signals_eval")
 async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     data = await state.get_data()
     signals = data.get("signals", [])
     total = sum(SIGNAL_STARS.get(n, 0) for n in signals)
@@ -1842,6 +1882,8 @@ async def clear_reports(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "calendar")
 async def show_calendar(cb: types.CallbackQuery):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     text, kb = calendar_keyboard(cb.from_user.id)
     await cb.message.answer(text, reply_markup=kb)
 
@@ -1849,6 +1891,8 @@ async def show_calendar(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("day_"))
 async def show_day_trades(cb: types.CallbackQuery):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     date_str = cb.data.split("_", 1)[1]
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
@@ -2094,6 +2138,8 @@ def build_top_trades(uid: int) -> str:
 @dp.callback_query(F.data == "setup_battle")
 async def setup_battle(cb: types.CallbackQuery):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     uid = cb.from_user.id
     text = build_setup_battle(uid)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="reports")]])
@@ -2103,6 +2149,8 @@ async def setup_battle(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "setup_analysis")
 async def setup_analysis(cb: types.CallbackQuery):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     uid = cb.from_user.id
     text = build_setup_analysis(uid)
     kb = InlineKeyboardMarkup(
@@ -2126,6 +2174,8 @@ async def top_trades(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "reset_setup_analysis")
 async def reset_setup_analysis(cb: types.CallbackQuery):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "UPDATE trades SET signals=NULL, signal_stars=NULL WHERE user_id=?",
@@ -2139,6 +2189,8 @@ async def reset_setup_analysis(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "charts")
 async def charts(cb: types.CallbackQuery):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     uid = cb.from_user.id
     df = pd.read_sql_query(
         "SELECT trade_type, pnl, entry_date FROM trades WHERE user_id=? AND exit_price IS NOT NULL AND COALESCE(is_deleted,0)=0",
