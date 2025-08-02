@@ -38,6 +38,7 @@ def init_db() -> None:
             stop_loss REAL,
             targets TEXT,
             percent REAL,
+            risk_percent REAL,
             entry_date TEXT,
             exit_price REAL,
             exit_date TEXT,
@@ -63,6 +64,9 @@ def add_missing_columns() -> None:
             conn.commit()
         if "exit_date" not in columns:
             cur.execute("ALTER TABLE trades ADD COLUMN exit_date TEXT")
+            conn.commit()
+        if "risk_percent" not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN risk_percent REAL")
             conn.commit()
 
 init_db()
@@ -111,6 +115,14 @@ def is_float(text: str) -> bool:
     except ValueError:
         return False
 
+
+def calc_risk(entry: float, stop: float, pct: float, t_type: str) -> float:
+    if t_type.lower() == "long":
+        risk = (entry - stop) / entry * pct
+    else:
+        risk = (stop - entry) / entry * pct
+    return round(risk, 2)
+
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -158,7 +170,7 @@ async def show_active(cb: types.CallbackQuery):
 
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
-        "SELECT id, symbol, entry_price, stop_loss, targets, percent, entry_date, comment "
+        "SELECT id, symbol, entry_price, stop_loss, targets, percent, entry_date, comment, risk_percent "
         "FROM trades WHERE user_id=? AND exit_price IS NULL",
         (uid,)
     ).fetchall()
@@ -170,8 +182,8 @@ async def show_active(cb: types.CallbackQuery):
     # собираем клавиатуру из сделок
     ikb = []
     for r in rows:
-        tid, sym, entry, sl, tgt, pct, date, comm = r
-        caption = f"{sym} | Вход {entry}  Стоп {sl}  Цели {tgt}  {pct}%  ({date})"
+        tid, sym, entry, sl, tgt, pct, date, comm, risk = r
+        caption = f"{sym} | Вход {entry}  Стоп {sl}  Цели {tgt}  {pct}% (риск {risk}%) ({date})"
         if comm:
             caption += f"\n💬 {comm}"
         ikb.append([
@@ -193,20 +205,21 @@ async def show_trade_details(cb: types.CallbackQuery):
     tid = int(cb.data.split("_")[1])
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT symbol, trade_type, entry_price, stop_loss, targets, percent, entry_date, comment "
+            "SELECT symbol, trade_type, entry_price, stop_loss, targets, percent, entry_date, comment, risk_percent "
             "FROM trades WHERE id=?",
             (tid,),
         ).fetchone()
     if not row:
         await cb.message.answer("Сделка не найдена.")
         return
-    sym, t_type, entry, sl, tgt, pct, date, comm = row
+    sym, t_type, entry, sl, tgt, pct, date, comm, risk = row
     text = (
         f"<b>{sym} {t_type.upper()}</b>\n"
         f"Вход: {entry}\n"
         f"Стоп: {sl}\n"
         f"Цели: {tgt}\n"
         f"% от депо: {pct}\n"
+        f"Риск: {risk}%\n"
         f"Дата входа: {date}"
     )
     if comm:
@@ -225,7 +238,7 @@ async def show_history(cb: types.CallbackQuery):
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT symbol, trade_type, entry_price, exit_price, pnl, exit_date, comment FROM trades "
+            "SELECT symbol, trade_type, entry_price, exit_price, pnl, exit_date, comment, risk_percent FROM trades "
             "WHERE user_id=? AND exit_price IS NOT NULL",
             (uid,),
         ).fetchall()
@@ -233,8 +246,8 @@ async def show_history(cb: types.CallbackQuery):
         await cb.message.answer("История сделок пуста.")
         return
     lines = []
-    for sym, t_type, entry, exit_price, pnl, exit_date, comm in rows:
-        line = f"{sym} {t_type.upper()} | {entry} → {exit_price} | {pnl:+.2f}% | {exit_date}"
+    for sym, t_type, entry, exit_price, pnl, exit_date, comm, risk in rows:
+        line = f"{sym} {t_type.upper()} | {entry} → {exit_price} | {pnl:+.2f}% | {exit_date} | Риск {risk}%"
         if comm:
             line += f"\n💬 {comm}"
         lines.append(line)
@@ -296,6 +309,13 @@ async def edit_save(msg: types.Message, state: FSMContext):
 
     conn = sqlite3.connect(DB_PATH)
     conn.execute(f"UPDATE trades SET { {'sl':'stop_loss','pct':'percent'}.get(field, field) } = ? WHERE id = ?", (val, tid))
+    if field in {"sl", "pct"}:
+        entry_price, stop_loss, percent, t_type = conn.execute(
+            "SELECT entry_price, stop_loss, percent, trade_type FROM trades WHERE id=?",
+            (tid,)
+        ).fetchone()
+        risk = calc_risk(entry_price, stop_loss, percent, t_type)
+        conn.execute("UPDATE trades SET risk_percent=? WHERE id=?", (risk, tid))
     conn.commit(); conn.close()
 
     await msg.answer("✅ Обновлено.")
@@ -358,6 +378,9 @@ async def add_trade_date_choice(msg: types.Message, state: FSMContext):
         await msg.answer("Введите число.")
         return
     await state.update_data(percent=float(msg.text.replace(",", ".")))
+    data = await state.get_data()
+    risk = calc_risk(data['entry_price'], data['stop_loss'], data['percent'], data['trade_type'])
+    await state.update_data(risk=risk)
     kb = with_back(
         InlineKeyboardMarkup(
             inline_keyboard=[
@@ -413,6 +436,7 @@ async def show_trade_summary(uid: int, state: FSMContext):
             f"Стоп: {data['stop_loss']}\n"
             f"Цели: {data['targets']}\n"
             f"% от депо: {data['percent']}\n"
+            f"Риск: {data['risk']}%\n"
             f"Дата: {data['entry_date']}")
     if data.get('comment'):
         text += f"\nКомментарий: {data['comment']}"
@@ -430,9 +454,9 @@ async def add_trade_save(cb: types.CallbackQuery, state: FSMContext):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "INSERT INTO trades (user_id, trade_type, symbol, entry_price, stop_loss, "
-            "targets, percent, entry_date, comment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "targets, percent, risk_percent, entry_date, comment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (cb.from_user.id, data['trade_type'], data['symbol'], data['entry_price'],
-             data['stop_loss'], data['targets'], data['percent'], data['entry_date'], data.get('comment'))
+             data['stop_loss'], data['targets'], data['percent'], data['risk'], data['entry_date'], data.get('comment'))
         )
     await cb.message.answer("✅ Сделка сохранена.")
     await go_home(cb.from_user.id, state)
@@ -501,15 +525,17 @@ async def close_trade_finish(msg: types.Message, state: FSMContext):
         pnl = ((exit_price - entry_price) / entry_price) * (100 if t_type.lower() == "long" else -100)
         profit = round(pnl * close_pct / 100, 2)
         exit_date = datetime.now().strftime("%Y-%m-%d")
+        risk_close = calc_risk(entry_price, sl, close_pct, t_type)
         cur.execute(
-            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, stop_loss, targets, percent, entry_date, exit_price, exit_date, pnl, profit_percent, comment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (user_id, t_type, sym, entry_price, sl, tgt, close_pct, entry_date, exit_price, exit_date, pnl, profit, comment)
+            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, stop_loss, targets, percent, risk_percent, entry_date, exit_price, exit_date, pnl, profit_percent, comment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, t_type, sym, entry_price, sl, tgt, close_pct, risk_close, entry_date, exit_price, exit_date, pnl, profit, comment)
         )
         remaining = percent - close_pct
         if remaining <= 0:
             cur.execute("DELETE FROM trades WHERE id=?", (tid,))
         else:
-            cur.execute("UPDATE trades SET percent=? WHERE id=?", (remaining, tid))
+            risk_remain = calc_risk(entry_price, sl, remaining, t_type)
+            cur.execute("UPDATE trades SET percent=?, risk_percent=? WHERE id=?", (remaining, risk_remain, tid))
         conn.commit()
     await msg.answer(f"Закрыто {close_pct}% | PNL: {pnl:+.2f}% | Profit: {profit}%")
     await go_home(msg.from_user.id, state)
