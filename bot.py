@@ -499,9 +499,10 @@ def reports_menu_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🧠 Сетап-анализ", callback_data="setup_analysis"),
             ],
             [
+                InlineKeyboardButton(text="⚔ Битва сетапов", callback_data="setup_battle"),
                 InlineKeyboardButton(text="🧹 Очистить отчёты", callback_data="clear_reports"),
-                InlineKeyboardButton(text="🧹 Очистить сетапы", callback_data="reset_setup_analysis"),
             ],
+            [InlineKeyboardButton(text="🧹 Очистить сетапы", callback_data="reset_setup_analysis")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
         ]
     )
@@ -1513,6 +1514,62 @@ async def clear_all_confirm(msg: types.Message, state: FSMContext):
     await go_home(msg.from_user.id, state)
 
 
+def build_setup_battle(uid: int) -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT signals, profit_percent FROM trades
+            WHERE user_id=? AND exit_price IS NOT NULL AND signals IS NOT NULL AND signals != '' AND COALESCE(is_deleted,0)=0
+            """,
+            (uid,),
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return "Нет завершённых сделок с сигналами."
+    combo_stats: dict[str, dict[str, float]] = {}
+    for sig_str, pct in rows:
+        sigs = [s for s in sig_str.split(";") if s]
+        if len(sigs) < 2:
+            continue
+        win = pct > 0
+        for r in range(2, min(len(sigs), 5) + 1):
+            for combo in combinations(sorted(set(sigs)), r):
+                key = " + ".join(combo)
+                st = combo_stats.setdefault(key, {"count": 0, "profit_sum": 0.0, "wins": 0})
+                st["count"] += 1
+                st["profit_sum"] += pct
+                if win:
+                    st["wins"] += 1
+    if not combo_stats:
+        return "Нет связок сигналов."
+    lines = ["⚔ Битва сетапов", ""]
+    for st in combo_stats.values():
+        st["avg"] = st["profit_sum"] / st["count"]
+        st["wr"] = st["wins"] / st["count"] * 100
+    best = [item for item in combo_stats.items() if item[1]["avg"] > 0]
+    best = sorted(best, key=lambda kv: kv[1]["avg"], reverse=True)[:5]
+    if best:
+        lines.append("🏆 Топ-5 связок по прибыли:")
+        for i, (name, st) in enumerate(best, 1):
+            lines.append(
+                f"№{i}: {name} — {st['count']} сделок / {st['avg']:+.1f}% / winrate {st['wr']:.0f}%"
+            )
+    else:
+        lines.append("Нет прибыльных связок.")
+    worst = [item for item in combo_stats.items() if item[1]["avg"] < 0]
+    worst = sorted(worst, key=lambda kv: kv[1]["avg"])[:5]
+    if worst:
+        lines.append("\n💀 Худшие связки:")
+        for i, (name, st) in enumerate(worst, 1):
+            lines.append(
+                f"№{i}: {name} — {st['count']} сделок / {st['avg']:+.1f}% / winrate {st['wr']:.0f}%"
+            )
+    else:
+        lines.append("\nНет убыточных связок.")
+    return "\n".join(lines)
+
+
 def build_setup_analysis(uid: int) -> str:
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
@@ -1584,6 +1641,15 @@ def build_setup_analysis(uid: int) -> str:
         for pair, st in loss_pairs:
             lines.append(f"{pair} — {st['losses']}")
     return "\n".join(lines)
+
+
+@dp.callback_query(F.data == "setup_battle")
+async def setup_battle(cb: types.CallbackQuery):
+    await cb.answer()
+    uid = cb.from_user.id
+    text = build_setup_battle(uid)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="reports")]])
+    await cb.message.answer(text, reply_markup=with_back(kb))
 
 
 @dp.callback_query(F.data == "setup_analysis")
