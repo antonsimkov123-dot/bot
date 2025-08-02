@@ -40,8 +40,9 @@ def init_db() -> None:
             percent REAL,
             entry_date TEXT,
             exit_price REAL,
+            exit_date TEXT,
             pnl REAL,
-            profit_percent REAL
+            profit_percent REAL,
             commet TEXT
             
         )
@@ -59,6 +60,9 @@ def add_missing_columns() -> None:
         columns = {row[1] for row in cur.fetchall()}
         if "comment" not in columns:
             cur.execute("ALTER TABLE trades ADD COLUMN comment TEXT")
+            conn.commit()
+        if "exit_date" not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN exit_date TEXT")
             conn.commit()
 
 init_db()
@@ -129,6 +133,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="📈 Графики", callback_data="charts")],
             [InlineKeyboardButton(text="📤 Выгрузить сделки", callback_data="export_csv")],
             [InlineKeyboardButton(text="📂 Текущие сделки", callback_data="active")],
+            [InlineKeyboardButton(text="📜 История сделок", callback_data="history")],
         ]
     )
 
@@ -192,16 +197,35 @@ async def show_active(cb: types.CallbackQuery):
     ikb.append([InlineKeyboardButton(text="🏠 Меню", callback_data="home")])
 
     await cb.message.answer("📂 Текущие сделки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=ikb))
+
+
+@dp.callback_query(F.data == "history")
+async def show_history(cb: types.CallbackQuery):
+    await cb.answer()
+    uid = cb.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT symbol, trade_type, entry_price, exit_price, pnl, exit_date FROM trades "
+            "WHERE user_id=? AND exit_price IS NOT NULL",
+            (uid,),
+        ).fetchall()
+    if not rows:
+        await cb.message.answer("История сделок пуста.")
+        return
+    lines = []
+    for sym, t_type, entry, exit_price, pnl, exit_date in rows:
+        lines.append(
+            f"{sym} {t_type.upper()} | {entry} → {exit_price} | {pnl:+.2f}% | {exit_date}"
+        )
+    text = "\n".join(lines)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Меню", callback_data="home")]])
+    await cb.message.answer("📜 История сделок:\n" + text, reply_markup=kb)
     
     # ───────── Edit-mode FSM ─────────
 class EditState(StatesGroup):
     """Состояния редактирования сделки"""
     choosing_field: State = State()
     entering_value: State = State()
-
-print("DEBUG: EditState declared")
-# ───────────────────────────────────────────────
-    
 
 @dp.callback_query(lambda c: c.data.startswith("edit_"))
 async def edit_choose_field(cb: types.CallbackQuery, state: FSMContext):
@@ -423,8 +447,11 @@ async def close_trade_finish(msg: types.Message, state: FSMContext):
         ).fetchone()
         pnl = ((exit_price - entry_price) / entry_price) * (100 if t_type.lower() == "long" else -100)
         profit = round(pnl * percent / 100, 2)
-        conn.execute("UPDATE trades SET exit_price=?, pnl=?, profit_percent=? WHERE id=?",
-                     (exit_price, pnl, profit, tid))
+        exit_date = datetime.now().strftime("%Y-%m-%d")
+        conn.execute(
+            "UPDATE trades SET exit_price=?, pnl=?, profit_percent=?, exit_date=? WHERE id=?",
+            (exit_price, pnl, profit, exit_date, tid),
+        )
     await msg.answer(f"Закрыта. PNL: {pnl:+.2f}% | Profit: {profit}%")
     await go_home(msg.from_user.id, state)
 
