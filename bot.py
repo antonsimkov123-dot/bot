@@ -49,6 +49,16 @@ def init_db() -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reminders (
+            user_id INTEGER PRIMARY KEY,
+            remind_time TEXT,
+            period_days INTEGER,
+            next_run TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -107,10 +117,22 @@ class DeleteTradeState(StatesGroup):
     choosing_trade = State()
     confirming = State()
 
+class ReminderState(StatesGroup):
+    entering_time = State()
+    choosing_period = State()
+
 # ---------- HELPERS ----------
 def is_float(text: str) -> bool:
     try:
         float(text.replace(",", "."))
+        return True
+    except ValueError:
+        return False
+
+
+def is_time(text: str) -> bool:
+    try:
+        datetime.strptime(text.strip(), "%H:%M")
         return True
     except ValueError:
         return False
@@ -123,6 +145,46 @@ def calc_risk(entry: float, stop: float, pct: float, t_type: str) -> float:
         risk = (stop - entry) / entry * pct
     return round(risk, 2)
 
+
+def list_open_trades(uid: int) -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT symbol, trade_type, entry_price, stop_loss, targets, percent FROM trades WHERE user_id=? AND exit_price IS NULL",
+            (uid,),
+        ).fetchall()
+    if not rows:
+        return ""
+    lines = []
+    for sym, t_type, entry, sl, tgt, pct in rows:
+        lines.append(f"{sym} {t_type.upper()} вход {entry} стоп {sl} цели {tgt} {pct}%")
+    return "\n".join(lines)
+
+
+async def reminder_scheduler():
+    while True:
+        now = datetime.now()
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT user_id, period_days, next_run FROM reminders WHERE next_run<=?",
+                (now.isoformat(),),
+            ).fetchall()
+        for uid, period, next_run in rows:
+            trades_text = list_open_trades(uid)
+            msg = "Проверь, не пора ли закрыть сделку?"
+            if trades_text:
+                msg += "\n" + trades_text
+            else:
+                msg += "\nОткрытых сделок нет."
+            try:
+                await bot.send_message(uid, msg)
+            except Exception:
+                pass
+            next_time = datetime.fromisoformat(next_run) + timedelta(days=period)
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("UPDATE reminders SET next_run=? WHERE user_id=?", (next_time.isoformat(), uid))
+                conn.commit()
+        await asyncio.sleep(60)
+
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -131,6 +193,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🗑 Удалить сделку", callback_data="delete_trade")],
             [InlineKeyboardButton(text="📊 Отчёты", callback_data="reports")],
             [InlineKeyboardButton(text="📈 Графики", callback_data="charts")],
+            [InlineKeyboardButton(text="🔔 Напоминание", callback_data="reminder")],
             [InlineKeyboardButton(text="📤 Выгрузить сделки", callback_data="export_csv")],
             [InlineKeyboardButton(text="📂 Текущие сделки", callback_data="active")],
             [InlineKeyboardButton(text="📜 История сделок", callback_data="history")],
@@ -161,6 +224,54 @@ async def cmd_menu(message: types.Message, state: FSMContext):
 @dp.callback_query(lambda c: c.data == "main_menu")
 async def cb_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    await go_home(cb.from_user.id, state)
+
+# ---------- REMINDER ----------
+@dp.callback_query(F.data == "reminder")
+async def reminder_start(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await cb.message.answer("Введите время напоминания (HH:MM):", reply_markup=with_back(InlineKeyboardMarkup(inline_keyboard=[])))
+    await state.set_state(ReminderState.entering_time)
+
+
+@dp.message(ReminderState.entering_time)
+async def reminder_time(msg: types.Message, state: FSMContext):
+    if not is_time(msg.text):
+        await msg.answer("Формат HH:MM")
+        return
+    await state.update_data(remind_time=msg.text.strip())
+    kb = with_back(
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="Ежедневно", callback_data="period_1")],
+                [InlineKeyboardButton(text="Через день", callback_data="period_2")],
+                [InlineKeyboardButton(text="Раз в неделю", callback_data="period_7")],
+            ]
+        )
+    )
+    await msg.answer("Периодичность:", reply_markup=kb)
+    await state.set_state(ReminderState.choosing_period)
+
+
+@dp.callback_query(ReminderState.choosing_period, lambda c: c.data.startswith("period_"))
+async def reminder_save(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    period = int(cb.data.split("_")[1])
+    data = await state.get_data()
+    t = datetime.strptime(data["remind_time"], "%H:%M").time()
+    now = datetime.now()
+    next_run = datetime.combine(now.date(), t)
+    if next_run <= now:
+        next_run += timedelta(days=period)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO reminders (user_id, remind_time, period_days, next_run) VALUES (?, ?, ?, ?)",
+            (cb.from_user.id, data["remind_time"], period, next_run.isoformat()),
+        )
+        conn.commit()
+    names = {1: "ежедневно", 2: "через день", 7: "раз в неделю"}
+    await cb.message.answer(f"Напоминание на {data['remind_time']} {names[period]} сохранено.")
+    await state.clear()
     await go_home(cb.from_user.id, state)
 # ---------- TRADE -------------
 @dp.callback_query(F.data == "active")
@@ -703,6 +814,11 @@ async def charts(cb: types.CallbackQuery):
     await bot.send_message(cb.from_user.id, "Готово! 😊", reply_markup=kb_restart)
 
 # ---------- RUN ----------
+async def main():
+    asyncio.create_task(reminder_scheduler())
+    await dp.start_polling(bot)
+
+
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    asyncio.run(dp.start_polling(bot))          
+    asyncio.run(main())
