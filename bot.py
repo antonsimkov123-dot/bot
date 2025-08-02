@@ -521,6 +521,7 @@ async def report_scheduler():
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="📈 Профиль", callback_data="profile")],
             [
                 InlineKeyboardButton(text="📦 Сделки", callback_data="trades_menu"),
                 InlineKeyboardButton(text="📊 Отчёты", callback_data="reports"),
@@ -736,6 +737,63 @@ async def cmd_menu(message: types.Message, state: FSMContext):
 async def cb_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     await go_home(cb.from_user.id, state)
+
+
+@dp.callback_query(F.data == "profile")
+async def show_profile(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.clear()
+    uid = cb.from_user.id
+    df = pd.read_sql_query(
+        "SELECT symbol, pnl, signals, entry_date, exit_date FROM trades WHERE user_id=? AND exit_price IS NOT NULL AND COALESCE(is_deleted,0)=0",
+        sqlite3.connect(DB_PATH),
+        params=(uid,),
+    )
+    if df.empty:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]])
+        await cb.message.answer("Нет завершённых сделок.", reply_markup=with_back(kb))
+        return
+    df["entry_date"] = pd.to_datetime(df["entry_date"], errors="coerce")
+    df["exit_date"] = pd.to_datetime(df["exit_date"], errors="coerce")
+    total = len(df)
+    wins = (df["pnl"] > 0)
+    losses = (df["pnl"] < 0)
+    avg_profit = df.loc[wins, "pnl"].mean() if wins.any() else 0
+    avg_loss = df.loc[losses, "pnl"].mean() if losses.any() else 0
+    winrate = wins.sum() / total * 100 if total else 0
+    durations = (df["exit_date"] - df["entry_date"]).dt.days
+    avg_duration = durations.mean() if not durations.empty else 0
+    signal_counts = defaultdict(int)
+    for s in df["signals"].dropna():
+        for sig in map(str.strip, s.split(",")):
+            if sig:
+                signal_counts[sig] += 1
+    top_signal = max(signal_counts, key=signal_counts.get) if signal_counts else "—"
+    coin_mean = df.groupby("symbol")["pnl"].mean()
+    best_coin = coin_mean.idxmax() if not coin_mean.empty else "—"
+    if total < 30 or winrate < 30:
+        rank = "Новичок"
+    elif winrate < 60:
+        rank = "Уверенный"
+    elif winrate < 75:
+        rank = "Снайпер"
+    elif winrate < 90:
+        rank = "Профи"
+    else:
+        rank = "БОГ ТРЕЙДА" if total > 50 else "Профи"
+    text = (
+        "📈 Профиль трейдера:\n"
+        f"🧮 Средняя прибыль: {avg_profit:+.2f}%\n"
+        f"📉 Средний убыток: {avg_loss:+.2f}%\n"
+        f"✅ Винрейт: {winrate:.1f}%\n"
+        f"⏳ Средняя длительность сделки: {avg_duration:.1f} дн.\n"
+        f"🔢 Количество сделок: {total}\n"
+        f"🧠 Самый частый сетап: {top_signal}\n"
+        f"💎 Самый прибыльный коин: {best_coin}\n"
+        f"🏅 Ранг: {rank}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]])
+    await cb.message.answer(text, reply_markup=with_back(kb))
 
 
 @dp.callback_query(F.data == "trades_menu")
