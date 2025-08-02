@@ -4,6 +4,7 @@ import asyncio
 import sqlite3
 from aiogram import F
 from datetime import datetime, timedelta
+import calendar
 from dotenv import load_dotenv
 from collections import defaultdict
 from itertools import combinations
@@ -24,6 +25,38 @@ import matplotlib.pyplot as plt
 # ---------- CONFIG ----------
 BOT_TOKEN = "8205192350:AAHUEmqDQK37-5D7dpcTUeMdpA6WpDACMkc"  # поменяй после теста!
 DB_PATH = "trades.db"
+
+MONTHS_RU = [
+    "",
+    "Январь",
+    "Февраль",
+    "Март",
+    "Апрель",
+    "Май",
+    "Июнь",
+    "Июль",
+    "Август",
+    "Сентябрь",
+    "Октябрь",
+    "Ноябрь",
+    "Декабрь",
+]
+
+MONTHS_RU_GEN = [
+    "",
+    "января",
+    "февраля",
+    "марта",
+    "апреля",
+    "мая",
+    "июня",
+    "июля",
+    "августа",
+    "сентября",
+    "октября",
+    "ноября",
+    "декабря",
+]
 
 # ---------- DATABASE ----------
 def init_db() -> None:
@@ -502,13 +535,55 @@ def reports_menu_kb() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="⚔ Битва сетапов", callback_data="setup_battle"),
-                InlineKeyboardButton(text="🧹 Очистить отчёты", callback_data="clear_reports"),
+                InlineKeyboardButton(text="📆 Календарь сделок", callback_data="calendar"),
             ],
-            [InlineKeyboardButton(text="🧹 Очистить сетапы", callback_data="reset_setup_analysis")],
+            [
+                InlineKeyboardButton(text="🧹 Очистить отчёты", callback_data="clear_reports"),
+                InlineKeyboardButton(text="🧹 Очистить сетапы", callback_data="reset_setup_analysis"),
+            ],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
         ]
     )
     return with_back(kb)
+
+
+def calendar_keyboard(uid: int) -> tuple[str, InlineKeyboardMarkup]:
+    now = datetime.now()
+    year, month = now.year, now.month
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT exit_date FROM trades WHERE user_id=? AND exit_price IS NOT NULL AND exit_date LIKE ? AND COALESCE(is_deleted,0)=0",
+            (uid, f"{year}-{month:02d}-%"),
+        ).fetchall()
+    days_with_trades = {int(r[0].split("-")[2]) for r in rows if r[0]}
+    cal = calendar.Calendar().monthdayscalendar(year, month)
+    text = f"📆 {MONTHS_RU[month]} {year}\n\nПн Вт Ср Чт Пт Сб Вс\n"
+    for week in cal:
+        line = ""
+        for day in week:
+            if day == 0:
+                line += "   "
+            else:
+                icon = "✅" if day in days_with_trades else "▫️"
+                line += f"{day:2d}{icon}"
+                line += " "
+        text += line.rstrip() + "\n"
+    text += "\n✅ — есть сделки\n▫️ — сделок нет\n\nНажми на дату, чтобы посмотреть сделки"
+
+    kb_rows = []
+    for week in cal:
+        row = []
+        for day in week:
+            if day == 0:
+                row.append(InlineKeyboardButton(text=" ", callback_data="ignore"))
+            else:
+                icon = "✅" if day in days_with_trades else "▫️"
+                date_str = f"{year}-{month:02d}-{day:02d}"
+                row.append(InlineKeyboardButton(text=f"{day}{icon}", callback_data=f"day_{date_str}"))
+        kb_rows.append(row)
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="reports")])
+    kb = with_back(InlineKeyboardMarkup(inline_keyboard=kb_rows))
+    return text, kb
 
 
 
@@ -1488,6 +1563,45 @@ async def clear_reports(cb: types.CallbackQuery):
         conn.commit()
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="reports")]])
     await cb.message.answer("Отчёты очищены.", reply_markup=with_back(kb))
+
+
+@dp.callback_query(F.data == "calendar")
+async def show_calendar(cb: types.CallbackQuery):
+    await cb.answer()
+    text, kb = calendar_keyboard(cb.from_user.id)
+    await cb.message.answer(text, reply_markup=kb)
+
+
+@dp.callback_query(lambda c: c.data.startswith("day_"))
+async def show_day_trades(cb: types.CallbackQuery):
+    await cb.answer()
+    date_str = cb.data.split("_", 1)[1]
+    uid = cb.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT symbol, trade_type, pnl, signals, signal_stars FROM trades WHERE user_id=? AND exit_date=? AND exit_price IS NOT NULL AND COALESCE(is_deleted,0)=0",
+            (uid, date_str),
+        ).fetchall()
+    lines = []
+    for i, (sym, t_type, pnl, signals, stars) in enumerate(rows, 1):
+        sigs = signals.split(";") if signals else []
+        lines.append(
+            f"{i}. {sym} {t_type.upper()} ({pnl:+.1f}%) — {len(sigs)} сигнала ({stars}⭐️)"
+        )
+    if lines:
+        text = "\n".join(lines)
+    else:
+        text = "Сделок нет."
+    day = int(date_str[-2:])
+    month = int(date_str[5:7])
+    title = f"{day} {MONTHS_RU_GEN[month]}"
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="calendar")]])
+    await cb.message.answer(f"📅 Сделки {title}:\n" + text, reply_markup=with_back(kb))
+
+
+@dp.callback_query(F.data == "ignore")
+async def ignore_cb(cb: types.CallbackQuery):
+    await cb.answer()
 
 
 @dp.callback_query(F.data == "clear_all")
