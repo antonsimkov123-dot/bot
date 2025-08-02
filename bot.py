@@ -49,6 +49,7 @@ def init_db() -> None:
             comment TEXT,
             signals TEXT,
             signal_stars INTEGER,
+            loss_reasons TEXT,
             is_deleted INTEGER DEFAULT 0
         )
         """
@@ -88,6 +89,9 @@ def add_missing_columns() -> None:
             conn.commit()
         if "signal_stars" not in columns:
             cur.execute("ALTER TABLE trades ADD COLUMN signal_stars INTEGER")
+            conn.commit()
+        if "loss_reasons" not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN loss_reasons TEXT")
             conn.commit()
         if "is_deleted" not in columns:
             cur.execute("ALTER TABLE trades ADD COLUMN is_deleted INTEGER DEFAULT 0")
@@ -149,6 +153,7 @@ class CloseTradeState(StatesGroup):
     choosing_trade = State()
     entering_percent = State()
     entering_exit_price = State()
+    choosing_reasons = State()
 
 class DeleteTradeState(StatesGroup):
     choosing_trade = State()
@@ -260,6 +265,17 @@ SIGNALS_TEXT = (
     "• Локальные уровни без объёма — ★"
     "\nШкала силы: ≤4 слабая • 5–7 умеренная • 8–11 сильная • 12+ очень сильная"
 )
+
+# ---------- LOSS REASONS ----------
+LOSS_REASONS = [
+    "Не дождался ретеста",
+    "Слабые сигналы",
+    "Зашёл на эмоциях",
+    "Передержал",
+    "Нарушил риск-менеджмент",
+    "Просто не повезло",
+]
+
 
 
 def signal_stats(names: list[str]) -> tuple[int, int, int, int]:
@@ -408,6 +424,15 @@ def signals_keyboard() -> InlineKeyboardMarkup:
         for idx, (name, stars) in enumerate(SIGNAL_OPTIONS)
     ]
     buttons.append([InlineKeyboardButton(text="🛑 Завершить выбор", callback_data="signals_done")])
+    return with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+def loss_reasons_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text=reason, callback_data=f"loss_{i}")]
+        for i, reason in enumerate(LOSS_REASONS)
+    ]
+    buttons.append([InlineKeyboardButton(text="✅ Готово", callback_data="loss_done")])
     return with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
@@ -1070,19 +1095,106 @@ async def close_trade_finish(msg: types.Message, state: FSMContext):
         profit = round(pnl * close_pct / 100, 2)
         exit_date = datetime.now().strftime("%Y-%m-%d")
         risk_close = calc_risk(entry_price, sl, close_pct, t_type)
-        cur.execute(
-            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, stop_loss, targets, percent, risk_percent, entry_date, exit_price, exit_date, pnl, profit_percent, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (user_id, t_type, sym, entry_price, sl, tgt, close_pct, risk_close, entry_date, exit_price, exit_date, pnl, profit, comment, signals, sstars),
-        )
         remaining = percent - close_pct
+        risk_remain = calc_risk(entry_price, sl, remaining, t_type) if remaining > 0 else None
+    if pnl < 0:
+        await state.update_data(
+            user_id=user_id,
+            t_type=t_type,
+            sym=sym,
+            entry_price=entry_price,
+            sl=sl,
+            tgt=tgt,
+            entry_date=entry_date,
+            comment=comment,
+            signals=signals,
+            sstars=sstars,
+            exit_price=exit_price,
+            exit_date=exit_date,
+            pnl=pnl,
+            profit=profit,
+            remaining=remaining,
+            close_pct=close_pct,
+            risk_close=risk_close,
+            risk_remain=risk_remain,
+            trade_id=tid,
+            reasons=[],
+        )
+        await msg.answer("Что пошло не так? Выбери причины убытка:", reply_markup=loss_reasons_keyboard())
+        await state.set_state(CloseTradeState.choosing_reasons)
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, stop_loss, targets, percent, risk_percent, entry_date, exit_price, exit_date, pnl, profit_percent, comment, signals, signal_stars, loss_reasons) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (user_id, t_type, sym, entry_price, sl, tgt, close_pct, risk_close, entry_date, exit_price, exit_date, pnl, profit, comment, signals, sstars, None),
+        )
         if remaining <= 0:
             cur.execute("DELETE FROM trades WHERE id=?", (tid,))
         else:
-            risk_remain = calc_risk(entry_price, sl, remaining, t_type)
             cur.execute("UPDATE trades SET percent=?, risk_percent=? WHERE id=?", (remaining, risk_remain, tid))
         conn.commit()
     await msg.answer(f"Закрыто {close_pct}% | PNL: {pnl:+.2f}% | Profit: {profit}%")
     await go_home(msg.from_user.id, state)
+
+
+@dp.callback_query(CloseTradeState.choosing_reasons, lambda c: c.data.startswith("loss_") and c.data != "loss_done")
+async def add_loss_reason(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    idx = int(cb.data.split("_")[1])
+    reason = LOSS_REASONS[idx]
+    data = await state.get_data()
+    reasons = data.get("reasons", [])
+    if reason not in reasons:
+        reasons.append(reason)
+        await state.update_data(reasons=reasons)
+        await cb.message.answer(f"Добавлено: {reason}")
+    else:
+        await cb.message.answer(f"Уже выбрано: {reason}")
+    await cb.message.answer("Выбери ещё или завершай:", reply_markup=loss_reasons_keyboard())
+
+
+@dp.callback_query(CloseTradeState.choosing_reasons, F.data == "loss_done")
+async def loss_reasons_done(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    data = await state.get_data()
+    reasons = ";".join(data.get("reasons", []))
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, stop_loss, targets, percent, risk_percent, entry_date, exit_price, exit_date, pnl, profit_percent, comment, signals, signal_stars, loss_reasons) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                data["user_id"],
+                data["t_type"],
+                data["sym"],
+                data["entry_price"],
+                data["sl"],
+                data["tgt"],
+                data["close_pct"],
+                data["risk_close"],
+                data["entry_date"],
+                data["exit_price"],
+                data["exit_date"],
+                data["pnl"],
+                data["profit"],
+                data["comment"],
+                data["signals"],
+                data["sstars"],
+                reasons,
+            ),
+        )
+        if data["remaining"] <= 0:
+            cur.execute("DELETE FROM trades WHERE id=?", (data["trade_id"],))
+        else:
+            cur.execute(
+                "UPDATE trades SET percent=?, risk_percent=? WHERE id=?",
+                (data["remaining"], data["risk_remain"], data["trade_id"]),
+            )
+        conn.commit()
+    await cb.message.answer(
+        f"Закрыто {data['close_pct']}% | PNL: {data['pnl']:+.2f}% | Profit: {data['profit']}%"
+    )
+    await go_home(cb.from_user.id, state)
 
 # ---------- DELETE TRADE ----------
 @dp.callback_query(lambda c: c.data == "delete_trade")
