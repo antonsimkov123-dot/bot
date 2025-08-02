@@ -304,6 +304,7 @@ async def show_reminders_menu(uid: int, message: types.Message) -> None:
     kb_rows = [[InlineKeyboardButton(text="➕ Добавить", callback_data="add_reminder")]]
     if rows:
         kb_rows.append([InlineKeyboardButton(text="❌ Удалить напоминание", callback_data="del_reminder")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")])
     kb = with_back(InlineKeyboardMarkup(inline_keyboard=kb_rows))
     await message.answer("\n".join(lines), reply_markup=kb)
 
@@ -336,18 +337,40 @@ async def reminder_scheduler():
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
+            [InlineKeyboardButton(text="📦 Сделки", callback_data="trades_menu")],
+            [InlineKeyboardButton(text="📊 Отчёты", callback_data="reports")],
+            [InlineKeyboardButton(text="🔔 Напоминания", callback_data="reminders")],
+            [InlineKeyboardButton(text="🧹 Очистить всё", callback_data="clear_all")],
+        ]
+    )
+
+
+def trades_menu_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
             [InlineKeyboardButton(text="➕ Добавить сделку", callback_data="add_trade")],
             [InlineKeyboardButton(text="✅ Закрыть сделку", callback_data="close_trade")],
             [InlineKeyboardButton(text="🗑 Удалить сделку", callback_data="delete_trade")],
-            [InlineKeyboardButton(text="\U0001f9ee Отчёты", callback_data="reports")],
-            [InlineKeyboardButton(text="📊 Сетап-анализ", callback_data="setup_analysis")],
-            [InlineKeyboardButton(text="📈 Графики", callback_data="charts")],
-            [InlineKeyboardButton(text="🔔 Напоминания", callback_data="reminders")],
             [InlineKeyboardButton(text="📤 Выгрузить сделки", callback_data="export_csv")],
-            [InlineKeyboardButton(text="📂 Текущие сделки", callback_data="active")],
-            [InlineKeyboardButton(text="📜 История сделок", callback_data="history")],
+            [InlineKeyboardButton(text="📋 Текущие сделки", callback_data="active")],
+            [InlineKeyboardButton(text="🧾 История сделок", callback_data="history")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
         ]
     )
+    return with_back(kb)
+
+
+def reports_menu_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📈 Графики", callback_data="charts")],
+            [InlineKeyboardButton(text="🧠 Сетап-анализ", callback_data="setup_analysis")],
+            [InlineKeyboardButton(text="🧹 Очистить отчёты", callback_data="clear_reports")],
+            [InlineKeyboardButton(text="🧹 Очистить сетапы", callback_data="reset_setup_analysis")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
+        ]
+    )
+    return with_back(kb)
 
 
 
@@ -411,6 +434,13 @@ async def cb_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     await go_home(cb.from_user.id, state)
 
+
+@dp.callback_query(F.data == "trades_menu")
+async def trades_menu(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.clear()
+    await cb.message.answer("📦 Сделки:", reply_markup=trades_menu_kb())
+
 # ---------- REMINDER ----------
 @dp.callback_query(F.data == "reminders")
 async def reminders_overview(cb: types.CallbackQuery, state: FSMContext):
@@ -422,9 +452,10 @@ async def reminders_overview(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "add_reminder")
 async def reminder_start(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="reminders")]])
     await cb.message.answer(
         "Введите время напоминания (HH:MM):",
-        reply_markup=with_back(InlineKeyboardMarkup(inline_keyboard=[])),
+        reply_markup=with_back(kb),
     )
     await state.set_state(ReminderState.entering_time)
 
@@ -482,7 +513,8 @@ async def reminder_delete_list(cb: types.CallbackQuery, state: FSMContext):
             (cb.from_user.id,),
         ).fetchall()
     if not rows:
-        await cb.message.answer("У тебя нет активных напоминаний.")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="reminders")]])
+        await cb.message.answer("У тебя нет активных напоминаний.", reply_markup=with_back(kb))
         return
     buttons = [
         [InlineKeyboardButton(text=describe_reminder(t, p, nr), callback_data=f"delr_{rid}")]
@@ -552,7 +584,8 @@ async def show_active(cb: types.CallbackQuery):
     conn.close()
 
     if not rows:
-        return await cb.message.answer("У тебя нет активных сделок.")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="trades_menu")]])
+        return await cb.message.answer("У тебя нет активных сделок.", reply_markup=with_back(kb))
 
     # собираем клавиатуру из сделок
     ikb = []
@@ -569,6 +602,7 @@ async def show_active(cb: types.CallbackQuery):
             InlineKeyboardButton(text="🗑 Удалить",  callback_data=f"del_{tid}"),
             InlineKeyboardButton(text="✅ Закрыть", callback_data=f"close_{tid}"),
         ])
+    ikb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="trades_menu")])
     keyboard = with_back(InlineKeyboardMarkup(inline_keyboard=ikb))
 
     await cb.message.answer("📂 Текущие сделки:", reply_markup=keyboard)
@@ -619,7 +653,8 @@ async def show_history(cb: types.CallbackQuery):
             (uid,),
         ).fetchall()
     if not rows:
-        await cb.message.answer("История сделок пуста.")
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="trades_menu")]])
+        await cb.message.answer("История сделок пуста.", reply_markup=with_back(kb))
         return
     lines = []
     for sym, t_type, entry, exit_price, pnl, exit_date, comm, risk in rows:
@@ -628,7 +663,8 @@ async def show_history(cb: types.CallbackQuery):
             line += f"\n💬 {comm}"
         lines.append(line)
     text = "\n".join(lines)
-    kb = with_back(InlineKeyboardMarkup(inline_keyboard=[]))
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="trades_menu")]])
+    kb = with_back(kb)
     await cb.message.answer("📜 История сделок:\n" + text, reply_markup=kb)
     
     # ───────── Edit-mode FSM ─────────
@@ -1083,22 +1119,22 @@ async def export_csv(cb: types.CallbackQuery):
         return
     path = f"trades_{uid}.csv"
     df.to_csv(path, index=False)
-    await bot.send_document(uid, FSInputFile(path), caption="📤 Твои сделки")
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="trades_menu")]])
+    kb = with_back(kb)
+    await bot.send_document(uid, FSInputFile(path), caption="📤 Твои сделки", reply_markup=kb)
 
 # ---------- REPORTS ----------
 @dp.callback_query(lambda c: c.data == "reports")
-async def reports(cb: types.CallbackQuery):
+async def reports(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    await state.clear()
     uid = cb.from_user.id
     df = pd.read_sql_query(
         "SELECT symbol, pnl, entry_date, exit_date FROM trades WHERE user_id=? AND exit_price IS NOT NULL AND COALESCE(is_deleted,0)=0",
-        sqlite3.connect(DB_PATH), params=(uid,)
+        sqlite3.connect(DB_PATH), params=(uid,),
     )
     if df.empty:
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="\U0001f9f9 Очистить все отчёты", callback_data="clear_reports")]]
-        )
-        await cb.message.answer("Нет завершённых сделок.", reply_markup=with_back(kb))
+        await cb.message.answer("Нет завершённых сделок.", reply_markup=reports_menu_kb())
         return
     df["entry_date"] = pd.to_datetime(df["entry_date"], errors="coerce")
     df["exit_date"] = pd.to_datetime(df["exit_date"], errors="coerce")
@@ -1126,10 +1162,7 @@ async def reports(cb: types.CallbackQuery):
         f"🏆 Лучший: {best} ({coin_mean.max():+.1f}%)\n"
         f"🚨 Худший: {worst} ({coin_mean.min():+.1f}%)"
     )
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="\U0001f9f9 Очистить все отчёты", callback_data="clear_reports")]]
-    )
-    await cb.message.answer(text, reply_markup=with_back(kb))
+    await cb.message.answer(text, reply_markup=reports_menu_kb())
 
 
 @dp.callback_query(F.data == "clear_reports")
@@ -1139,7 +1172,19 @@ async def clear_reports(cb: types.CallbackQuery):
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("DELETE FROM trades WHERE user_id=?", (uid,))
         conn.commit()
-    await cb.message.answer("Отчёты очищены.", reply_markup=with_back(InlineKeyboardMarkup(inline_keyboard=[])))
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="reports")]])
+    await cb.message.answer("Отчёты очищены.", reply_markup=with_back(kb))
+
+
+@dp.callback_query(F.data == "clear_all")
+async def clear_all(cb: types.CallbackQuery):
+    await cb.answer()
+    uid = cb.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM trades WHERE user_id=?", (uid,))
+        conn.commit()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]])
+    await cb.message.answer("Все данные очищены.", reply_markup=with_back(kb))
 
 
 def build_setup_analysis(uid: int) -> str:
@@ -1221,7 +1266,10 @@ async def setup_analysis(cb: types.CallbackQuery):
     uid = cb.from_user.id
     text = build_setup_analysis(uid)
     kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="\U0001f504 Сброс анализа", callback_data="reset_setup_analysis")]]
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🧹 Очистить сетапы", callback_data="reset_setup_analysis")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="reports")],
+        ]
     )
     await cb.message.answer(text, reply_markup=with_back(kb))
 
@@ -1235,7 +1283,8 @@ async def reset_setup_analysis(cb: types.CallbackQuery):
             (cb.from_user.id,),
         )
         conn.commit()
-    await cb.message.answer("Аналитика по сетапам сброшена.", reply_markup=with_back(InlineKeyboardMarkup(inline_keyboard=[])))
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="reports")]])
+    await cb.message.answer("Аналитика по сетапам сброшена.", reply_markup=with_back(kb))
 
 # ---------- CHARTS ----------
 @dp.callback_query(lambda c: c.data == "charts")
