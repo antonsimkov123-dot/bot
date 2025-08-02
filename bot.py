@@ -564,12 +564,13 @@ def reports_menu_kb() -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text="⚔ Битва сетапов", callback_data="setup_battle"),
-                InlineKeyboardButton(text="📆 Календарь сделок", callback_data="calendar"),
+                InlineKeyboardButton(text="🏅 Топ-5 трейдов", callback_data="top_trades"),
             ],
             [
+                InlineKeyboardButton(text="📆 Календарь сделок", callback_data="calendar"),
                 InlineKeyboardButton(text="🧹 Очистить отчёты", callback_data="clear_reports"),
-                InlineKeyboardButton(text="🧹 Очистить сетапы", callback_data="reset_setup_analysis"),
             ],
+            [InlineKeyboardButton(text="🧹 Очистить сетапы", callback_data="reset_setup_analysis")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
         ]
     )
@@ -1955,6 +1956,48 @@ def build_setup_analysis(uid: int) -> str:
     return "\n".join(lines)
 
 
+def build_top_trades(uid: int) -> str:
+    since = (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            """
+            SELECT symbol, pnl, signals, entry_date, exit_date, signal_stars
+            FROM trades
+            WHERE user_id=? AND exit_price IS NOT NULL AND exit_date>=? AND COALESCE(is_deleted,0)=0
+            ORDER BY pnl DESC
+            LIMIT 5
+            """,
+            (uid, since),
+        ).fetchall()
+        best = conn.execute(
+            """
+            SELECT symbol, signal_stars FROM trades
+            WHERE user_id=? AND exit_price IS NOT NULL AND exit_date>=? AND signal_stars IS NOT NULL AND COALESCE(is_deleted,0)=0
+            ORDER BY signal_stars DESC LIMIT 1
+            """,
+            (uid, since),
+        ).fetchone()
+    if not rows:
+        return "❌ Недостаточно данных для рейтинга. Попробуй попозже!"
+    lines = ["🏅 Топ-5 трейдов за последний месяц:\n"]
+    for i, (sym, pnl, sig_str, entry_date, exit_date, _) in enumerate(rows, 1):
+        sigs = []
+        if sig_str:
+            for s in sig_str.split(";"):
+                if s:
+                    sigs.append(f"{s} — {'★'*SIGNAL_STARS.get(s, 0)}")
+        sig_text = "; ".join(sigs) if sigs else "—"
+        lines.append(
+            f"{i}. 📍 {sym}\n   🎯 {pnl:+.2f}%\n   🧠 {sig_text}\n   🕓 {entry_date} — {exit_date}"
+        )
+    if best:
+        lines.append(
+            "\n⭐️ Самый высокозвёздочный сетап месяца:\n"
+            f"📍 {best[0]} — {best[1]}★"
+        )
+    return "\n".join(lines)
+
+
 @dp.callback_query(F.data == "setup_battle")
 async def setup_battle(cb: types.CallbackQuery):
     await cb.answer()
@@ -1975,6 +2018,15 @@ async def setup_analysis(cb: types.CallbackQuery):
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="reports")],
         ]
     )
+    await cb.message.answer(text, reply_markup=with_back(kb))
+
+
+@dp.callback_query(F.data == "top_trades")
+async def top_trades(cb: types.CallbackQuery):
+    await cb.answer()
+    uid = cb.from_user.id
+    text = build_top_trades(uid)
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="reports")]])
     await cb.message.answer(text, reply_markup=with_back(kb))
 
 
