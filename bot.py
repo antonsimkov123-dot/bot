@@ -163,6 +163,10 @@ class ReminderDelState(StatesGroup):
     choosing_reminder = State()
     confirming = State()
 
+
+class ClearAllState(StatesGroup):
+    confirming = State()
+
 # ---------- HELPERS ----------
 def is_float(text: str) -> bool:
     try:
@@ -301,10 +305,10 @@ async def show_reminders_menu(uid: int, message: types.Message) -> None:
         lines.append(f"• {clock_emoji(t)} {describe_reminder(t, period, next_run)}")
     if not rows:
         lines.append("У тебя нет активных напоминаний.")
-    kb_rows = [[InlineKeyboardButton(text="➕ Добавить", callback_data="add_reminder")]]
+    row = [InlineKeyboardButton(text="➕ Добавить", callback_data="add_reminder")]
     if rows:
-        kb_rows.append([InlineKeyboardButton(text="❌ Удалить напоминание", callback_data="del_reminder")])
-    kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")])
+        row.append(InlineKeyboardButton(text="❌ Удалить напоминание", callback_data="del_reminder"))
+    kb_rows = [row, [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]]
     kb = with_back(InlineKeyboardMarkup(inline_keyboard=kb_rows))
     await message.answer("\n".join(lines), reply_markup=kb)
 
@@ -337,10 +341,14 @@ async def reminder_scheduler():
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📦 Сделки", callback_data="trades_menu")],
-            [InlineKeyboardButton(text="📊 Отчёты", callback_data="reports")],
-            [InlineKeyboardButton(text="🔔 Напоминания", callback_data="reminders")],
-            [InlineKeyboardButton(text="🧹 Очистить всё", callback_data="clear_all")],
+            [
+                InlineKeyboardButton(text="📦 Сделки", callback_data="trades_menu"),
+                InlineKeyboardButton(text="📊 Отчёты", callback_data="reports"),
+            ],
+            [
+                InlineKeyboardButton(text="🔔 Напоминания", callback_data="reminders"),
+                InlineKeyboardButton(text="🧹 Очистить всё", callback_data="clear_all"),
+            ],
         ]
     )
 
@@ -348,12 +356,18 @@ def main_menu_kb() -> InlineKeyboardMarkup:
 def trades_menu_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="➕ Добавить сделку", callback_data="add_trade")],
-            [InlineKeyboardButton(text="✅ Закрыть сделку", callback_data="close_trade")],
-            [InlineKeyboardButton(text="🗑 Удалить сделку", callback_data="delete_trade")],
-            [InlineKeyboardButton(text="📤 Выгрузить сделки", callback_data="export_csv")],
-            [InlineKeyboardButton(text="📋 Текущие сделки", callback_data="active")],
-            [InlineKeyboardButton(text="🧾 История сделок", callback_data="history")],
+            [
+                InlineKeyboardButton(text="➕ Добавить сделку", callback_data="add_trade"),
+                InlineKeyboardButton(text="✅ Закрыть сделку", callback_data="close_trade"),
+            ],
+            [
+                InlineKeyboardButton(text="🗑 Удалить сделку", callback_data="delete_trade"),
+                InlineKeyboardButton(text="📤 Выгрузить сделки", callback_data="export_csv"),
+            ],
+            [
+                InlineKeyboardButton(text="📋 Текущие сделки", callback_data="active"),
+                InlineKeyboardButton(text="🧾 История сделок", callback_data="history"),
+            ],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
         ]
     )
@@ -363,10 +377,14 @@ def trades_menu_kb() -> InlineKeyboardMarkup:
 def reports_menu_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="📈 Графики", callback_data="charts")],
-            [InlineKeyboardButton(text="🧠 Сетап-анализ", callback_data="setup_analysis")],
-            [InlineKeyboardButton(text="🧹 Очистить отчёты", callback_data="clear_reports")],
-            [InlineKeyboardButton(text="🧹 Очистить сетапы", callback_data="reset_setup_analysis")],
+            [
+                InlineKeyboardButton(text="📈 Графики", callback_data="charts"),
+                InlineKeyboardButton(text="🧠 Сетап-анализ", callback_data="setup_analysis"),
+            ],
+            [
+                InlineKeyboardButton(text="🧹 Очистить отчёты", callback_data="clear_reports"),
+                InlineKeyboardButton(text="🧹 Очистить сетапы", callback_data="reset_setup_analysis"),
+            ],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
         ]
     )
@@ -377,7 +395,10 @@ def reports_menu_kb() -> InlineKeyboardMarkup:
 def with_back(kb: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
     """Добавляет кнопку «🏠 Меню» в любую inline-клавиатуру"""
     rows = list(kb.inline_keyboard)
-    rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
+    if rows and len(rows[-1]) == 1 and rows[-1][0].text.startswith(("⬅️", "🔙")):
+        rows[-1].append(InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu"))
+    else:
+        rows.append([InlineKeyboardButton(text="🏠 Меню", callback_data="main_menu")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1177,14 +1198,44 @@ async def clear_reports(cb: types.CallbackQuery):
 
 
 @dp.callback_query(F.data == "clear_all")
-async def clear_all(cb: types.CallbackQuery):
+async def clear_all(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    uid = cb.from_user.id
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM trades WHERE user_id=?", (uid,))
-        conn.commit()
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]])
-    await cb.message.answer("Все данные очищены.", reply_markup=with_back(kb))
+    text = (
+        "⚠️ Вы собираетесь удалить ВСЕ данные:\n"
+        "– Сделки (все типы)\n"
+        "– Отчёты\n"
+        "– Сетап-аналитику\n"
+        "– Напоминания\n\n"
+        "Это действие НЕОБРАТИМО.\n"
+        "Чтобы подтвердить, введите: of course\n"
+        "Или нажмите кнопку «Отмена»"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_clear_all")]]
+    )
+    await cb.message.answer(text, reply_markup=with_back(kb))
+    await state.set_state(ClearAllState.confirming)
+
+
+@dp.callback_query(F.data == "cancel_clear_all")
+async def cancel_clear_all(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await cb.message.answer("Операция отменена.")
+    await go_home(cb.from_user.id, state)
+
+
+@dp.message(ClearAllState.confirming)
+async def clear_all_confirm(msg: types.Message, state: FSMContext):
+    if msg.text.strip().lower() == "of course":
+        uid = msg.from_user.id
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("DELETE FROM trades WHERE user_id=?", (uid,))
+            conn.execute("DELETE FROM reminders WHERE user_id=?", (uid,))
+            conn.commit()
+        await msg.answer("Все данные очищены.")
+    else:
+        await msg.answer("Очистка отменена.")
+    await go_home(msg.from_user.id, state)
 
 
 def build_setup_analysis(uid: int) -> str:
