@@ -109,6 +109,7 @@ class TradeState(StatesGroup):
 
 class CloseTradeState(StatesGroup):
     choosing_trade = State()
+    entering_percent = State()
     entering_exit_price = State()
 
 class DeleteTradeState(StatesGroup):
@@ -420,9 +421,9 @@ async def close_trade_list(cb: types.CallbackQuery, state: FSMContext):
         return
     kb = with_back(
         InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text=f"{sym.upper()} {s} @ {e}",
+            inline_keyboard=[[InlineKeyboardButton(text=f"{sym.upper()} {t.upper()} @ {e}",
                                                    callback_data=f"close_{tid}")]
-                             for tid, t, sym, e, s in rows]
+                             for tid, t, sym, e in rows]
         )
     )
     await cb.message.answer("Выберите сделку для закрытия:", reply_markup=kb)
@@ -430,8 +431,25 @@ async def close_trade_list(cb: types.CallbackQuery, state: FSMContext):
 
 @dp.callback_query(lambda c: c.data.startswith("close_"))
 async def close_trade_enter(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
     await state.update_data(trade_id=int(cb.data.split("_")[1]))
-    await bot.send_message(cb.from_user.id, "Цена выхода:")
+    await bot.send_message(cb.from_user.id, "Сколько % закрыть?")
+    await state.set_state(CloseTradeState.entering_percent)
+
+@dp.message(CloseTradeState.entering_percent)
+async def close_trade_get_percent(msg: types.Message, state: FSMContext):
+    if not is_float(msg.text):
+        await msg.answer("Введите число.")
+        return
+    pct = float(msg.text.replace(",", "."))
+    tid = (await state.get_data())["trade_id"]
+    with sqlite3.connect(DB_PATH) as conn:
+        total_pct = conn.execute("SELECT percent FROM trades WHERE id=?", (tid,)).fetchone()[0]
+    if pct <= 0 or pct > total_pct:
+        await msg.answer(f"Доступно от 1 до {total_pct}%.")
+        return
+    await state.update_data(close_percent=pct)
+    await msg.answer("Цена выхода:")
     await state.set_state(CloseTradeState.entering_exit_price)
 
 @dp.message(CloseTradeState.entering_exit_price)
@@ -440,19 +458,29 @@ async def close_trade_finish(msg: types.Message, state: FSMContext):
         await msg.answer("Введите число.")
         return
     exit_price = float(msg.text.replace(",", "."))
-    tid = (await state.get_data())['trade_id']
+    data = await state.get_data()
+    tid = data['trade_id']
+    close_pct = data['close_percent']
     with sqlite3.connect(DB_PATH) as conn:
-        entry_price, t_type, percent = conn.execute(
-            "SELECT entry_price, trade_type, percent FROM trades WHERE id=?", (tid,)
+        cur = conn.cursor()
+        user_id, t_type, sym, entry_price, sl, tgt, percent, entry_date, comment = cur.execute(
+            "SELECT user_id, trade_type, symbol, entry_price, stop_loss, targets, percent, entry_date, comment FROM trades WHERE id=?",
+            (tid,)
         ).fetchone()
         pnl = ((exit_price - entry_price) / entry_price) * (100 if t_type.lower() == "long" else -100)
-        profit = round(pnl * percent / 100, 2)
+        profit = round(pnl * close_pct / 100, 2)
         exit_date = datetime.now().strftime("%Y-%m-%d")
-        conn.execute(
-            "UPDATE trades SET exit_price=?, pnl=?, profit_percent=?, exit_date=? WHERE id=?",
-            (exit_price, pnl, profit, exit_date, tid),
+        cur.execute(
+            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, stop_loss, targets, percent, entry_date, exit_price, exit_date, pnl, profit_percent, comment) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (user_id, t_type, sym, entry_price, sl, tgt, close_pct, entry_date, exit_price, exit_date, pnl, profit, comment)
         )
-    await msg.answer(f"Закрыта. PNL: {pnl:+.2f}% | Profit: {profit}%")
+        remaining = percent - close_pct
+        if remaining <= 0:
+            cur.execute("DELETE FROM trades WHERE id=?", (tid,))
+        else:
+            cur.execute("UPDATE trades SET percent=? WHERE id=?", (remaining, tid))
+        conn.commit()
+    await msg.answer(f"Закрыто {close_pct}% | PNL: {pnl:+.2f}% | Profit: {profit}%")
     await go_home(msg.from_user.id, state)
 
 # ---------- DELETE TRADE ----------
