@@ -175,7 +175,7 @@ async def show_active(cb: types.CallbackQuery):
         if comm:
             caption += f"\n💬 {comm}"
         ikb.append([
-            InlineKeyboardButton(text=caption, callback_data=f"noop_{tid}")  # клика нет, просто строка
+            InlineKeyboardButton(text=caption, callback_data=f"view_{tid}")
         ])
         ikb.append([
             InlineKeyboardButton(text="📝 Изменить", callback_data=f"edit_{tid}"),
@@ -185,6 +185,38 @@ async def show_active(cb: types.CallbackQuery):
     keyboard = with_back(InlineKeyboardMarkup(inline_keyboard=ikb))
 
     await cb.message.answer("📂 Текущие сделки:", reply_markup=keyboard)
+
+
+@dp.callback_query(lambda c: c.data.startswith("view_"))
+async def show_trade_details(cb: types.CallbackQuery):
+    await cb.answer()
+    tid = int(cb.data.split("_")[1])
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT symbol, trade_type, entry_price, stop_loss, targets, percent, entry_date, comment "
+            "FROM trades WHERE id=?",
+            (tid,),
+        ).fetchone()
+    if not row:
+        await cb.message.answer("Сделка не найдена.")
+        return
+    sym, t_type, entry, sl, tgt, pct, date, comm = row
+    text = (
+        f"<b>{sym} {t_type.upper()}</b>\n"
+        f"Вход: {entry}\n"
+        f"Стоп: {sl}\n"
+        f"Цели: {tgt}\n"
+        f"% от депо: {pct}\n"
+        f"Дата входа: {date}"
+    )
+    if comm:
+        text += f"\nКомментарий: {comm}"
+    kb = with_back(
+        InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="active")]]
+        )
+    )
+    await cb.message.answer(text, reply_markup=kb)
 
 
 @dp.callback_query(F.data == "history")
