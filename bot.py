@@ -80,19 +80,6 @@ async def cb_restart(cb: types.CallbackQuery, state: FSMContext):
     # вызываем вашу функцию главного меню
     await go_home(cb.from_user.id, state)   # или отправь /start-меню вручную
 
-# -------- HOME (кнопка "🏠 Меню") --------
-@dp.callback_query(F.data == "home")                # 2. хэндлер
-async def cb_home(cb: types.CallbackQuery, state: FSMContext):
-    await cb.answer()                               # закрыли "часики"
-    await state.clear()                             # очистили FSM
-
-    main_kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="➕ Добавить", callback_data="add")],
-        [InlineKeyboardButton(text="📈 Графики",  callback_data="charts")],
-        [InlineKeyboardButton(text="📤 CSV",      callback_data="csv")],
-    ])
-    await cb.message.answer("🏠 Главное меню", reply_markup=main_kb)
-
 # ---------- STATES ----------
 class TradeState(StatesGroup):
     choosing_type = State()
@@ -195,9 +182,9 @@ async def show_active(cb: types.CallbackQuery):
             InlineKeyboardButton(text="🗑 Удалить",  callback_data=f"del_{tid}"),
             InlineKeyboardButton(text="✅ Закрыть", callback_data=f"close_{tid}"),
         ])
-    ikb.append([InlineKeyboardButton(text="🏠 Меню", callback_data="home")])
+    keyboard = with_back(InlineKeyboardMarkup(inline_keyboard=ikb))
 
-    await cb.message.answer("📂 Текущие сделки:", reply_markup=InlineKeyboardMarkup(inline_keyboard=ikb))
+    await cb.message.answer("📂 Текущие сделки:", reply_markup=keyboard)
 
 
 @dp.callback_query(F.data == "history")
@@ -219,7 +206,7 @@ async def show_history(cb: types.CallbackQuery):
             f"{sym} {t_type.upper()} | {entry} → {exit_price} | {pnl:+.2f}% | {exit_date}"
         )
     text = "\n".join(lines)
-    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🏠 Меню", callback_data="home")]])
+    kb = with_back(InlineKeyboardMarkup(inline_keyboard=[]))
     await cb.message.answer("📜 История сделок:\n" + text, reply_markup=kb)
     
     # ───────── Edit-mode FSM ─────────
@@ -240,7 +227,7 @@ async def edit_choose_field(cb: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="💼 %",      callback_data="field_pct")],
         [InlineKeyboardButton(text="📆 Дата",   callback_data="field_date")],
         [InlineKeyboardButton(text="💬 Коммент",callback_data="field_comment")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="home")]
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu")]
     ])
     await cb.message.answer("Что изменить?", reply_markup=kb)
     await state.set_state(EditState.choosing_field)
