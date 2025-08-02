@@ -815,8 +815,13 @@ async def add_trade_manual_date(msg: types.Message, state: FSMContext):
     await state.set_state(TradeState.entering_comment)
 
 
-async def start_signals_choice(uid: int, state: FSMContext):
-    await state.update_data(signals=[], signals_total=0)
+async def start_signals_choice(uid: int, state: FSMContext, reset: bool = False):
+    if reset:
+        await state.update_data(signals=[], signals_total=0)
+    data = await state.get_data()
+    signals = data.get("signals", [])
+    total, _, _, _ = signal_stats(signals)
+    await state.update_data(signals_total=total)
     await bot.send_message(uid, SIGNALS_TEXT, reply_markup=signals_keyboard())
     await state.set_state(TradeState.choosing_signals)
 
@@ -825,8 +830,8 @@ async def add_trade_comment(msg: types.Message, state: FSMContext):
     comment = msg.text.strip()
     if comment == "-" or comment == "":
         comment = None
-    await state.update_data(comment=comment)
-    await start_signals_choice(msg.from_user.id, state)
+    await state.update_data(comment=comment, signals=[])
+    await start_signals_choice(msg.from_user.id, state, reset=True)
 
 
 @dp.callback_query(TradeState.choosing_signals, lambda c: c.data.startswith("sig_"))
@@ -863,26 +868,79 @@ async def show_trade_summary(uid: int, state: FSMContext):
     data = await state.get_data()
     text = "<b>Сводка сделки</b>\n\n" + format_trade(data)
     kb = with_back(
-        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_add"),
-                              InlineKeyboardButton(text="🔁 Изменить", callback_data="add_trade")]]
+        InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_add"),
+                 InlineKeyboardButton(text="🔁 Изменить", callback_data="add_trade")]
+            ]
         )
     )
     await bot.send_message(uid, text, reply_markup=kb)
     await state.set_state(TradeState.confirming)
 
-@dp.callback_query(lambda c: c.data == "confirm_add")
-async def add_trade_save(cb: types.CallbackQuery, state: FSMContext):
+
+async def save_trade(cb: types.CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
+    signals = data.get('signals', [])
+    total, _, _, _ = signal_stats(signals)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, stop_loss, "
-            "targets, percent, risk_percent, entry_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
-            (cb.from_user.id, data['trade_type'], data['symbol'], data['entry_price'],
-             data['stop_loss'], data['targets'], data['percent'], data['risk'], data['entry_date'],
-             data.get('comment'), ";".join(data.get('signals', [])), data.get('signals_total', 0))
+            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, stop_loss, targets, percent, risk_percent, entry_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                cb.from_user.id,
+                data['trade_type'],
+                data['symbol'],
+                data['entry_price'],
+                data['stop_loss'],
+                data['targets'],
+                data['percent'],
+                data['risk'],
+                data['entry_date'],
+                data.get('comment'),
+                ";".join(signals),
+                total,
+            ),
         )
     await cb.message.answer("✅ Сделка сохранена.")
     await go_home(cb.from_user.id, state)
+
+
+@dp.callback_query(TradeState.confirming, lambda c: c.data == "confirm_add")
+async def add_trade_confirm(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    data = await state.get_data()
+    signals = data.get('signals', [])
+    total, strong, _, _ = signal_stats(signals)
+    if strong < 2 or total < 6:
+        warn = (
+            "⚠️ Внимание!\n"
+            "У сделки недостаточно сильных сигналов:\n"
+            f"– Сильных: {strong} (нужно 2–3+)\n"
+            f"– Всего звёздочек: {total} (рекомендуется 6+)\n"
+            "Такой вход может быть рискованным.\n"
+            "Вы уверены, что хотите сохранить сделку?"
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_force")],
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="confirm_cancel")],
+            ]
+        )
+        await cb.message.answer(warn, reply_markup=kb)
+    else:
+        await save_trade(cb, state)
+
+
+@dp.callback_query(TradeState.confirming, F.data == "confirm_force")
+async def add_trade_force(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await save_trade(cb, state)
+
+
+@dp.callback_query(TradeState.confirming, F.data == "confirm_cancel")
+async def add_trade_cancel(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await start_signals_choice(cb.from_user.id, state)
 
 # ---------- CLOSE TRADE ----------
 @dp.callback_query(lambda c: c.data == "close_trade")
