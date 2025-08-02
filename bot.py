@@ -336,7 +336,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="➕ Добавить сделку", callback_data="add_trade")],
             [InlineKeyboardButton(text="✅ Закрыть сделку", callback_data="close_trade")],
             [InlineKeyboardButton(text="🗑 Удалить сделку", callback_data="delete_trade")],
-            [InlineKeyboardButton(text="📊 Отчёты", callback_data="reports")],
+            [InlineKeyboardButton(text="\U0001f9ee Отчёты", callback_data="reports")],
             [InlineKeyboardButton(text="📊 Сетап-анализ", callback_data="setup_analysis")],
             [InlineKeyboardButton(text="📈 Графики", callback_data="charts")],
             [InlineKeyboardButton(text="🔔 Напоминания", callback_data="reminders")],
@@ -1081,12 +1081,16 @@ async def export_csv(cb: types.CallbackQuery):
 # ---------- REPORTS ----------
 @dp.callback_query(lambda c: c.data == "reports")
 async def reports(cb: types.CallbackQuery):
+    await cb.answer()
     uid = cb.from_user.id
     df = pd.read_sql_query(
         "SELECT symbol, pnl, entry_date, exit_date FROM trades WHERE user_id=? AND exit_price IS NOT NULL",
         sqlite3.connect(DB_PATH), params=(uid,))
     if df.empty:
-        await cb.message.answer("Нет завершённых сделок.")
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="\U0001f9f9 Очистить все отчёты", callback_data="clear_reports")]]
+        )
+        await cb.message.answer("Нет завершённых сделок.", reply_markup=with_back(kb))
         return
     df["entry_date"] = pd.to_datetime(df["entry_date"], errors="coerce")
     df["exit_date"] = pd.to_datetime(df["exit_date"], errors="coerce")
@@ -1114,7 +1118,20 @@ async def reports(cb: types.CallbackQuery):
         f"🏆 Лучший: {best} ({coin_mean.max():+.1f}%)\n"
         f"🚨 Худший: {worst} ({coin_mean.min():+.1f}%)"
     )
-    await cb.message.answer(text)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="\U0001f9f9 Очистить все отчёты", callback_data="clear_reports")]]
+    )
+    await cb.message.answer(text, reply_markup=with_back(kb))
+
+
+@dp.callback_query(F.data == "clear_reports")
+async def clear_reports(cb: types.CallbackQuery):
+    await cb.answer()
+    uid = cb.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM trades WHERE user_id=?", (uid,))
+        conn.commit()
+    await cb.message.answer("Отчёты очищены.", reply_markup=with_back(InlineKeyboardMarkup(inline_keyboard=[])))
 
 
 def build_setup_analysis(uid: int) -> str:
@@ -1192,8 +1209,25 @@ def build_setup_analysis(uid: int) -> str:
 
 @dp.callback_query(F.data == "setup_analysis")
 async def setup_analysis(cb: types.CallbackQuery):
-    text = build_setup_analysis(cb.from_user.id)
-    await cb.message.answer(text, reply_markup=with_back(InlineKeyboardMarkup(inline_keyboard=[])))
+    await cb.answer()
+    uid = cb.from_user.id
+    text = build_setup_analysis(uid)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="\U0001f504 Сброс анализа", callback_data="reset_setup_analysis")]]
+    )
+    await cb.message.answer(text, reply_markup=with_back(kb))
+
+
+@dp.callback_query(F.data == "reset_setup_analysis")
+async def reset_setup_analysis(cb: types.CallbackQuery):
+    await cb.answer()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE trades SET signals=NULL, signal_stars=NULL WHERE user_id=?",
+            (cb.from_user.id,),
+        )
+        conn.commit()
+    await cb.message.answer("Аналитика по сетапам сброшена.", reply_markup=with_back(InlineKeyboardMarkup(inline_keyboard=[])))
 
 # ---------- CHARTS ----------
 @dp.callback_query(lambda c: c.data == "charts")
