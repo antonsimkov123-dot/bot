@@ -339,6 +339,28 @@ def signals_keyboard() -> InlineKeyboardMarkup:
     buttons.append([InlineKeyboardButton(text="🛑 Завершить выбор", callback_data="signals_done")])
     return with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
 
+
+def format_trade(data: dict) -> str:
+    text = (
+        f"Тип: {data['trade_type'].upper()}\n"
+        f"Тикер: {data['symbol']}\n"
+        f"Вход: {data['entry_price']}\n"
+        f"Стоп: {data['stop_loss']}\n"
+        f"Цели: {data['targets']}\n"
+        f"% от депо: {data['percent']}\n"
+        f"Риск: {data['risk']}%\n"
+        f"Дата: {data['entry_date']}"
+    )
+    if data.get('comment'):
+        text += f"\nКомментарий: {data['comment']}"
+    sigs = data.get('signals')
+    if sigs:
+        if isinstance(sigs, str):
+            sigs = [s for s in sigs.split(';') if s]
+        if sigs:
+            text += "\nСигналы: " + ", ".join(sigs)
+    return text
+
 async def go_home(user_id: int, state: FSMContext):
     await state.clear()
     await bot.send_message(user_id, "🏠 Главное меню:", reply_markup=main_menu_kb())
@@ -526,28 +548,29 @@ async def show_trade_details(cb: types.CallbackQuery):
     tid = int(cb.data.split("_")[1])
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT symbol, trade_type, entry_price, stop_loss, targets, percent, entry_date, comment, risk_percent "
+            "SELECT trade_type, symbol, entry_price, stop_loss, targets, percent, risk_percent, entry_date, comment, signals "
             "FROM trades WHERE id=?",
             (tid,),
         ).fetchone()
     if not row:
         await cb.message.answer("Сделка не найдена.")
         return
-    sym, t_type, entry, sl, tgt, pct, date, comm, risk = row
-    text = (
-        f"<b>{sym} {t_type.upper()}</b>\n"
-        f"Вход: {entry}\n"
-        f"Стоп: {sl}\n"
-        f"Цели: {tgt}\n"
-        f"% от депо: {pct}\n"
-        f"Риск: {risk}%\n"
-        f"Дата входа: {date}"
-    )
-    if comm:
-        text += f"\nКомментарий: {comm}"
+    data = {
+        "trade_type": row[0],
+        "symbol": row[1],
+        "entry_price": row[2],
+        "stop_loss": row[3],
+        "targets": row[4],
+        "percent": row[5],
+        "risk": row[6],
+        "entry_date": row[7],
+        "comment": row[8],
+        "signals": row[9],
+    }
+    text = "<b>Сводка сделки</b>\n\n" + format_trade(data)
     kb = with_back(
         InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="active")]]
+            inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="active")]]
         )
     )
     await cb.message.answer(text, reply_markup=kb)
@@ -587,6 +610,30 @@ async def edit_choose_field(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     tid = int(cb.data.split("_")[1])
     await state.update_data(tid=tid)
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT trade_type, symbol, entry_price, stop_loss, targets, percent, risk_percent, entry_date, comment, signals "
+            "FROM trades WHERE id=?",
+            (tid,),
+        ).fetchone()
+    if row:
+        data = {
+            "trade_type": row[0],
+            "symbol": row[1],
+            "entry_price": row[2],
+            "stop_loss": row[3],
+            "targets": row[4],
+            "percent": row[5],
+            "risk": row[6],
+            "entry_date": row[7],
+            "comment": row[8],
+            "signals": row[9],
+        }
+        text = "<b>Сводка сделки</b>\n\n" + format_trade(data)
+        kb_sum = with_back(
+            InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="active")]])
+        )
+        await cb.message.answer(text, reply_markup=kb_sum)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🎯 Цели",   callback_data="field_targets")],
@@ -594,8 +641,9 @@ async def edit_choose_field(cb: types.CallbackQuery, state: FSMContext):
         [InlineKeyboardButton(text="💼 %",      callback_data="field_pct")],
         [InlineKeyboardButton(text="📆 Дата",   callback_data="field_date")],
         [InlineKeyboardButton(text="💬 Коммент",callback_data="field_comment")],
-        [InlineKeyboardButton(text="❌ Отмена", callback_data="main_menu")]
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="active")]
     ])
+    kb = with_back(kb)
     await cb.message.answer("Что изменить?", reply_markup=kb)
     await state.set_state(EditState.choosing_field)
 
@@ -787,20 +835,7 @@ async def show_trade_summary(uid: int, state: FSMContext):
         rating = f"⚖️ Умеренно сильная сделка: ★{total}"
     else:
         rating = f"🔥 Отличный сетап: ★{total}"
-    text = (rating + "\n\n" +
-            f"<b>Сводка сделки</b>\n\n"
-            f"Тип: {data['trade_type'].upper()}\n"
-            f"Тикер: {data['symbol']}\n"
-            f"Вход: {data['entry_price']}\n"
-            f"Стоп: {data['stop_loss']}\n"
-            f"Цели: {data['targets']}\n"
-            f"% от депо: {data['percent']}\n"
-            f"Риск: {data['risk']}%\n"
-            f"Дата: {data['entry_date']}")
-    if data.get('comment'):
-        text += f"\nКомментарий: {data['comment']}"
-    if data.get('signals'):
-        text += "\nСигналы: " + ", ".join(data['signals'])
+    text = rating + "\n\n<b>Сводка сделки</b>\n\n" + format_trade(data)
     kb = with_back(
         InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Подтвердить", callback_data="confirm_add"),
                               InlineKeyboardButton(text="🔁 Изменить", callback_data="add_trade")]]
