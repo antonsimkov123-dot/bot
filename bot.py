@@ -5,6 +5,8 @@ import sqlite3
 from aiogram import F
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+from collections import defaultdict
+from itertools import combinations
 load_dotenv()                    # ← Следите, чтобы ВЫШЕ этого не было кода,
                                  #    использующего os.getenv("BOT_TOKEN")
 from aiogram import Bot, Dispatcher, types, F
@@ -335,6 +337,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="✅ Закрыть сделку", callback_data="close_trade")],
             [InlineKeyboardButton(text="🗑 Удалить сделку", callback_data="delete_trade")],
             [InlineKeyboardButton(text="📊 Отчёты", callback_data="reports")],
+            [InlineKeyboardButton(text="📊 Сетап-анализ", callback_data="setup_analysis")],
             [InlineKeyboardButton(text="📈 Графики", callback_data="charts")],
             [InlineKeyboardButton(text="🔔 Напоминания", callback_data="reminders")],
             [InlineKeyboardButton(text="📤 Выгрузить сделки", callback_data="export_csv")],
@@ -1112,6 +1115,85 @@ async def reports(cb: types.CallbackQuery):
         f"🚨 Худший: {worst} ({coin_mean.min():+.1f}%)"
     )
     await cb.message.answer(text)
+
+
+def build_setup_analysis(uid: int) -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        cur.execute(
+            """
+            SELECT signals, profit_percent FROM trades
+            WHERE user_id=? AND exit_price IS NOT NULL AND signals IS NOT NULL AND signals != ''
+            """,
+            (uid,),
+        )
+        rows = cur.fetchall()
+    if not rows:
+        return "Нет завершённых сделок с сигналами."
+    stats: dict[str, dict[str, float]] = {}
+    pair_stats = defaultdict(lambda: {"wins": 0, "losses": 0})
+    for sig_str, pct in rows:
+        sigs = [s for s in sig_str.split(";") if s]
+        win = pct > 0
+        for s in sigs:
+            st = stats.setdefault(s, {"count": 0, "wins": 0, "losses": 0, "profit_sum": 0.0, "loss_sum": 0.0})
+            st["count"] += 1
+            if win:
+                st["wins"] += 1
+                st["profit_sum"] += pct
+            else:
+                st["losses"] += 1
+                st["loss_sum"] += pct
+        if len(sigs) >= 2:
+            for combo in combinations(sorted(set(sigs)), 2):
+                key = " + ".join(combo)
+                if win:
+                    pair_stats[key]["wins"] += 1
+                else:
+                    pair_stats[key]["losses"] += 1
+    lines = ["📊 Аналитика по сетапам:", ""]
+    for name, st in sorted(stats.items(), key=lambda kv: kv[1]["count"], reverse=True):
+        avg_profit = st["profit_sum"] / st["wins"] if st["wins"] else 0
+        avg_loss = st["loss_sum"] / st["losses"] if st["losses"] else 0
+        winrate = st["wins"] / st["count"] * 100 if st["count"] else 0
+        lines.append(
+            f"• {name} — {st['count']} раз, побед {st['wins']}, убытков {st['losses']}, "
+            f"ср.прибыль {avg_profit:+.1f}%, ср.убыток {avg_loss:+.1f}%, WR {winrate:.1f}%"
+        )
+    top_wr = sorted(stats.items(), key=lambda kv: kv[1]["wins"] / kv[1]["count"] if kv[1]["count"] else 0, reverse=True)[:5]
+    if top_wr:
+        lines.append("\nТОП-5 по винрейту:")
+        for name, st in top_wr:
+            wr = st["wins"] / st["count"] * 100 if st["count"] else 0
+            lines.append(f"{name} — {wr:.1f}% ({st['count']})")
+    top_profit = [item for item in stats.items() if item[1]["wins"]]
+    top_profit = sorted(top_profit, key=lambda kv: kv[1]["profit_sum"] / kv[1]["wins"], reverse=True)[:5]
+    if top_profit:
+        lines.append("\nТОП-5 по среднему профиту:")
+        for name, st in top_profit:
+            lines.append(f"{name} — {st['profit_sum'] / st['wins']:.1f}%")
+    top_losses = sorted(stats.items(), key=lambda kv: kv[1]["losses"], reverse=True)[:5]
+    if top_losses:
+        lines.append("\nТОП-5 по частоте в убыточных:")
+        for name, st in top_losses:
+            lines.append(f"{name} — {st['losses']}")
+    profit_pairs = sorted(pair_stats.items(), key=lambda kv: kv[1]["wins"], reverse=True)[:5]
+    if profit_pairs:
+        lines.append("\nСвязки в профитных:")
+        for pair, st in profit_pairs:
+            lines.append(f"{pair} — {st['wins']}")
+    loss_pairs = sorted(pair_stats.items(), key=lambda kv: kv[1]["losses"], reverse=True)[:5]
+    if loss_pairs:
+        lines.append("\nСвязки в убытках:")
+        for pair, st in loss_pairs:
+            lines.append(f"{pair} — {st['losses']}")
+    return "\n".join(lines)
+
+
+@dp.callback_query(F.data == "setup_analysis")
+async def setup_analysis(cb: types.CallbackQuery):
+    text = build_setup_analysis(cb.from_user.id)
+    await cb.message.answer(text, reply_markup=with_back(InlineKeyboardMarkup(inline_keyboard=[])))
 
 # ---------- CHARTS ----------
 @dp.callback_query(lambda c: c.data == "charts")
