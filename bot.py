@@ -48,8 +48,8 @@ def init_db() -> None:
             profit_percent REAL,
             comment TEXT,
             signals TEXT,
-            signal_stars INTEGER
-
+            signal_stars INTEGER,
+            is_deleted INTEGER DEFAULT 0
         )
         """
     )
@@ -88,6 +88,9 @@ def add_missing_columns() -> None:
             conn.commit()
         if "signal_stars" not in columns:
             cur.execute("ALTER TABLE trades ADD COLUMN signal_stars INTEGER")
+            conn.commit()
+        if "is_deleted" not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN is_deleted INTEGER DEFAULT 0")
             conn.commit()
 
         cur.execute("PRAGMA table_info(reminders)")
@@ -276,7 +279,7 @@ def strength_label(total: int) -> str:
 def list_open_trades(uid: int) -> str:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT symbol, trade_type, entry_price, stop_loss, targets, percent FROM trades WHERE user_id=? AND exit_price IS NULL",
+            "SELECT symbol, trade_type, entry_price, stop_loss, targets, percent FROM trades WHERE user_id=? AND exit_price IS NULL AND COALESCE(is_deleted,0)=0",
             (uid,),
         ).fetchall()
     if not rows:
@@ -543,7 +546,7 @@ async def show_active(cb: types.CallbackQuery):
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
         "SELECT id, symbol, entry_price, stop_loss, targets, percent, entry_date, comment, risk_percent "
-        "FROM trades WHERE user_id=? AND exit_price IS NULL",
+        "FROM trades WHERE user_id=? AND exit_price IS NULL AND COALESCE(is_deleted,0)=0",
         (uid,)
     ).fetchall()
     conn.close()
@@ -612,7 +615,7 @@ async def show_history(cb: types.CallbackQuery):
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
             "SELECT symbol, trade_type, entry_price, exit_price, pnl, exit_date, comment, risk_percent FROM trades "
-            "WHERE user_id=? AND exit_price IS NOT NULL",
+            "WHERE user_id=? AND exit_price IS NOT NULL AND COALESCE(is_deleted,0)=0",
             (uid,),
         ).fetchall()
     if not rows:
@@ -953,7 +956,7 @@ async def close_trade_list(cb: types.CallbackQuery, state: FSMContext):
         rows = conn.execute("""
         SELECT id, trade_type, symbol, entry_price
         FROM trades
-        WHERE user_id=? AND exit_price IS NULL
+        WHERE user_id=? AND exit_price IS NULL AND COALESCE(is_deleted,0)=0
 """, (uid,)).fetchall()
     if not rows:
         await cb.message.answer("Нет открытых сделок.")
@@ -983,7 +986,7 @@ async def close_trade_get_percent(msg: types.Message, state: FSMContext):
     pct = float(msg.text.replace(",", "."))
     tid = (await state.get_data())["trade_id"]
     with sqlite3.connect(DB_PATH) as conn:
-        total_pct = conn.execute("SELECT percent FROM trades WHERE id=?", (tid,)).fetchone()[0]
+        total_pct = conn.execute("SELECT percent FROM trades WHERE id=? AND COALESCE(is_deleted,0)=0", (tid,)).fetchone()[0]
     if pct <= 0 or pct > total_pct:
         await msg.answer(f"Доступно от 1 до {total_pct}%.")
         return
@@ -1003,7 +1006,7 @@ async def close_trade_finish(msg: types.Message, state: FSMContext):
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         user_id, t_type, sym, entry_price, sl, tgt, percent, entry_date, comment, signals, sstars = cur.execute(
-            "SELECT user_id, trade_type, symbol, entry_price, stop_loss, targets, percent, entry_date, comment, signals, signal_stars FROM trades WHERE id=?",
+            "SELECT user_id, trade_type, symbol, entry_price, stop_loss, targets, percent, entry_date, comment, signals, signal_stars FROM trades WHERE id=? AND COALESCE(is_deleted,0)=0",
             (tid,),
         ).fetchone()
         pnl = ((exit_price - entry_price) / entry_price) * (100 if t_type.lower() == "long" else -100)
@@ -1028,8 +1031,10 @@ async def close_trade_finish(msg: types.Message, state: FSMContext):
 @dp.callback_query(lambda c: c.data == "delete_trade")
 async def delete_trade_list(cb: types.CallbackQuery, state: FSMContext):
     uid = cb.from_user.id
-    df = pd.read_sql_query("SELECT id, trade_type, symbol, entry_price FROM trades WHERE user_id=?",
-                           sqlite3.connect(DB_PATH), params=(uid,))
+    df = pd.read_sql_query(
+        "SELECT id, trade_type, symbol, entry_price FROM trades WHERE user_id=? AND COALESCE(is_deleted,0)=0",
+        sqlite3.connect(DB_PATH), params=(uid,)
+    )
     if df.empty:
         await cb.message.answer("Нет сделок для удаления.")
         return
@@ -1061,7 +1066,7 @@ async def delete_trade_confirm(cb: types.CallbackQuery, state: FSMContext):
 async def delete_trade_do(cb: types.CallbackQuery, state: FSMContext):
     tid = (await state.get_data())['delete_id']
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM trades WHERE id=?", (tid,))
+        conn.execute("UPDATE trades SET is_deleted=1 WHERE id=?", (tid,))
     await cb.message.answer("Сделка удалена.")
     await go_home(cb.from_user.id, state)
 
@@ -1069,8 +1074,10 @@ async def delete_trade_do(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(lambda c: c.data == "export_csv")
 async def export_csv(cb: types.CallbackQuery):
     uid = cb.from_user.id
-    df = pd.read_sql_query("SELECT * FROM trades WHERE user_id=?",
-                           sqlite3.connect(DB_PATH), params=(uid,))
+    df = pd.read_sql_query(
+        "SELECT * FROM trades WHERE user_id=? AND COALESCE(is_deleted,0)=0",
+        sqlite3.connect(DB_PATH), params=(uid,)
+    )
     if df.empty:
         await cb.message.answer("Нет данных.")
         return
@@ -1084,8 +1091,9 @@ async def reports(cb: types.CallbackQuery):
     await cb.answer()
     uid = cb.from_user.id
     df = pd.read_sql_query(
-        "SELECT symbol, pnl, entry_date, exit_date FROM trades WHERE user_id=? AND exit_price IS NOT NULL",
-        sqlite3.connect(DB_PATH), params=(uid,))
+        "SELECT symbol, pnl, entry_date, exit_date FROM trades WHERE user_id=? AND exit_price IS NOT NULL AND COALESCE(is_deleted,0)=0",
+        sqlite3.connect(DB_PATH), params=(uid,)
+    )
     if df.empty:
         kb = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="\U0001f9f9 Очистить все отчёты", callback_data="clear_reports")]]
@@ -1140,7 +1148,7 @@ def build_setup_analysis(uid: int) -> str:
         cur.execute(
             """
             SELECT signals, profit_percent FROM trades
-            WHERE user_id=? AND exit_price IS NOT NULL AND signals IS NOT NULL AND signals != ''
+            WHERE user_id=? AND exit_price IS NOT NULL AND signals IS NOT NULL AND signals != '' AND COALESCE(is_deleted,0)=0
             """,
             (uid,),
         )
@@ -1235,8 +1243,9 @@ async def charts(cb: types.CallbackQuery):
     await cb.answer()
     uid = cb.from_user.id
     df = pd.read_sql_query(
-        "SELECT trade_type, pnl, entry_date FROM trades WHERE user_id=? AND exit_price IS NOT NULL",
-        sqlite3.connect(DB_PATH), params=(uid,))
+        "SELECT trade_type, pnl, entry_date FROM trades WHERE user_id=? AND exit_price IS NOT NULL AND COALESCE(is_deleted,0)=0",
+        sqlite3.connect(DB_PATH), params=(uid,)
+    )
     if df.empty:
         await cb.message.answer("Нет данных.")
         return
