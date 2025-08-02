@@ -108,6 +108,17 @@ def init_db() -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS danger_days (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            day_date TEXT,
+            reason TEXT,
+            UNIQUE(user_id, day_date)
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -232,6 +243,10 @@ class AutoReportState(StatesGroup):
     entering_time = State()
     choosing_period = State()
 
+class DangerDayState(StatesGroup):
+    choosing_reason = State()
+    entering_custom = State()
+
 # ---------- HELPERS ----------
 def is_float(text: str) -> bool:
     try:
@@ -255,6 +270,16 @@ def calc_risk(entry: float, stop: float, pct: float, t_type: str) -> float:
     else:
         risk = (stop - entry) / entry * pct
     return round(risk, 2)
+
+
+def save_danger_day(uid: int, reason: str) -> None:
+    date_str = datetime.now().date().isoformat()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO danger_days (user_id, day_date, reason) VALUES (?,?,?)",
+            (uid, date_str, reason),
+        )
+        conn.commit()
 
 
 def clock_emoji(time_str: str) -> str:
@@ -434,6 +459,9 @@ async def show_reminders_menu(uid: int, message: types.Message) -> None:
             InlineKeyboardButton(text="📊 Автоотчёт", callback_data="auto_report"),
         ]
     ]
+    kb_rows.append([
+        InlineKeyboardButton(text="⚠️ Сегодня не трейдить", callback_data="danger_day")
+    ])
     if rows:
         kb_rows.append([InlineKeyboardButton(text="❌ Удалить напоминание", callback_data="del_reminder")])
     kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")])
@@ -555,7 +583,12 @@ def calendar_keyboard(uid: int) -> tuple[str, InlineKeyboardMarkup]:
             "SELECT exit_date FROM trades WHERE user_id=? AND exit_price IS NOT NULL AND exit_date LIKE ? AND COALESCE(is_deleted,0)=0",
             (uid, f"{year}-{month:02d}-%"),
         ).fetchall()
+        drows = conn.execute(
+            "SELECT day_date FROM danger_days WHERE user_id=? AND day_date LIKE ?",
+            (uid, f"{year}-{month:02d}-%"),
+        ).fetchall()
     days_with_trades = {int(r[0].split("-")[2]) for r in rows if r[0]}
+    danger_days = {int(r[0].split("-")[2]) for r in drows if r[0]}
     cal = calendar.Calendar().monthdayscalendar(year, month)
     text = f"📆 {MONTHS_RU[month]} {year}\n\nПн Вт Ср Чт Пт Сб Вс\n"
     for week in cal:
@@ -564,11 +597,16 @@ def calendar_keyboard(uid: int) -> tuple[str, InlineKeyboardMarkup]:
             if day == 0:
                 line += "   "
             else:
-                icon = "✅" if day in days_with_trades else "▫️"
+                if day in danger_days:
+                    icon = "⚠️"
+                elif day in days_with_trades:
+                    icon = "✅"
+                else:
+                    icon = "▫️"
                 line += f"{day:2d}{icon}"
                 line += " "
         text += line.rstrip() + "\n"
-    text += "\n✅ — есть сделки\n▫️ — сделок нет\n\nНажми на дату, чтобы посмотреть сделки"
+    text += "\n✅ — есть сделки\n⚠️ — опасный день\n▫️ — сделок нет\n\nНажми на дату, чтобы посмотреть сделки"
 
     kb_rows = []
     for week in cal:
@@ -577,7 +615,12 @@ def calendar_keyboard(uid: int) -> tuple[str, InlineKeyboardMarkup]:
             if day == 0:
                 row.append(InlineKeyboardButton(text=" ", callback_data="ignore"))
             else:
-                icon = "✅" if day in days_with_trades else "▫️"
+                if day in danger_days:
+                    icon = "⚠️"
+                elif day in days_with_trades:
+                    icon = "✅"
+                else:
+                    icon = "▫️"
                 date_str = f"{year}-{month:02d}-{day:02d}"
                 row.append(InlineKeyboardButton(text=f"{day}{icon}", callback_data=f"day_{date_str}"))
         kb_rows.append(row)
@@ -890,6 +933,65 @@ async def reminder_delete(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.answer("🗑 Напоминание удалено.")
     await state.clear()
     await show_reminders_menu(cb.from_user.id, cb.message)
+
+
+@dp.callback_query(F.data == "danger_day")
+async def danger_day_start(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="😵 Эмоционально нестабилен", callback_data="dng_emo"),
+                InlineKeyboardButton(text="📉 Рынок неясен", callback_data="dng_market"),
+            ],
+            [
+                InlineKeyboardButton(text="📆 Личный день отдыха", callback_data="dng_dayoff"),
+                InlineKeyboardButton(text="💤 Плохой сон / самочувствие", callback_data="dng_sleep"),
+            ],
+            [InlineKeyboardButton(text="✍️ Другая", callback_data="dng_other")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="reminders")],
+        ]
+    )
+    kb = with_back(kb)
+    await cb.message.answer(
+        "❗️Ты решил сегодня не входить в сделки.\n\nУкажи причину:",
+        reply_markup=kb,
+    )
+    await state.set_state(DangerDayState.choosing_reason)
+
+
+@dp.callback_query(DangerDayState.choosing_reason, lambda c: c.data.startswith("dng_"))
+async def danger_reason_chosen(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    code = cb.data.split("_")[1]
+    reasons = {
+        "emo": "Эмоционально нестабилен",
+        "market": "Рынок неясен",
+        "dayoff": "Личный день отдыха",
+        "sleep": "Плохой сон / самочувствие",
+    }
+    if code == "other":
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="danger_day")]]
+        )
+        kb = with_back(kb)
+        await cb.message.answer("Введи свою причину:", reply_markup=kb)
+        await state.set_state(DangerDayState.entering_custom)
+        return
+    reason = reasons.get(code, "")
+    save_danger_day(cb.from_user.id, reason)
+    await cb.message.answer(f"⚠️ День отмечен как опасный: {reason}")
+    await state.clear()
+    await show_reminders_menu(cb.from_user.id, cb.message)
+
+
+@dp.message(DangerDayState.entering_custom)
+async def danger_custom_reason(msg: types.Message, state: FSMContext):
+    reason = msg.text.strip()
+    save_danger_day(msg.from_user.id, reason)
+    await msg.answer(f"⚠️ День отмечен как опасный: {reason}")
+    await state.clear()
+    await show_reminders_menu(msg.from_user.id, msg)
 # ---------- TRADE -------------
 @dp.callback_query(F.data == "active")
 async def show_active(cb: types.CallbackQuery):
@@ -1540,6 +1642,16 @@ async def reports(cb: types.CallbackQuery, state: FSMContext):
     coin_mean = df.groupby("symbol")["pnl"].mean()
     best = coin_mean.idxmax() if not coin_mean.empty else "—"
     worst = coin_mean.idxmin() if not coin_mean.empty else "—"
+    with sqlite3.connect(DB_PATH) as conn:
+        drows = conn.execute(
+            "SELECT day_date FROM danger_days WHERE user_id=?",
+            (uid,),
+        ).fetchall()
+    danger_dates = [r[0] for r in drows]
+    dd_df = df[df["entry_date"].dt.strftime("%Y-%m-%d").isin(danger_dates)]
+    dd_total = len(dd_df)
+    dd_wins = (dd_df["pnl"] > 0).sum()
+    dd_losses = (dd_df["pnl"] <= 0).sum()
     text = (
         f"📅 Неделя: {pnl_week:+.2f}%\n"
         f"📅 Месяц: {pnl_month:+.2f}%\n"
@@ -1551,6 +1663,16 @@ async def reports(cb: types.CallbackQuery, state: FSMContext):
         f"🏆 Лучший: {best} ({coin_mean.max():+.1f}%)\n"
         f"🚨 Худший: {worst} ({coin_mean.min():+.1f}%)"
     )
+    if danger_dates:
+        text += (
+            f"\n\n⚠️ В «опасные» дни ты:\n"
+            f"– всё же открыл сделки: {dd_total} раз\n"
+            f"– из них: {dd_wins} в плюс | {dd_losses} в минус"
+        )
+        if dd_total and dd_losses > dd_wins:
+            text += "\n– Вывод: ты действительно чаще ошибаешься в такие дни."
+        elif dd_total:
+            text += "\n– Вывод: дисциплина не страдает."
     await cb.message.answer(text, reply_markup=reports_menu_kb())
 
 
