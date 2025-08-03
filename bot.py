@@ -728,7 +728,7 @@ def save_spot_history_trade(uid: int, order: dict) -> None:
         dt = datetime.now().strftime("%Y-%m-%d")
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, exit_price, position_size, leverage, stop_loss, targets, percent, risk_percent, entry_date, exit_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, exit_price, position_size, leverage, stop_loss, targets, percent, risk_percent, entry_date, exit_date, comment, signals, signal_stars, pnl, profit_percent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 uid,
                 t_type,
@@ -743,9 +743,11 @@ def save_spot_history_trade(uid: int, order: dict) -> None:
                 None,
                 dt,
                 dt,
-                "Импорт Spot истории", 
+                "Импорт Spot истории",
                 None,
                 None,
+                0.0,
+                0.0,
             ),
         )
         conn.commit()
