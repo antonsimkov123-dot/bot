@@ -646,8 +646,19 @@ async def fetch_bybit_spot_history(api_key: str, api_secret: str) -> tuple[bool,
 
 async def fetch_bybit_balance(
     uid: int, api_key: str, api_secret: str, account_type: str | None = None
-) -> tuple[bool, tuple[float, list[tuple[str, float]]] | str]:
-    async def _try(acc_type: str) -> tuple[bool, tuple[float, list[tuple[str, float]]] | str]:
+) -> tuple[
+    bool,
+    tuple[float, list[tuple[str, float]], list[tuple[str, float, float]]] | str,
+]:
+    """Fetch wallet balance and return total USD, non-stablecoin USD values,
+    and detailed (coin, amount, usd) tuples."""
+
+    async def _try(
+        acc_type: str,
+    ) -> tuple[
+        bool,
+        tuple[float, list[tuple[str, float]], list[tuple[str, float, float]]] | str,
+    ]:
         ts = str(int(time.time() * 1000))
         recv = "5000"
         params = {"accountType": acc_type}
@@ -675,14 +686,22 @@ async def fetch_bybit_balance(
             return False, data.get("retMsg", "")
         total = 0.0
         extra: list[tuple[str, float]] = []
+        details: list[tuple[str, float, float]] = []
         for acc in data.get("result", {}).get("list", []):
             for coin in acc.get("coin", []):
                 usd = float(coin.get("usdValue") or 0)
+                amt = float(
+                    coin.get("equity")
+                    or coin.get("walletBalance")
+                    or coin.get("free")
+                    or 0
+                )
                 total += usd
                 c = coin.get("coin")
                 if c != "USDT" and usd:
                     extra.append((c, usd))
-        return True, (total, extra)
+                details.append((c, amt, usd))
+        return True, (total, extra, details)
 
     first = account_type or "CONTRACT"
     ok, res = await _try(first)
@@ -874,6 +893,174 @@ def process_spot_history(uid: int, orders: list[dict]) -> None:
                 )
                 store_closed_trade(close_data, None)
                 remaining -= close_qty
+
+
+async def get_spot_entry_price(api_key: str, api_secret: str, coin: str) -> float | None:
+    """Calculate average entry price for a spot coin based on trade history."""
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    params = {"category": "spot", "symbol": f"{coin}USDT", "limit": "50"}
+    query = urlencode(params)
+    sign_payload = ts + api_key + recv + query
+    sign = hmac.new(api_secret.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": api_key,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+    }
+    url = "https://api.bybit.com/v5/order/history-trade"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json()
+    except Exception:
+        return None
+    if data.get("retCode") != 0:
+        return None
+    trades = sorted(
+        data.get("result", {}).get("list", []),
+        key=lambda o: int(o.get("execTime", 0)),
+    )
+    qty = 0.0
+    cost = 0.0
+    for o in trades:
+        side = o.get("side")
+        price = float(o.get("avgPrice") or o.get("execPrice") or 0)
+        q = float(o.get("execQty") or 0)
+        if side == "Buy":
+            cost += price * q
+            qty += q
+        elif side == "Sell":
+            qty -= q
+            cost -= price * q
+            if qty < 0:
+                qty = 0
+                cost = 0
+    if qty > 0:
+        return cost / qty
+    return None
+
+
+async def sync_spot_balances(
+    uid: int,
+    api_key: str,
+    api_secret: str,
+    balances: list[tuple[str, float, float]],
+) -> None:
+    """Ensure trades table reflects spot balances."""
+    stable = {"USDT", "USDC"}
+    now = datetime.now().strftime("%Y-%m-%d")
+    balance_map = {c: (amt, usd) for c, amt, usd in balances if amt > 0}
+    for coin, (amt, usd) in balance_map.items():
+        if coin in stable:
+            continue
+        entry = await get_spot_entry_price(api_key, api_secret, coin)
+        if entry is None:
+            price = await fetch_price(coin)
+            entry = price or 0
+        with sqlite3.connect(DB_PATH) as conn:
+            cur = conn.cursor()
+            row = cur.execute(
+                "SELECT id, entry_price, position_size, percent, trade_type, stop_loss, targets, entry_date, comment, signals, signal_stars FROM trades WHERE user_id=? AND symbol=? AND trade_type='SPOT' AND exit_price IS NULL AND COALESCE(is_deleted,0)=0",
+                (uid, coin),
+            ).fetchone()
+            if not row:
+                cur.execute(
+                    "INSERT INTO trades (user_id, trade_type, symbol, entry_price, position_size, leverage, stop_loss, targets, percent, risk_percent, entry_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        uid,
+                        "SPOT",
+                        coin,
+                        entry,
+                        amt,
+                        1,
+                        None,
+                        None,
+                        100.0,
+                        None,
+                        now,
+                        None,
+                        None,
+                        None,
+                    ),
+                )
+                conn.commit()
+            else:
+                tid, e_price, old_size, percent, t_type, sl, tgt, entry_date, comment, signals, sstars = row
+                if amt < (old_size or 0):
+                    closed_qty = (old_size or 0) - amt
+                    close_pct = percent * closed_qty / ((old_size or 1))
+                    exit_price = await fetch_price(coin)
+                    pnl = ((exit_price - e_price) / e_price) * 100 if exit_price else 0
+                    profit = round(pnl * close_pct / 100, 2) if exit_price else 0
+                    close_data = dict(
+                        user_id=uid,
+                        t_type=t_type,
+                        sym=coin,
+                        entry_price=e_price,
+                        sl=sl,
+                        tgt=tgt,
+                        entry_date=entry_date,
+                        comment=comment,
+                        signals=signals,
+                        sstars=sstars,
+                        exit_price=exit_price or e_price,
+                        exit_date=now,
+                        pnl=pnl if exit_price else 0,
+                        profit=profit if exit_price else 0,
+                        remaining=percent - close_pct,
+                        close_pct=close_pct,
+                        risk_close=None,
+                        risk_remain=None,
+                        trade_id=tid,
+                        remain_size=amt,
+                    )
+                    store_closed_trade(close_data, None)
+                else:
+                    new_entry = entry if entry else e_price
+                    cur.execute(
+                        "UPDATE trades SET entry_price=?, position_size=?, percent=100 WHERE id=?",
+                        (new_entry, amt, tid),
+                    )
+                    conn.commit()
+    # close trades absent in balance
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT id, symbol, entry_price, percent, position_size, trade_type, stop_loss, targets, entry_date, comment, signals, signal_stars FROM trades WHERE user_id=? AND trade_type='SPOT' AND exit_price IS NULL AND COALESCE(is_deleted,0)=0",
+            (uid,),
+        ).fetchall()
+    for row in rows:
+        tid, sym, e_price, percent, pos_size, t_type, sl, tgt, entry_date, comment, signals, sstars = row
+        if sym not in balance_map:
+            exit_price = await fetch_price(sym)
+            pnl = ((exit_price - e_price) / e_price) * 100 if exit_price else 0
+            profit = round(pnl * percent / 100, 2) if exit_price else 0
+            close_data = dict(
+                user_id=uid,
+                t_type=t_type,
+                sym=sym,
+                entry_price=e_price,
+                sl=sl,
+                tgt=tgt,
+                entry_date=entry_date,
+                comment=comment,
+                signals=signals,
+                sstars=sstars,
+                exit_price=exit_price or e_price,
+                exit_date=now,
+                pnl=pnl if exit_price else 0,
+                profit=profit if exit_price else 0,
+                remaining=0,
+                close_pct=percent,
+                risk_close=None,
+                risk_remain=None,
+                trade_id=tid,
+                remain_size=0,
+            )
+            store_closed_trade(close_data, None)
 
 
 async def fetch_price(symbol: str) -> float | None:
@@ -1471,7 +1658,7 @@ async def build_profile_text(uid: int, include_balance: bool = False) -> str:
             if row:
                 ok, balinfo = await fetch_bybit_balance(uid, row[0], row[1], row[2])
                 if ok:
-                    total, coins = balinfo
+                    total, coins, _ = balinfo
                     rate = await get_usd_rub_rate()
                     bal_rub = total * rate
                     rub = f"₽{bal_rub:,.0f}".replace(",", " ")
@@ -1521,7 +1708,7 @@ async def build_profile_text(uid: int, include_balance: bool = False) -> str:
         if row:
             ok, balinfo = await fetch_bybit_balance(uid, row[0], row[1], row[2])
             if ok:
-                total, coins = balinfo
+                total, coins, _ = balinfo
                 rate = await get_usd_rub_rate()
                 bal_rub = total * rate
                 detail = (
@@ -2784,12 +2971,16 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
         ok_pos, positions = False, []
     else:
         ok_spot, spot_orders = await fetch_bybit_spot_history(row[0], row[1])
-    if not ok_pos and not ok_spot:
-        if positions == "401" or spot_orders == "401":
+    ok_bal, balinfo = await fetch_bybit_balance(uid, row[0], row[1], row[2])
+    bal_details: list[tuple[str, float, float]] = []
+    if ok_bal:
+        _, _, bal_details = balinfo
+        await sync_spot_balances(uid, row[0], row[1], bal_details)
+    if not ok_pos and not ok_spot and not (ok_bal and bal_details):
+        if positions == "401" or spot_orders == "401" or (not ok_bal and balinfo == "401"):
             await cb.message.answer("❌ Неверный API-ключ или Secret")
         else:
-            okb, _ = await fetch_bybit_balance(uid, row[0], row[1], row[2])
-            if okb:
+            if ok_bal:
                 await cb.message.answer("✅ Ключи активны, но сделок пока не найдено")
             else:
                 await cb.message.answer(
@@ -2813,6 +3004,8 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
             )
         elif not ok_pos or not positions:
             response_lines.append("✅ Ключи активны (Spot), но сделок пока не найдено")
+    if ok_bal and bal_details:
+        response_lines.append("✅ Баланс загружен, спотовые позиции обновлены")
     if response_lines:
         await cb.message.answer("\n".join(response_lines))
     if not ok_pos or not positions:
