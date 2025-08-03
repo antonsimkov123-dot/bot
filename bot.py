@@ -319,6 +319,13 @@ class BybitKeyState(StatesGroup):
 class BybitImportState(StatesGroup):
     choosing = State()
 
+
+class AutoStopState(StatesGroup):
+    choosing_trade = State()
+    choosing_vol = State()
+    entering_custom = State()
+    confirming = State()
+
 # ---------- HELPERS ----------
 def is_float(text: str) -> bool:
     try:
@@ -342,6 +349,45 @@ def calc_risk(entry: float, stop: float, pct: float, t_type: str) -> float:
     else:
         risk = (stop - entry) / entry * pct
     return round(risk, 2)
+
+
+def fmt_price(val: float) -> str:
+    return f"{val:.2f}".rstrip("0").rstrip(".")
+
+
+async def present_auto_calc(msg: types.Message, state: FSMContext, vol: float) -> None:
+    data = await state.get_data()
+    entry = data["entry"]
+    t_type = data["type"]
+    pct = data.get("percent") or 0
+    dist = entry * vol / 100
+    if t_type.lower() == "long":
+        stop = entry - dist
+        targets = [entry + 1.5 * dist, entry + 2.5 * dist, entry + 4 * dist]
+    else:
+        stop = entry + dist
+        targets = [entry - 1.5 * dist, entry - 2.5 * dist, entry - 4 * dist]
+    risk = calc_risk(entry, stop, pct, t_type)
+    await state.update_data(stop=stop, targets=targets, vol=vol, risk=risk)
+    t1, t2, t3 = [fmt_price(t) for t in targets]
+    text = (
+        f"📍 Авторасчёт завершён:\n\n"
+        f"🛑 Стоп: {fmt_price(stop)}\n"
+        "🎯 Цели:\n"
+        f"— 1: {t1} (1.5R)\n"
+        f"— 2: {t2} (2.5R)\n"
+        f"— 3: {t3} (4R)\n\n"
+        "💬 Можешь отредактировать вручную или подтвердить."
+    )
+    buttons = [
+        [
+            InlineKeyboardButton(text="✅ Подтвердить", callback_data="astc_save"),
+            InlineKeyboardButton(text="✏️ Изменить вручную", callback_data=f"edit_{data['tid']}")
+        ],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_stops")],
+    ]
+    await state.set_state(AutoStopState.confirming)
+    await msg.answer(text, reply_markup=with_back(InlineKeyboardMarkup(inline_keyboard=buttons)))
 
 
 def save_danger_day(uid: int, reason: str) -> None:
@@ -2086,7 +2132,6 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
 
 
 @dp.callback_query(lambda c: c.data in {
-    "opt_stops",
     "opt_notify",
     "opt_toggle",
     "opt_autotrade",
@@ -2096,6 +2141,104 @@ async def optimization_stub(cb: types.CallbackQuery):
     if not await require_subscription(cb.message, cb.from_user.id):
         return
     await cb.message.answer("🔒 Функция в разработке. Следи за обновлениями!")
+
+
+@dp.callback_query(F.data == "opt_stops")
+async def auto_stop_choose_trade(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    uid = cb.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT id, symbol, trade_type, entry_price, percent FROM trades "
+            "WHERE user_id=? AND exit_price IS NULL AND entry_price IS NOT NULL "
+            "AND trade_type IS NOT NULL AND COALESCE(is_deleted,0)=0",
+            (uid,),
+        ).fetchall()
+    if not rows:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="optimization")]])
+        await cb.message.answer("❌ Нет сделок с входом для расчёта.", reply_markup=with_back(kb))
+        return
+    buttons = []
+    for tid, sym, ttype, entry, pct in rows:
+        side = "Long" if ttype.lower() == "long" else "Short"
+        buttons.append([
+            InlineKeyboardButton(text=f"🔹 {sym} / {side} / Вход: {fmt_price(entry)}", callback_data=f"ast_{tid}")
+        ])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")])
+    kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
+    await state.set_state(AutoStopState.choosing_trade)
+    await cb.message.answer("Выбери сделку для расчёта:", reply_markup=kb)
+
+
+@dp.callback_query(AutoStopState.choosing_trade, lambda c: c.data.startswith("ast_"))
+async def auto_stop_vol(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    tid = int(cb.data.split("_", 1)[1])
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT trade_type, entry_price, percent FROM trades WHERE id=? AND user_id=? AND exit_price IS NULL AND COALESCE(is_deleted,0)=0",
+            (tid, cb.from_user.id),
+        ).fetchone()
+    if not row:
+        await cb.message.answer("❌ Сделка не найдена.")
+        await state.clear()
+        return
+    await state.update_data(tid=tid, type=row[0], entry=row[1], percent=row[2])
+    buttons = [
+        [InlineKeyboardButton(text="Низкая (2%)", callback_data="astv_2"), InlineKeyboardButton(text="Средняя (4%)", callback_data="astv_4")],
+        [InlineKeyboardButton(text="Высокая (6%)", callback_data="astv_6"), InlineKeyboardButton(text="Другая", callback_data="astv_custom")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_stops")],
+    ]
+    await state.set_state(AutoStopState.choosing_vol)
+    await cb.message.answer(
+        "📊 Укажи ожидаемую волатильность (%) или выбери стандарт:",
+        reply_markup=with_back(InlineKeyboardMarkup(inline_keyboard=buttons)),
+    )
+
+
+@dp.callback_query(AutoStopState.choosing_vol, lambda c: c.data.startswith("astv_") and c.data != "astv_custom")
+async def auto_stop_calc(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    vol = float(cb.data.split("_", 1)[1])
+    await present_auto_calc(cb.message, state, vol)
+
+
+@dp.callback_query(AutoStopState.choosing_vol, F.data == "astv_custom")
+async def auto_stop_custom_prompt(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await cb.message.answer("Введи волатильность в %:")
+    await state.set_state(AutoStopState.entering_custom)
+
+
+@dp.message(AutoStopState.entering_custom)
+async def auto_stop_custom(msg: types.Message, state: FSMContext):
+    if not is_float(msg.text):
+        await msg.answer("Введите число.")
+        return
+    vol = float(msg.text.replace(",", "."))
+    await present_auto_calc(msg, state, vol)
+
+
+@dp.callback_query(AutoStopState.confirming, F.data == "astc_save")
+async def auto_stop_save(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    data = await state.get_data()
+    stop = data["stop"]
+    targets = data["targets"]
+    tid = data["tid"]
+    risk = data.get("risk", 0)
+    targets_str = ",".join(fmt_price(t) for t in targets)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE trades SET stop_loss=?, targets=?, risk_percent=? WHERE id=?",
+            (stop, targets_str, risk, tid),
+        )
+        conn.commit()
+    await state.clear()
+    kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="optimization")]])
+    await cb.message.answer("✅ Авторасчёт применён.", reply_markup=with_back(kb))
 
 
 @dp.callback_query(F.data == "opt_ai")
