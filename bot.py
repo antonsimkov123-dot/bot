@@ -517,7 +517,7 @@ async def fetch_bybit_positions(
                 "symbol": p.get("symbol"),
                 "side": p.get("side"),
                 "leverage": p.get("leverage"),
-                "avgPrice": p.get("avgPrice"),
+                "entryPrice": p.get("entryPrice") or p.get("avgPrice"),
                 "size": p.get("size"),
             }
             for p in data.get("result", {}).get("list", [])
@@ -744,36 +744,49 @@ async def get_usd_rub_rate() -> float:
 
 
 def save_imported_trade(uid: int, pos: dict) -> int:
-    t_type = "Long" if pos.get("side") == "Buy" else "Short"
+    t_type = "Long" if pos.get("side") in {"Buy", "Long"} else "Short"
     sym = pos.get("symbol", "")
     if sym.endswith("USDT"):
         sym = sym[:-4]
-    entry = float(pos.get("avgPrice") or 0)
+    entry = float(pos.get("entryPrice") or pos.get("avgPrice") or 0)
     size = float(pos.get("size") or 0)
     lev = float(pos.get("leverage") or 0)
     entry_date = datetime.now().strftime("%Y-%m-%d")
     with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, position_size, leverage, stop_loss, targets, percent, risk_percent, entry_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                uid,
-                t_type,
-                sym,
-                entry,
-                size,
-                lev,
-                None,
-                None,
-                None,
-                None,
-                entry_date,
-                "Импорт из Bybit",
-                None,
-                None,
-            ),
-        )
+        cur = conn.cursor()
+        row = cur.execute(
+            "SELECT id FROM trades WHERE user_id=? AND symbol=? AND trade_type=? AND exit_price IS NULL AND COALESCE(is_deleted,0)=0",
+            (uid, sym, t_type),
+        ).fetchone()
+        if row:
+            tid = row[0]
+            cur.execute(
+                "UPDATE trades SET entry_price=?, position_size=?, leverage=?, percent=100, entry_date=? WHERE id=?",
+                (entry, size, lev, entry_date, tid),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO trades (user_id, trade_type, symbol, entry_price, position_size, leverage, stop_loss, targets, percent, risk_percent, entry_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    uid,
+                    t_type,
+                    sym,
+                    entry,
+                    size,
+                    lev,
+                    None,
+                    None,
+                    100.0,
+                    None,
+                    entry_date,
+                    "Импорт из Bybit",
+                    None,
+                    None,
+                ),
+            )
+            tid = cur.lastrowid
         conn.commit()
-        return cur.lastrowid
+        return tid
 
 
 def process_spot_history(uid: int, orders: list[dict]) -> None:
@@ -1597,14 +1610,20 @@ def store_closed_trade(data: dict, reason: str | None) -> None:
 
 
 def format_trade(data: dict) -> str:
+    sl = data.get('stop_loss') or '-'
+    tgt = data.get('targets') or '-'
+    pct = data.get('percent')
+    pct_str = pct if pct is not None else '-'
+    risk = data.get('risk')
+    risk_str = f"{risk}%" if risk is not None else '-'
     text = (
         f"Тип: {data['trade_type'].upper()}\n"
         f"Тикер: {data['symbol']}\n"
         f"Вход: {data['entry_price']}\n"
-        f"Стоп: {data['stop_loss']}\n"
-        f"Цели: {data['targets']}\n"
-        f"% от депо: {data['percent']}\n"
-        f"Риск: {data['risk']}%\n"
+        f"Стоп: {sl}\n"
+        f"Цели: {tgt}\n"
+        f"% от депо: {pct_str}\n"
+        f"Риск: {risk_str}\n"
         f"Дата: {data['entry_date']}"
     )
     if data.get('comment'):
@@ -2086,14 +2105,18 @@ async def show_active(cb: types.CallbackQuery):
     ikb = []
     for r in rows:
         tid, sym, ttype, entry, sl, tgt, pct, date, comm, risk = r
+        sl = sl or "-"
+        tgt = tgt or "-"
+        pct_str = f"{pct}%" if pct is not None else "-"
+        risk_str = f"{risk}%" if risk is not None else "-"
         if ttype and ttype.upper() == "SPOT":
-            caption = f"{sym} SPOT @ {fmt_price(entry)} — {pct}%"
+            caption = f"{sym} SPOT @ {fmt_price(entry)} — {pct_str}"
             if comm:
                 caption += f"\n💬 {comm}"
         else:
             caption = (
-                f"{sym} | Вход {fmt_price(entry)}  Стоп {sl}  Цели {tgt}  {pct}%"
-                f" (риск {risk}%) ({date})"
+                f"{sym} | Вход {fmt_price(entry)}  Стоп {sl}  Цели {tgt}  {pct_str}"
+                f" (риск {risk_str}) ({date})"
             )
             if comm:
                 caption += f"\n💬 {comm}"
