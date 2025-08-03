@@ -2,7 +2,12 @@ import os
 import logging
 import asyncio
 import sqlite3
+import time
+import hmac
+import hashlib
+from urllib.parse import urlencode
 from aiogram import F
+import aiohttp
 from datetime import datetime, timedelta
 import calendar
 from dotenv import load_dotenv
@@ -70,6 +75,8 @@ def init_db() -> None:
             trade_type TEXT,
             symbol TEXT,
             entry_price REAL,
+            position_size REAL,
+            leverage REAL,
             stop_loss REAL,
             targets TEXT,
             percent REAL,
@@ -119,6 +126,15 @@ def init_db() -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bybit_keys (
+            user_id INTEGER PRIMARY KEY,
+            api_key TEXT,
+            api_secret TEXT
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -150,6 +166,12 @@ def add_missing_columns() -> None:
         if "is_deleted" not in columns:
             cur.execute("ALTER TABLE trades ADD COLUMN is_deleted INTEGER DEFAULT 0")
             conn.commit()
+        if "position_size" not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN position_size REAL")
+            conn.commit()
+        if "leverage" not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN leverage REAL")
+            conn.commit()
 
         cur.execute("PRAGMA table_info(reminders)")
         rem_cols = {row[1] for row in cur.fetchall()}
@@ -180,6 +202,15 @@ def add_missing_columns() -> None:
                 report_time TEXT,
                 period_days INTEGER,
                 next_run TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS bybit_keys (
+                user_id INTEGER PRIMARY KEY,
+                api_key TEXT,
+                api_secret TEXT
             )
             """
         )
@@ -279,6 +310,15 @@ class DangerDayState(StatesGroup):
     choosing_reason = State()
     entering_custom = State()
 
+
+class BybitKeyState(StatesGroup):
+    api_key = State()
+    api_secret = State()
+
+
+class BybitImportState(StatesGroup):
+    choosing = State()
+
 # ---------- HELPERS ----------
 def is_float(text: str) -> bool:
     try:
@@ -318,6 +358,42 @@ def clock_emoji(time_str: str) -> str:
     hour = int(time_str.split(":")[0])
     clocks = ["🕛", "🕐", "🕑", "🕒", "🕓", "🕔", "🕕", "🕖", "🕗", "🕘", "🕙", "🕚", "🕛"]
     return clocks[hour % 12]
+
+
+async def fetch_bybit_positions(api_key: str, api_secret: str) -> tuple[bool, list | str]:
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    params = {"category": "linear"}
+    query = urlencode(params)
+    sign_payload = ts + api_key + recv + query
+    sign = hmac.new(api_secret.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": api_key,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+    }
+    url = "https://api.bybit.com/v5/position/list"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers) as resp:
+                data = await resp.json()
+    except Exception:
+        return False, "❌ Не удалось связаться с Bybit"
+    if data.get("retCode") != 0:
+        return False, "❌ Неверный API-ключ"
+    items = [
+        {
+            "symbol": p.get("symbol"),
+            "side": p.get("side"),
+            "leverage": p.get("leverage"),
+            "avgPrice": p.get("avgPrice"),
+            "size": p.get("size"),
+        }
+        for p in data.get("result", {}).get("list", [])
+        if float(p.get("size", 0)) != 0
+    ]
+    return True, items
 
 
 def describe_reminder(t: str, period: int, next_run: str) -> str:
@@ -1591,12 +1667,14 @@ async def save_trade(cb: types.CallbackQuery, state: FSMContext) -> None:
     total, _, _, _ = signal_stats(signals)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, stop_loss, targets, percent, risk_percent, entry_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, position_size, leverage, stop_loss, targets, percent, risk_percent, entry_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 cb.from_user.id,
                 data['trade_type'],
                 data['symbol'],
                 data['entry_price'],
+                None,
+                None,
                 data['stop_loss'],
                 data['targets'],
                 data['percent'],
@@ -1900,8 +1978,49 @@ async def optimization_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.answer("🔧 Оптимизация:", reply_markup=optimization_menu_kb())
 
 
+@dp.callback_query(F.data == "opt_bybit")
+async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    uid = cb.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT api_key, api_secret FROM bybit_keys WHERE user_id=?",
+            (uid,),
+        ).fetchone()
+    if not row or not row[0] or not row[1]:
+        await state.set_state(BybitKeyState.api_key)
+        await cb.message.answer(
+            "🔐 Введите свой API-ключ и Secret от Bybit (USDT Perpetual)\n\nСначала отправьте API-ключ:",
+        )
+        return
+    ok, res = await fetch_bybit_positions(row[0], row[1])
+    if not ok:
+        await cb.message.answer(res)
+        return
+    positions = res
+    if not positions:
+        await cb.message.answer("❌ У тебя сейчас нет открытых сделок на Bybit")
+        return
+    buttons = []
+    for idx, p in enumerate(positions):
+        side = "LONG" if p.get("side") == "Buy" else "SHORT"
+        sym = p.get("symbol", "")
+        if sym.endswith("USDT"):
+            sym = sym[:-4]
+        lev = p.get("leverage", "")
+        buttons.append([
+            InlineKeyboardButton(text=f"{side} {sym} {lev}x", callback_data=f"byimp_{idx}")
+        ])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")])
+    kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
+    await state.set_state(BybitImportState.choosing)
+    await state.update_data(positions=positions)
+    await cb.message.answer("Выбери сделку для импорта:", reply_markup=kb)
+
+
 @dp.callback_query(lambda c: c.data in {
-    "opt_bybit",
     "opt_ai",
     "opt_stops",
     "opt_notify",
@@ -1913,6 +2032,73 @@ async def optimization_stub(cb: types.CallbackQuery):
     if not await require_subscription(cb.message, cb.from_user.id):
         return
     await cb.message.answer("🔒 Функция в разработке. Следи за обновлениями!")
+
+
+@dp.message(BybitKeyState.api_key)
+async def bybit_enter_key(msg: types.Message, state: FSMContext):
+    await state.update_data(api_key=msg.text.strip())
+    await state.set_state(BybitKeyState.api_secret)
+    await msg.answer("Теперь введите Secret-ключ:")
+
+
+@dp.message(BybitKeyState.api_secret)
+async def bybit_enter_secret(msg: types.Message, state: FSMContext):
+    data = await state.get_data()
+    api_key = data.get("api_key")
+    api_secret = msg.text.strip()
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO bybit_keys (user_id, api_key, api_secret) VALUES (?,?,?)",
+            (msg.from_user.id, api_key, api_secret),
+        )
+        conn.commit()
+    await state.clear()
+    await msg.answer("✅ Ключи сохранены. Нажми «🔁 Загрузить сделки с Bybit» ещё раз.")
+
+
+@dp.callback_query(BybitImportState.choosing, lambda c: c.data.startswith("byimp_"))
+async def import_bybit_trade(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    data = await state.get_data()
+    positions = data.get("positions", [])
+    idx = int(cb.data.split("_")[1])
+    if idx >= len(positions):
+        await cb.message.answer("Сделка не найдена.")
+        return
+    pos = positions[idx]
+    t_type = "Long" if pos.get("side") == "Buy" else "Short"
+    sym = pos.get("symbol", "")
+    if sym.endswith("USDT"):
+        sym = sym[:-4]
+    entry = float(pos.get("avgPrice") or 0)
+    size = float(pos.get("size") or 0)
+    lev = float(pos.get("leverage") or 0)
+    entry_date = datetime.now().strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, position_size, leverage, stop_loss, targets, percent, risk_percent, entry_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                cb.from_user.id,
+                t_type,
+                sym,
+                entry,
+                size,
+                lev,
+                None,
+                None,
+                None,
+                None,
+                entry_date,
+                "Импорт из Bybit",
+                None,
+                None,
+            ),
+        )
+        conn.commit()
+    await state.clear()
+    await cb.message.answer(
+        "✅ Сделка успешно импортирована из Bybit!\nНе забудь указать стоп и цели — нажми \"📝 Изменить\" в текущих сделках."
+    )
 
 
 @dp.callback_query(F.data == "clear_reports")
