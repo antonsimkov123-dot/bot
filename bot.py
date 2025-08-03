@@ -136,6 +136,14 @@ def init_db() -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS user_settings (
+            user_id INTEGER PRIMARY KEY,
+            is_automation_enabled INTEGER DEFAULT 0
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -218,6 +226,14 @@ def add_missing_columns() -> None:
             )
             """
         )
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS user_settings (
+                user_id INTEGER PRIMARY KEY,
+                is_automation_enabled INTEGER DEFAULT 0
+            )
+            """
+        )
 
 init_db()
 add_missing_columns()      # ← вызов
@@ -258,6 +274,25 @@ async def recheck_subscription(cb: types.CallbackQuery):
         await cb.message.answer("✅ Подписка подтверждена. Теперь можно пользоваться этой функцией.")
     else:
         await require_subscription(cb.message, cb.from_user.id)
+
+
+def is_automation_enabled(uid: int) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT is_automation_enabled FROM user_settings WHERE user_id=?",
+            (uid,),
+        ).fetchone()
+    return bool(row[0]) if row else False
+
+
+def set_automation(uid: int, enabled: bool) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO user_settings (user_id, is_automation_enabled) VALUES (?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET is_automation_enabled=excluded.is_automation_enabled",
+            (uid, int(enabled)),
+        )
+        conn.commit()
 # -------- RESTART
 @dp.callback_query(F.data == "restart")
 async def cb_restart(cb: types.CallbackQuery, state: FSMContext):
@@ -378,6 +413,30 @@ async def present_auto_calc(msg: types.Message, state: FSMContext, vol: float) -
     risk = calc_risk(entry, stop, pct, t_type)
     await state.update_data(stop=stop, targets=targets, vol=vol, risk=risk)
     t1, t2, t3 = [fmt_price(t) for t in targets]
+    if is_automation_enabled(msg.from_user.id):
+        tid = data["tid"]
+        targets_str = ",".join(fmt_price(t) for t in targets)
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE trades SET stop_loss=?, targets=?, risk_percent=? WHERE id=?",
+                (stop, targets_str, risk, tid),
+            )
+            conn.commit()
+        await state.clear()
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="optimization")]]
+        )
+        text = (
+            f"📍 Авторасчёт завершён:\n\n"
+            f"🛑 Стоп: {fmt_price(stop)}\n"
+            "🎯 Цели:\n"
+            f"— 1: {t1} (1.5R)\n"
+            f"— 2: {t2} (2.5R)\n"
+            f"— 3: {t3} (4R)\n\n"
+            "✅ Автоматизация: стоп и цели сохранены."
+        )
+        await msg.answer(text, reply_markup=with_back(kb))
+        return
     text = (
         f"📍 Авторасчёт завершён:\n\n"
         f"🛑 Стоп: {fmt_price(stop)}\n"
@@ -448,6 +507,39 @@ async def fetch_bybit_positions(api_key: str, api_secret: str) -> tuple[bool, li
         if float(p.get("size", 0)) != 0
     ]
     return True, items
+
+
+def save_imported_trade(uid: int, pos: dict) -> int:
+    t_type = "Long" if pos.get("side") == "Buy" else "Short"
+    sym = pos.get("symbol", "")
+    if sym.endswith("USDT"):
+        sym = sym[:-4]
+    entry = float(pos.get("avgPrice") or 0)
+    size = float(pos.get("size") or 0)
+    lev = float(pos.get("leverage") or 0)
+    entry_date = datetime.now().strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.execute(
+            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, position_size, leverage, stop_loss, targets, percent, risk_percent, entry_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                uid,
+                t_type,
+                sym,
+                entry,
+                size,
+                lev,
+                None,
+                None,
+                None,
+                None,
+                entry_date,
+                "Импорт из Bybit",
+                None,
+                None,
+            ),
+        )
+        conn.commit()
+        return cur.lastrowid
 
 
 async def fetch_price(symbol: str) -> float | None:
@@ -824,7 +916,10 @@ def reports_menu_kb() -> InlineKeyboardMarkup:
     return with_back(kb)
 
 
-def optimization_menu_kb() -> InlineKeyboardMarkup:
+def optimization_menu_kb(uid: int) -> InlineKeyboardMarkup:
+    auto_text = (
+        "⚙️ Автоматизация [🟢 вкл]" if is_automation_enabled(uid) else "⚙️ Автоматизация [🔴 выкл]"
+    )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -836,7 +931,7 @@ def optimization_menu_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📬 Уведомления", callback_data="opt_notify"),
             ],
             [
-                InlineKeyboardButton(text="⚙️ Автоматизация [вкл/выкл]", callback_data="opt_toggle"),
+                InlineKeyboardButton(text=auto_text, callback_data="opt_toggle"),
                 InlineKeyboardButton(text="🤖 Автотрейдинг по стратегии", callback_data="opt_autotrade"),
             ],
             [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")],
@@ -1894,6 +1989,14 @@ async def save_trade(cb: types.CallbackQuery, state: FSMContext) -> int:
 
 
 async def ask_notifications(uid: int, trade_id: int, state: FSMContext) -> None:
+    if is_automation_enabled(uid):
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE trades SET notifications_enabled=1 WHERE id=?",
+                (trade_id,),
+            )
+            conn.commit()
+        return
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -1905,6 +2008,44 @@ async def ask_notifications(uid: int, trade_id: int, state: FSMContext) -> None:
     await bot.send_message(uid, "🔔 Включить уведомления для этой сделки?", reply_markup=kb)
     await state.update_data(notif_trade_id=trade_id)
     await state.set_state(NotifyState.choosing)
+
+
+async def maybe_send_ai_advice(uid: int, tid: int) -> None:
+    if not is_automation_enabled(uid):
+        return
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT signals, signal_stars, risk_percent FROM trades WHERE id=? AND user_id=?",
+            (tid, uid),
+        ).fetchone()
+    if not row:
+        return
+    signals, stars, risk = row
+    sig_list = [s for s in (signals or "").split(";") if s]
+    if not sig_list or not risk:
+        return
+    total, strong, _, _ = signal_stats(sig_list)
+    risk = float(risk)
+    if strong >= 2 and risk <= 10:
+        text = (
+            "💡 Сетап оценён!\n\n"
+            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}★\n"
+            f"— Риск: {risk:.1f}%\n\n"
+            "📊 Анализ:\n"
+            "✅ Отличное соотношение сигналов и риска.\n"
+            "💬 Совет: проверь объёмы на 4H, возможен откат."
+        )
+    else:
+        text = (
+            "⚠️ Осторожно: слабый сетап\n\n"
+            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}★\n"
+            f"— Риск: {risk:.1f}%\n\n"
+            "📊 Анализ:\n"
+            "❌ Недостаточно подтверждающих сигналов.\n"
+            "🔺 Повышенный риск.\n"
+            "💬 Совет: дождись ретеста или усиливающего сигнала."
+        )
+    await bot.send_message(uid, text)
 
 
 @dp.callback_query(TradeState.confirming, lambda c: c.data == "confirm_add")
@@ -1933,6 +2074,7 @@ async def add_trade_confirm(cb: types.CallbackQuery, state: FSMContext):
         tid = await save_trade(cb, state)
         await state.clear()
         await ask_notifications(cb.from_user.id, tid, state)
+        await maybe_send_ai_advice(cb.from_user.id, tid)
 
 
 @dp.callback_query(TradeState.confirming, F.data == "confirm_force")
@@ -1941,6 +2083,7 @@ async def add_trade_force(cb: types.CallbackQuery, state: FSMContext):
     tid = await save_trade(cb, state)
     await state.clear()
     await ask_notifications(cb.from_user.id, tid, state)
+    await maybe_send_ai_advice(cb.from_user.id, tid)
 
 
 @dp.callback_query(TradeState.confirming, F.data == "confirm_cancel")
@@ -2218,7 +2361,29 @@ async def optimization_menu(cb: types.CallbackQuery, state: FSMContext):
     if not await require_subscription(cb.message, cb.from_user.id):
         return
     await state.clear()
-    await cb.message.answer("🔧 Оптимизация:", reply_markup=optimization_menu_kb())
+    await cb.message.answer(
+        "🔧 Оптимизация:", reply_markup=optimization_menu_kb(cb.from_user.id)
+    )
+
+
+@dp.callback_query(F.data == "opt_toggle")
+async def toggle_automation(cb: types.CallbackQuery):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    uid = cb.from_user.id
+    enabled = is_automation_enabled(uid)
+    set_automation(uid, not enabled)
+    text = (
+        "✅ Автоматизация включена. Теперь бот будет выполнять действия автоматически (если это возможно)."
+        if not enabled
+        else "🔕 Автоматизация отключена. Теперь все функции работают только вручную."
+    )
+    try:
+        await cb.message.edit_reply_markup(optimization_menu_kb(uid))
+    except Exception:
+        pass
+    await cb.message.answer(text)
 
 
 @dp.callback_query(F.data == "opt_bybit")
@@ -2246,6 +2411,19 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
     if not positions:
         await cb.message.answer("❌ У тебя сейчас нет открытых сделок на Bybit")
         return
+    if is_automation_enabled(uid):
+        for p in positions:
+            tid = save_imported_trade(uid, p)
+            await ask_notifications(uid, tid, state)
+            await maybe_send_ai_advice(uid, tid)
+        await state.clear()
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="optimization")]]
+        )
+        await cb.message.answer(
+            "✅ Сделки автоматически импортированы из Bybit!", reply_markup=with_back(kb)
+        )
+        return
     buttons = []
     for idx, p in enumerate(positions):
         side = "LONG" if p.get("side") == "Buy" else "SHORT"
@@ -2263,10 +2441,7 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.answer("Выбери сделку для импорта:", reply_markup=kb)
 
 
-@dp.callback_query(lambda c: c.data in {
-    "opt_toggle",
-    "opt_autotrade",
-})
+@dp.callback_query(F.data == "opt_autotrade")
 async def optimization_stub(cb: types.CallbackQuery):
     await cb.answer()
     if not await require_subscription(cb.message, cb.from_user.id):
@@ -2480,41 +2655,13 @@ async def import_bybit_trade(cb: types.CallbackQuery, state: FSMContext):
         await cb.message.answer("Сделка не найдена.")
         return
     pos = positions[idx]
-    t_type = "Long" if pos.get("side") == "Buy" else "Short"
-    sym = pos.get("symbol", "")
-    if sym.endswith("USDT"):
-        sym = sym[:-4]
-    entry = float(pos.get("avgPrice") or 0)
-    size = float(pos.get("size") or 0)
-    lev = float(pos.get("leverage") or 0)
-    entry_date = datetime.now().strftime("%Y-%m-%d")
-    with sqlite3.connect(DB_PATH) as conn:
-        cur = conn.execute(
-            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, position_size, leverage, stop_loss, targets, percent, risk_percent, entry_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                cb.from_user.id,
-                t_type,
-                sym,
-                entry,
-                size,
-                lev,
-                None,
-                None,
-                None,
-                None,
-                entry_date,
-                "Импорт из Bybit",
-                None,
-                None,
-            ),
-        )
-        conn.commit()
-        trade_id = cur.lastrowid
+    trade_id = save_imported_trade(cb.from_user.id, pos)
     await state.clear()
     await cb.message.answer(
         "✅ Сделка успешно импортирована из Bybit!\nНе забудь указать стоп и цели — нажми \"📝 Изменить\" в текущих сделках."
     )
     await ask_notifications(cb.from_user.id, trade_id, state)
+    await maybe_send_ai_advice(cb.from_user.id, trade_id)
 
 
 @dp.callback_query(F.data == "opt_notify")
