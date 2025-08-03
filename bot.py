@@ -855,7 +855,10 @@ async def notification_scheduler():
             await process_notifications(uid)
         await asyncio.sleep(3600 * 24)
 
-def main_menu_kb() -> InlineKeyboardMarkup:
+def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
+    opt_text = (
+        "🔧 Оптимизация 🟢" if is_automation_enabled(uid) else "🔧 Оптимизация 🔴"
+    )
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="📈 Профиль", callback_data="profile")],
@@ -868,7 +871,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📅 Напоминания", callback_data="reminders"),
                 InlineKeyboardButton(text="🧹 Очистить всё", callback_data="clear_all"),
             ],
-            [InlineKeyboardButton(text="🔧 Оптимизация", callback_data="optimization")],
+            [InlineKeyboardButton(text=opt_text, callback_data="optimization")],
         ]
     )
 
@@ -918,7 +921,7 @@ def reports_menu_kb() -> InlineKeyboardMarkup:
 
 def optimization_menu_kb(uid: int) -> InlineKeyboardMarkup:
     auto_text = (
-        "⚙️ Автоматизация [🟢 вкл]" if is_automation_enabled(uid) else "⚙️ Автоматизация [🔴 выкл]"
+        "🟢⚙️ Автоматизация [вкл]" if is_automation_enabled(uid) else "🔴⚙️ Автоматизация [выкл]"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -930,10 +933,8 @@ def optimization_menu_kb(uid: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🛠️ Авторасчёт стопов", callback_data="opt_stops"),
                 InlineKeyboardButton(text="📬 Уведомления", callback_data="opt_notify"),
             ],
-            [
-                InlineKeyboardButton(text=auto_text, callback_data="opt_toggle"),
-                InlineKeyboardButton(text="🤖 Автотрейдинг по стратегии", callback_data="opt_autotrade"),
-            ],
+            [InlineKeyboardButton(text="🤖 Автотрейдинг по стратегии", callback_data="opt_autotrade")],
+            [InlineKeyboardButton(text=auto_text, callback_data="opt_toggle")],
             [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")],
         ]
     )
@@ -1086,7 +1087,7 @@ def format_trade(data: dict) -> str:
 
 async def go_home(user_id: int, state: FSMContext):
     await state.clear()
-    await bot.send_message(user_id, "🏠 Главное меню:", reply_markup=main_menu_kb())
+    await bot.send_message(user_id, "🏠 Главное меню:", reply_markup=main_menu_kb(user_id))
 
 # ---------- COMMON ----------
 @dp.message(CommandStart())
