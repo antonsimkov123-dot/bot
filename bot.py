@@ -394,7 +394,7 @@ def is_time(text: str) -> bool:
 
 
 def calc_risk(entry: float, stop: float, pct: float, t_type: str) -> float:
-    if t_type.lower() == "long":
+    if t_type.lower() in {"long", "spot"}:
         risk = (entry - stop) / entry * pct
     else:
         risk = (stop - entry) / entry * pct
@@ -411,7 +411,7 @@ async def present_auto_calc(msg: types.Message, state: FSMContext, vol: float) -
     t_type = data["type"]
     pct = data.get("percent") or 0
     dist = entry * vol / 100
-    if t_type.lower() == "long":
+    if t_type.lower() in {"long", "spot"}:
         stop = entry - dist
         targets = [entry + 1.5 * dist, entry + 2.5 * dist, entry + 4 * dist]
     else:
@@ -738,25 +738,41 @@ def process_spot_history(uid: int, orders: list[dict]) -> None:
         )
         if side == "Buy":
             with sqlite3.connect(DB_PATH) as conn:
-                conn.execute(
-                    "INSERT INTO trades (user_id, trade_type, symbol, entry_price, position_size, leverage, stop_loss, targets, percent, risk_percent, entry_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                    (
-                        uid,
-                        "Long",
-                        base,
-                        price,
-                        qty,
-                        1,
-                        None,
-                        None,
-                        100.0,
-                        None,
-                        dt,
-                        "Спот",
-                        None,
-                        None,
-                    ),
-                )
+                cur = conn.cursor()
+                row = cur.execute(
+                    "SELECT id, entry_price, position_size FROM trades WHERE user_id=? AND symbol=? AND exit_price IS NULL AND trade_type='SPOT' AND COALESCE(is_deleted,0)=0 ORDER BY entry_date, id LIMIT 1",
+                    (uid, base),
+                ).fetchone()
+                if row:
+                    tid, e_price, size = row
+                    new_size = (size or 0) + qty
+                    new_entry = (
+                        (e_price or 0) * (size or 0) + price * qty
+                    ) / new_size if (size or 0) > 0 else price
+                    cur.execute(
+                        "UPDATE trades SET entry_price=?, position_size=?, percent=100 WHERE id=?",
+                        (new_entry, new_size, tid),
+                    )
+                else:
+                    cur.execute(
+                        "INSERT INTO trades (user_id, trade_type, symbol, entry_price, position_size, leverage, stop_loss, targets, percent, risk_percent, entry_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (
+                            uid,
+                            "SPOT",
+                            base,
+                            price,
+                            qty,
+                            1,
+                            None,
+                            None,
+                            100.0,
+                            None,
+                            dt,
+                            None,
+                            None,
+                            None,
+                        ),
+                    )
                 conn.commit()
         elif side == "Sell":
             remaining = qty
@@ -764,7 +780,7 @@ def process_spot_history(uid: int, orders: list[dict]) -> None:
                 with sqlite3.connect(DB_PATH) as conn:
                     cur = conn.cursor()
                     row = cur.execute(
-                        "SELECT id, entry_price, percent, position_size, trade_type, stop_loss, targets, entry_date, comment, signals, signal_stars FROM trades WHERE user_id=? AND symbol=? AND exit_price IS NULL AND COALESCE(is_deleted,0)=0 ORDER BY entry_date, id LIMIT 1",
+                        "SELECT id, entry_price, percent, position_size, trade_type, stop_loss, targets, entry_date, comment, signals, signal_stars FROM trades WHERE user_id=? AND symbol=? AND trade_type='SPOT' AND exit_price IS NULL AND COALESCE(is_deleted,0)=0 ORDER BY entry_date, id LIMIT 1",
                         (uid, base),
                     ).fetchone()
                 if not row:
@@ -786,7 +802,9 @@ def process_spot_history(uid: int, orders: list[dict]) -> None:
                 if close_qty <= 0:
                     break
                 close_pct = percent * close_qty / (pos_size or 1)
-                pnl = ((price - entry_price) / entry_price) * (100 if t_type.lower() == "long" else -100)
+                pnl = ((price - entry_price) / entry_price) * (
+                    100 if t_type.lower() in {"long", "spot"} else -100
+                )
                 profit = round(pnl * close_pct / 100, 2)
                 remain_size = (pos_size or 0) - close_qty
                 close_data = dict(
@@ -934,7 +952,10 @@ def list_open_trades(uid: int) -> str:
         return ""
     lines = []
     for sym, t_type, entry, sl, tgt, pct in rows:
-        lines.append(f"{sym} {t_type.upper()} вход {entry} стоп {sl} цели {tgt} {pct}%")
+        if t_type and t_type.upper() == "SPOT":
+            lines.append(f"{sym} SPOT @ {fmt_price(entry)} — {pct}%")
+        else:
+            lines.append(f"{sym} {t_type.upper()} вход {entry} стоп {sl} цели {tgt} {pct}%")
     return "\n".join(lines)
 
 
@@ -990,7 +1011,9 @@ async def process_notifications(uid: int) -> None:
                 alerts.append("⚠️ Цена близко к тейку/стопу!")
         targets = [float(t) for t in (tgt_str or "").split(",") if t]
         for t in targets:
-            if (t_type.lower() == "long" and price >= t) or (t_type.lower() == "short" and price <= t):
+            if (t_type.lower() in {"long", "spot"} and price >= t) or (
+                t_type.lower() == "short" and price <= t
+            ):
                 alerts.append("🎯 Цель достигнута")
                 break
             if abs(price - t) / t * 100 <= 2:
@@ -1819,7 +1842,7 @@ async def show_active(cb: types.CallbackQuery):
 
     conn = sqlite3.connect(DB_PATH)
     rows = conn.execute(
-        "SELECT id, symbol, entry_price, stop_loss, targets, percent, entry_date, comment, risk_percent "
+        "SELECT id, symbol, trade_type, entry_price, stop_loss, targets, percent, entry_date, comment, risk_percent "
         "FROM trades WHERE user_id=? AND exit_price IS NULL AND COALESCE(is_deleted,0)=0",
         (uid,)
     ).fetchall()
@@ -1832,10 +1855,18 @@ async def show_active(cb: types.CallbackQuery):
     # собираем клавиатуру из сделок
     ikb = []
     for r in rows:
-        tid, sym, entry, sl, tgt, pct, date, comm, risk = r
-        caption = f"{sym} | Вход {entry}  Стоп {sl}  Цели {tgt}  {pct}% (риск {risk}%) ({date})"
-        if comm:
-            caption += f"\n💬 {comm}"
+        tid, sym, ttype, entry, sl, tgt, pct, date, comm, risk = r
+        if ttype and ttype.upper() == "SPOT":
+            caption = f"{sym} SPOT @ {fmt_price(entry)} — {pct}%"
+            if comm:
+                caption += f"\n💬 {comm}"
+        else:
+            caption = (
+                f"{sym} | Вход {fmt_price(entry)}  Стоп {sl}  Цели {tgt}  {pct}%"
+                f" (риск {risk}%) ({date})"
+            )
+            if comm:
+                caption += f"\n💬 {comm}"
         ikb.append([
             InlineKeyboardButton(text=caption, callback_data=f"view_{tid}")
         ])
@@ -2472,7 +2503,9 @@ async def close_trade_finish(msg: types.Message, state: FSMContext):
             "SELECT user_id, trade_type, symbol, entry_price, stop_loss, targets, percent, entry_date, comment, signals, signal_stars FROM trades WHERE id=? AND COALESCE(is_deleted,0)=0",
             (tid,),
         ).fetchone()
-    pnl = ((exit_price - entry_price) / entry_price) * (100 if t_type.lower() == "long" else -100)
+    pnl = ((exit_price - entry_price) / entry_price) * (
+        100 if t_type.lower() in {"long", "spot"} else -100
+    )
     profit = round(pnl * close_pct / 100, 2)
     exit_date = datetime.now().strftime("%Y-%m-%d")
     risk_close = calc_risk(entry_price, sl, close_pct, t_type)
@@ -2789,10 +2822,20 @@ async def auto_stop_choose_trade(cb: types.CallbackQuery, state: FSMContext):
         return
     buttons = []
     for tid, sym, ttype, entry, pct in rows:
-        side = "Long" if ttype.lower() == "long" else "Short"
-        buttons.append([
-            InlineKeyboardButton(text=f"🔹 {sym} / {side} / Вход: {fmt_price(entry)}", callback_data=f"ast_{tid}")
-        ])
+        if ttype.lower() == "short":
+            side = "Short"
+        elif ttype.lower() == "spot":
+            side = "SPOT"
+        else:
+            side = "Long"
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=f"🔹 {sym} / {side} / Вход: {fmt_price(entry)}",
+                    callback_data=f"ast_{tid}",
+                )
+            ]
+        )
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")])
     kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
     await state.set_state(AutoStopState.choosing_trade)
