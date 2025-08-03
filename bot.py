@@ -489,7 +489,7 @@ async def fetch_bybit_positions(
     async def _try(acc_type: str) -> tuple[bool, list | str]:
         ts = str(int(time.time() * 1000))
         recv = "5000"
-        params = {"category": "linear", "accountType": acc_type}
+        params = {"category": "linear", "accountType": acc_type, "settleCoin": "USDT"}
         query = urlencode(params)
         sign_payload = ts + api_key + recv + query
         sign = hmac.new(api_secret.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
@@ -3018,7 +3018,7 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
                 f"✅ Ключи активны ({label}), {len(positions)} сделок загружено"
             )
         else:
-            response_lines.append(f"✅ Ключи активны ({label}), но сделок пока не найдено")
+            response_lines.append("❌ У тебя сейчас нет открытых фьючерсных сделок")
     if ok_spot:
         if spot_orders:
             process_spot_history(uid, spot_orders)
@@ -3053,9 +3053,12 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
         if sym.endswith("USDT"):
             sym = sym[:-4]
         lev = p.get("leverage")
+        entry = p.get("entryPrice") or p.get("avgPrice")
         text = f"{side} {sym}"
         if lev:
             text += f" {lev}x"
+        if entry:
+            text += f" @ {entry}"
         buttons.append([InlineKeyboardButton(text=text, callback_data=f"byimp_{idx}")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")])
     kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
