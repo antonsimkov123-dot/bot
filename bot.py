@@ -565,14 +565,14 @@ async def fetch_bybit_positions(
 
     first = account_type or "CONTRACT"
     ok, res = await _try(first)
-    if ok:
+    if ok and res:
         save_account_type(uid, first)
         return True, res, first
     if res == "401":
         return False, "401", first
     second = "UNIFIED" if first == "CONTRACT" else "CONTRACT"
     ok2, res2 = await _try(second)
-    if ok2:
+    if ok2 and res2:
         save_account_type(uid, second)
         return True, res2, second
     if res2 == "401":
@@ -583,6 +583,13 @@ async def fetch_bybit_positions(
         return True, res3, "SPOT"
     if res3 == "401":
         return False, "401", "SPOT"
+    # if futures endpoints succeeded but positions empty, treat as success
+    if ok:
+        save_account_type(uid, first)
+        return True, res, first
+    if ok2:
+        save_account_type(uid, second)
+        return True, res2, second
     return (
         False,
         "❌ Не удалось связаться с Bybit: оба типа аккаунта не поддерживаются",
@@ -592,8 +599,8 @@ async def fetch_bybit_positions(
 
 async def fetch_bybit_balance(
     uid: int, api_key: str, api_secret: str, account_type: str | None = None
-) -> tuple[bool, float | str]:
-    async def _try(acc_type: str) -> tuple[bool, float | str]:
+) -> tuple[bool, tuple[float, list[tuple[str, float]]] | str]:
+    async def _try(acc_type: str) -> tuple[bool, tuple[float, list[tuple[str, float]]] | str]:
         ts = str(int(time.time() * 1000))
         recv = "5000"
         params = {"accountType": acc_type}
@@ -619,15 +626,16 @@ async def fetch_bybit_balance(
             return False, "http"
         if data.get("retCode") != 0:
             return False, data.get("retMsg", "")
-        bal = 0.0
+        total = 0.0
+        extra: list[tuple[str, float]] = []
         for acc in data.get("result", {}).get("list", []):
             for coin in acc.get("coin", []):
-                if coin.get("coin") == "USDT":
-                    bal = float(coin.get("walletBalance") or 0)
-                    break
-            if bal:
-                break
-        return True, bal
+                usd = float(coin.get("usdValue") or 0)
+                total += usd
+                c = coin.get("coin")
+                if c != "USDT" and usd:
+                    extra.append((c, usd))
+        return True, (total, extra)
 
     first = account_type or "CONTRACT"
     ok, res = await _try(first)
@@ -1279,13 +1287,19 @@ async def build_profile_text(uid: int, include_balance: bool = False) -> str:
                     (uid,),
                 ).fetchone()
             if row:
-                ok, bal = await fetch_bybit_balance(uid, row[0], row[1], row[2])
+                ok, balinfo = await fetch_bybit_balance(uid, row[0], row[1], row[2])
                 if ok:
+                    total, coins = balinfo
                     rate = await get_usd_rub_rate()
-                    bal_rub = bal * rate
+                    bal_rub = total * rate
                     rub = f"₽{bal_rub:,.0f}".replace(",", " ")
-                    usd = f"${bal:.2f}"
-                    base += f"💰 Баланс: {usd} / {rub}\n"
+                    usd = f"${total:.2f}"
+                    detail = (
+                        " (" + " + ".join(f"{c} ${v:.2f}" for c, v in coins) + ")"
+                        if coins
+                        else ""
+                    )
+                    base += f"💰 Баланс: {usd} / {rub}{detail}\n"
         return base + "Нет завершённых сделок."
     df["entry_date"] = pd.to_datetime(df["entry_date"], errors="coerce")
     df["exit_date"] = pd.to_datetime(df["exit_date"], errors="coerce")
@@ -1323,12 +1337,20 @@ async def build_profile_text(uid: int, include_balance: bool = False) -> str:
                 (uid,),
             ).fetchone()
         if row:
-            ok, bal = await fetch_bybit_balance(uid, row[0], row[1], row[2])
+            ok, balinfo = await fetch_bybit_balance(uid, row[0], row[1], row[2])
             if ok:
+                total, coins = balinfo
                 rate = await get_usd_rub_rate()
-                bal_rub = bal * rate
+                bal_rub = total * rate
+                detail = (
+                    " (" + " + ".join(f"{c} ${v:.2f}" for c, v in coins) + ")"
+                    if coins
+                    else ""
+                )
                 parts.append(
-                    f"💰 Баланс: ${bal:.2f} / ₽{bal_rub:,.0f}".replace(",", " ") + "\n"
+                    f"💰 Баланс: ${total:.2f} / ₽{bal_rub:,.0f}".replace(",", " ")
+                    + detail
+                    + "\n"
                 )
     parts.extend(
         [
