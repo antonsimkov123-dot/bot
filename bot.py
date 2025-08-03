@@ -90,7 +90,8 @@ def init_db() -> None:
             signals TEXT,
             signal_stars INTEGER,
             mistake_reason TEXT,
-            is_deleted INTEGER DEFAULT 0
+            is_deleted INTEGER DEFAULT 0,
+            notifications_enabled INTEGER DEFAULT 0
         )
         """
     )
@@ -171,6 +172,9 @@ def add_missing_columns() -> None:
             conn.commit()
         if "leverage" not in columns:
             cur.execute("ALTER TABLE trades ADD COLUMN leverage REAL")
+            conn.commit()
+        if "notifications_enabled" not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN notifications_enabled INTEGER DEFAULT 0")
             conn.commit()
 
         cur.execute("PRAGMA table_info(reminders)")
@@ -324,7 +328,10 @@ class AutoStopState(StatesGroup):
     choosing_trade = State()
     choosing_vol = State()
     entering_custom = State()
-    confirming = State()
+
+
+class NotifyState(StatesGroup):
+    choosing = State()
 
 # ---------- HELPERS ----------
 def is_float(text: str) -> bool:
@@ -440,6 +447,21 @@ async def fetch_bybit_positions(api_key: str, api_secret: str) -> tuple[bool, li
         if float(p.get("size", 0)) != 0
     ]
     return True, items
+
+
+async def fetch_price(symbol: str) -> float | None:
+    url = "https://api.bybit.com/v5/market/tickers"
+    params = {"category": "linear", "symbol": f"{symbol}USDT"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as resp:
+                data = await resp.json()
+    except Exception:
+        return None
+    try:
+        return float(data.get("result", {}).get("list", [{}])[0].get("lastPrice"))
+    except Exception:
+        return None
 
 
 def describe_reminder(t: str, period: int, next_run: str) -> str:
@@ -585,6 +607,39 @@ def build_auto_report(uid: int, days: int) -> str:
     return text
 
 
+async def process_notifications(uid: int) -> None:
+    now = datetime.now()
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT trade_type, symbol, entry_price, stop_loss, targets, entry_date FROM trades WHERE user_id=? AND exit_price IS NULL AND notifications_enabled=1 AND COALESCE(is_deleted,0)=0",
+            (uid,),
+        ).fetchall()
+    for t_type, sym, entry, sl, tgt_str, entry_date in rows:
+        price = await fetch_price(sym)
+        if price is None:
+            continue
+        alerts = []
+        if sl is not None:
+            if abs(price - sl) / sl * 100 <= 2:
+                alerts.append("⚠️ Цена близко к тейку/стопу!")
+        targets = [float(t) for t in (tgt_str or "").split(",") if t]
+        for t in targets:
+            if (t_type.lower() == "long" and price >= t) or (t_type.lower() == "short" and price <= t):
+                alerts.append("🎯 Цель достигнута")
+                break
+            if abs(price - t) / t * 100 <= 2:
+                alerts.append("⚠️ Цена близко к тейку/стопу!")
+                break
+        entry_dt = datetime.fromisoformat(entry_date)
+        if now - entry_dt >= timedelta(hours=48) and abs(price - entry) / entry * 100 < 1:
+            alerts.append("💤 Сделка в стагнации — подумай о действиях")
+        for msg in alerts:
+            try:
+                await bot.send_message(uid, f"{sym} {t_type}: {msg}")
+            except Exception:
+                pass
+
+
 async def show_reminders_menu(uid: int, message: types.Message) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
@@ -621,6 +676,30 @@ async def show_reminders_menu(uid: int, message: types.Message) -> None:
     kb_rows.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")])
     kb = with_back(InlineKeyboardMarkup(inline_keyboard=kb_rows))
     await message.answer("\n".join(lines), reply_markup=kb)
+
+
+async def show_notifications_menu(uid: int, message: types.Message) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT id, symbol, trade_type FROM trades WHERE user_id=? AND exit_price IS NULL AND notifications_enabled=1 AND COALESCE(is_deleted,0)=0",
+            (uid,),
+        ).fetchall()
+    if not rows:
+        kb = with_back(
+            InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")]]
+            )
+        )
+        await message.answer("У тебя нет сделок с уведомлениями.", reply_markup=kb)
+        return
+    buttons = [
+        [InlineKeyboardButton(text=f"{sym} {t_type}", callback_data=f"notif_off_{tid}")]
+        for tid, sym, t_type in rows
+    ]
+    buttons.append([InlineKeyboardButton(text="🔕 Выключить все", callback_data="notif_off_all")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")])
+    kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
+    await message.answer("📋 Сделки с уведомлениями:", reply_markup=kb)
 
 
 async def reminder_scheduler():
@@ -671,6 +750,17 @@ async def report_scheduler():
                 )
                 conn.commit()
         await asyncio.sleep(60)
+
+
+async def notification_scheduler():
+    while True:
+        with sqlite3.connect(DB_PATH) as conn:
+            uids = [row[0] for row in conn.execute(
+                "SELECT DISTINCT user_id FROM trades WHERE exit_price IS NULL AND notifications_enabled=1 AND COALESCE(is_deleted,0)=0"
+            ).fetchall()]
+        for uid in uids:
+            await process_notifications(uid)
+        await asyncio.sleep(3600 * 24)
 
 def main_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
@@ -1772,12 +1862,12 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.answer(text)
 
 
-async def save_trade(cb: types.CallbackQuery, state: FSMContext) -> None:
+async def save_trade(cb: types.CallbackQuery, state: FSMContext) -> int:
     data = await state.get_data()
     signals = data.get('signals', [])
     total, _, _, _ = signal_stats(signals)
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO trades (user_id, trade_type, symbol, entry_price, position_size, leverage, stop_loss, targets, percent, risk_percent, entry_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 cb.from_user.id,
@@ -1796,8 +1886,24 @@ async def save_trade(cb: types.CallbackQuery, state: FSMContext) -> None:
                 total,
             ),
         )
+        conn.commit()
+        trade_id = cur.lastrowid
     await cb.message.answer("✅ Сделка сохранена.")
-    await go_home(cb.from_user.id, state)
+    return trade_id
+
+
+async def ask_notifications(uid: int, trade_id: int, state: FSMContext) -> None:
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Да", callback_data="notif_yes"),
+                InlineKeyboardButton(text="Нет", callback_data="notif_no"),
+            ]
+        ]
+    )
+    await bot.send_message(uid, "🔔 Включить уведомления для этой сделки?", reply_markup=kb)
+    await state.update_data(notif_trade_id=trade_id)
+    await state.set_state(NotifyState.choosing)
 
 
 @dp.callback_query(TradeState.confirming, lambda c: c.data == "confirm_add")
@@ -1823,19 +1929,44 @@ async def add_trade_confirm(cb: types.CallbackQuery, state: FSMContext):
         )
         await cb.message.answer(warn, reply_markup=kb)
     else:
-        await save_trade(cb, state)
+        tid = await save_trade(cb, state)
+        await state.clear()
+        await ask_notifications(cb.from_user.id, tid, state)
 
 
 @dp.callback_query(TradeState.confirming, F.data == "confirm_force")
 async def add_trade_force(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    await save_trade(cb, state)
+    tid = await save_trade(cb, state)
+    await state.clear()
+    await ask_notifications(cb.from_user.id, tid, state)
 
 
 @dp.callback_query(TradeState.confirming, F.data == "confirm_cancel")
 async def add_trade_cancel(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     await start_signals_choice(cb.from_user.id, state)
+
+
+@dp.callback_query(NotifyState.choosing, F.data == "notif_yes")
+async def notif_yes(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    data = await state.get_data()
+    tid = data.get("notif_trade_id")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE trades SET notifications_enabled=1 WHERE id=?", (tid,))
+        conn.commit()
+    await cb.message.answer("🔔 Уведомления включены.")
+    await go_home(cb.from_user.id, state)
+
+
+@dp.callback_query(NotifyState.choosing, F.data == "notif_no")
+async def notif_no(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await cb.message.answer("Ок, уведомления выключены.")
+    await go_home(cb.from_user.id, state)
 
 # ---------- CLOSE TRADE ----------
 @dp.callback_query(lambda c: c.data == "close_trade")
@@ -2132,7 +2263,6 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
 
 
 @dp.callback_query(lambda c: c.data in {
-    "opt_notify",
     "opt_toggle",
     "opt_autotrade",
 })
@@ -2358,7 +2488,7 @@ async def import_bybit_trade(cb: types.CallbackQuery, state: FSMContext):
     lev = float(pos.get("leverage") or 0)
     entry_date = datetime.now().strftime("%Y-%m-%d")
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
+        cur = conn.execute(
             "INSERT INTO trades (user_id, trade_type, symbol, entry_price, position_size, leverage, stop_loss, targets, percent, risk_percent, entry_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 cb.from_user.id,
@@ -2378,10 +2508,46 @@ async def import_bybit_trade(cb: types.CallbackQuery, state: FSMContext):
             ),
         )
         conn.commit()
+        trade_id = cur.lastrowid
     await state.clear()
     await cb.message.answer(
         "✅ Сделка успешно импортирована из Bybit!\nНе забудь указать стоп и цели — нажми \"📝 Изменить\" в текущих сделках."
     )
+    await ask_notifications(cb.from_user.id, trade_id, state)
+
+
+@dp.callback_query(F.data == "opt_notify")
+async def opt_notify(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    await process_notifications(cb.from_user.id)
+    await show_notifications_menu(cb.from_user.id, cb.message)
+
+
+@dp.callback_query(lambda c: c.data.startswith("notif_off"))
+async def notif_off(cb: types.CallbackQuery):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    uid = cb.from_user.id
+    if cb.data == "notif_off_all":
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE trades SET notifications_enabled=0 WHERE user_id=?", (uid,)
+            )
+            conn.commit()
+        await cb.message.answer("🔕 Уведомления отключены для всех сделок.")
+    else:
+        tid = int(cb.data.split("_")[2])
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "UPDATE trades SET notifications_enabled=0 WHERE id=? AND user_id=?",
+                (tid, uid),
+            )
+            conn.commit()
+        await cb.message.answer("🔕 Уведомления отключены.")
+    await show_notifications_menu(uid, cb.message)
 
 
 @dp.callback_query(F.data == "clear_reports")
@@ -2778,6 +2944,7 @@ async def charts(cb: types.CallbackQuery):
 async def main():
     asyncio.create_task(reminder_scheduler())
     asyncio.create_task(report_scheduler())
+    asyncio.create_task(notification_scheduler())
     await dp.start_polling(bot)
 
 
