@@ -714,43 +714,105 @@ def save_imported_trade(uid: int, pos: dict) -> int:
         return cur.lastrowid
 
 
-def save_spot_history_trade(uid: int, order: dict) -> None:
-    t_type = "Long" if order.get("side") == "Buy" else "Short"
-    sym = order.get("symbol", "")
-    if sym.endswith("USDT"):
-        sym = sym[:-4]
-    price = float(order.get("avgPrice") or order.get("execPrice") or 0)
-    size = float(order.get("size") or order.get("execQty") or 0)
-    ts = order.get("execTime")
-    if ts:
-        dt = datetime.fromtimestamp(int(ts) / 1000).strftime("%Y-%m-%d")
-    else:
-        dt = datetime.now().strftime("%Y-%m-%d")
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, exit_price, position_size, leverage, stop_loss, targets, percent, risk_percent, entry_date, exit_date, comment, signals, signal_stars, pnl, profit_percent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            (
-                uid,
-                t_type,
-                sym,
-                price,
-                price,
-                size,
-                1,
-                None,
-                None,
-                0,
-                None,
-                dt,
-                dt,
-                "Импорт Spot истории",
-                None,
-                None,
-                0.0,
-                0.0,
-            ),
+def process_spot_history(uid: int, orders: list[dict]) -> None:
+    stable = {"USDT", "USDC"}
+    orders = sorted(orders, key=lambda o: int(o.get("execTime", 0)))
+    for o in orders:
+        sym = o.get("symbol", "")
+        if sym.endswith("USDT"):
+            base = sym[:-4]
+        elif sym.endswith("USDC"):
+            base = sym[:-4]
+        else:
+            continue
+        if base in stable:
+            continue
+        side = o.get("side")
+        price = float(o.get("avgPrice") or o.get("execPrice") or 0)
+        qty = float(o.get("size") or o.get("execQty") or 0)
+        ts = o.get("execTime")
+        dt = (
+            datetime.fromtimestamp(int(ts) / 1000).strftime("%Y-%m-%d")
+            if ts
+            else datetime.now().strftime("%Y-%m-%d")
         )
-        conn.commit()
+        if side == "Buy":
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "INSERT INTO trades (user_id, trade_type, symbol, entry_price, position_size, leverage, stop_loss, targets, percent, risk_percent, entry_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (
+                        uid,
+                        "Long",
+                        base,
+                        price,
+                        qty,
+                        1,
+                        None,
+                        None,
+                        100.0,
+                        None,
+                        dt,
+                        "Спот",
+                        None,
+                        None,
+                    ),
+                )
+                conn.commit()
+        elif side == "Sell":
+            remaining = qty
+            while remaining > 0:
+                with sqlite3.connect(DB_PATH) as conn:
+                    cur = conn.cursor()
+                    row = cur.execute(
+                        "SELECT id, entry_price, percent, position_size, trade_type, stop_loss, targets, entry_date, comment, signals, signal_stars FROM trades WHERE user_id=? AND symbol=? AND exit_price IS NULL AND COALESCE(is_deleted,0)=0 ORDER BY entry_date, id LIMIT 1",
+                        (uid, base),
+                    ).fetchone()
+                if not row:
+                    break
+                (
+                    tid,
+                    entry_price,
+                    percent,
+                    pos_size,
+                    t_type,
+                    sl,
+                    tgt,
+                    entry_date,
+                    comment,
+                    signals,
+                    sstars,
+                ) = row
+                close_qty = min(remaining, pos_size or 0)
+                if close_qty <= 0:
+                    break
+                close_pct = percent * close_qty / (pos_size or 1)
+                pnl = ((price - entry_price) / entry_price) * (100 if t_type.lower() == "long" else -100)
+                profit = round(pnl * close_pct / 100, 2)
+                remain_size = (pos_size or 0) - close_qty
+                close_data = dict(
+                    user_id=uid,
+                    t_type=t_type,
+                    sym=base,
+                    entry_price=entry_price,
+                    sl=sl,
+                    tgt=tgt,
+                    entry_date=entry_date,
+                    comment=comment,
+                    signals=signals,
+                    sstars=sstars,
+                    exit_price=price,
+                    exit_date=dt,
+                    pnl=pnl,
+                    profit=profit,
+                    remaining=percent - close_pct,
+                    close_pct=close_pct,
+                    risk_close=None,
+                    risk_remain=None,
+                    trade_id=tid,
+                    remain_size=remain_size,
+                )
+                store_closed_trade(close_data, None)
+                remaining -= close_qty
 
 
 async def fetch_price(symbol: str) -> float | None:
@@ -1263,10 +1325,21 @@ def store_closed_trade(data: dict, reason: str | None) -> None:
         if data["remaining"] <= 0:
             cur.execute("DELETE FROM trades WHERE id=?", (data["trade_id"],))
         else:
-            cur.execute(
-                "UPDATE trades SET percent=?, risk_percent=? WHERE id=?",
-                (data["remaining"], data["risk_remain"], data["trade_id"]),
-            )
+            if "remain_size" in data:
+                cur.execute(
+                    "UPDATE trades SET percent=?, risk_percent=?, position_size=? WHERE id=?",
+                    (
+                        data["remaining"],
+                        data["risk_remain"],
+                        data["remain_size"],
+                        data["trade_id"],
+                    ),
+                )
+            else:
+                cur.execute(
+                    "UPDATE trades SET percent=?, risk_percent=? WHERE id=?",
+                    (data["remaining"], data["risk_remain"], data["trade_id"]),
+                )
         conn.commit()
 
 
@@ -2641,8 +2714,7 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
         if not positions:
             await cb.message.answer("✅ Ключи активны (Spot), но сделок пока не найдено")
             return
-        for p in positions:
-            save_spot_history_trade(uid, p)
+        process_spot_history(uid, positions)
         kb = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="optimization")]]
         )
