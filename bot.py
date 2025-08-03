@@ -1104,20 +1104,14 @@ async def cb_menu(cb: types.CallbackQuery, state: FSMContext):
     await go_home(cb.from_user.id, state)
 
 
-@dp.callback_query(F.data == "profile")
-async def show_profile(cb: types.CallbackQuery, state: FSMContext):
-    await cb.answer()
-    await state.clear()
-    uid = cb.from_user.id
+def build_profile_text(uid: int) -> str:
     df = pd.read_sql_query(
         "SELECT symbol, pnl, signals, entry_date, exit_date FROM trades WHERE user_id=? AND exit_price IS NOT NULL AND COALESCE(is_deleted,0)=0",
         sqlite3.connect(DB_PATH),
         params=(uid,),
     )
     if df.empty:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]])
-        await cb.message.answer("Нет завершённых сделок.", reply_markup=with_back(kb))
-        return
+        return "Нет завершённых сделок."
     df["entry_date"] = pd.to_datetime(df["entry_date"], errors="coerce")
     df["exit_date"] = pd.to_datetime(df["exit_date"], errors="coerce")
     total = len(df)
@@ -1146,7 +1140,7 @@ async def show_profile(cb: types.CallbackQuery, state: FSMContext):
         rank = "Профи"
     else:
         rank = "БОГ ТРЕЙДА" if total > 50 else "Профи"
-    text = (
+    return (
         "📈 Профиль трейдера:\n"
         f"🧮 Средняя прибыль: {avg_profit:+.2f}%\n"
         f"📉 Средний убыток: {avg_loss:+.2f}%\n"
@@ -1157,6 +1151,13 @@ async def show_profile(cb: types.CallbackQuery, state: FSMContext):
         f"💎 Самый прибыльный коин: {best_coin}\n"
         f"🏅 Ранг: {rank}"
     )
+
+
+@dp.callback_query(F.data == "profile")
+async def show_profile(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.clear()
+    text = build_profile_text(cb.from_user.id)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]])
     await cb.message.answer(text, reply_markup=with_back(kb))
 
@@ -1199,40 +1200,7 @@ async def build_trader_rating() -> tuple[str, InlineKeyboardMarkup]:
     return "\n".join(lines), with_back(InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 
-async def build_trader_details(uid: int) -> str:
-    chat = await bot.get_chat(uid)
-    name = chat.username or chat.full_name or str(uid)
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            "SELECT pnl FROM trades WHERE user_id=? AND exit_price IS NOT NULL AND COALESCE(is_deleted,0)=0",
-            (uid,),
-        ).fetchall()
-        last = conn.execute(
-            """
-            SELECT symbol, pnl, exit_date FROM trades
-            WHERE user_id=? AND exit_price IS NOT NULL AND COALESCE(is_deleted,0)=0
-            ORDER BY exit_date DESC LIMIT 1
-            """,
-            (uid,),
-        ).fetchone()
-    pnls = [r[0] for r in rows]
-    wins = [p for p in pnls if p > 0]
-    losses = [p for p in pnls if p < 0]
-    avg_profit = sum(wins) / len(wins) if wins else 0
-    avg_loss = sum(losses) / len(losses) if losses else 0
-    winrate = len(wins) * 100 / len(pnls) if pnls else 0
-    if last:
-        lsym, lpnl, ldate = last
-        last_text = f"Последняя сделка: {lsym} ({lpnl:+.2f}%) — {ldate}"
-    else:
-        last_text = "Последняя сделка: —"
-    return (
-        f"{name}\n"
-        f"Средняя прибыль: {avg_profit:+.2f}%\n"
-        f"Средний убыток: {avg_loss:+.2f}%\n"
-        f"Общий winrate: {winrate:.1f}%\n"
-        f"{last_text}"
-    )
+    # removed build_trader_details; profile rendering reused for rating detail
 
 
 @dp.callback_query(F.data == "rating")
@@ -1250,7 +1218,7 @@ async def rating_detail(cb: types.CallbackQuery):
     if not await require_subscription(cb.message, cb.from_user.id):
         return
     uid = int(cb.data.split("_", 1)[1])
-    text = await build_trader_details(uid)
+    text = build_profile_text(uid)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="rating")]]
     )
