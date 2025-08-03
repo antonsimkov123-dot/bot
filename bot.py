@@ -525,75 +525,20 @@ async def fetch_bybit_positions(
         ]
         return True, items
 
-    async def _try_spot_history() -> tuple[bool, list | str]:
-        ts = str(int(time.time() * 1000))
-        recv = "5000"
-        params = {"category": "spot", "limit": "50"}
-        query = urlencode(params)
-        sign_payload = ts + api_key + recv + query
-        sign = hmac.new(api_secret.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
-        headers = {
-            "X-BAPI-API-KEY": api_key,
-            "X-BAPI-SIGN": sign,
-            "X-BAPI-TIMESTAMP": ts,
-            "X-BAPI-RECV-WINDOW": recv,
-        }
-        url = "https://api.bybit.com/v5/order/history-trade"
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params, headers=headers) as resp:
-                    if resp.status == 401:
-                        return False, "401"
-                    if resp.status != 200:
-                        return False, "http"
-                    data = await resp.json()
-        except Exception:
-            return False, "http"
-        if data.get("retCode") != 0:
-            return False, data.get("retMsg", "")
-        items = [
-            {
-                "symbol": o.get("symbol"),
-                "side": o.get("side"),
-                "leverage": 1,
-                "avgPrice": o.get("avgPrice") or o.get("execPrice"),
-                "size": o.get("execQty"),
-                "orderType": o.get("orderType"),
-                "execTime": o.get("execTime"),
-            }
-            for o in data.get("result", {}).get("list", [])
-            if o.get("orderType") in {"Market", "Limit"}
-            and o.get("side") in {"Buy", "Sell"}
-        ]
-        return True, items
-
     first = account_type or "CONTRACT"
     ok, res = await _try(first)
-    if ok and res:
+    if ok:
         save_account_type(uid, first)
         return True, res, first
     if res == "401":
         return False, "401", first
     second = "UNIFIED" if first == "CONTRACT" else "CONTRACT"
     ok2, res2 = await _try(second)
-    if ok2 and res2:
+    if ok2:
         save_account_type(uid, second)
         return True, res2, second
     if res2 == "401":
         return False, "401", second
-    ok3, res3 = await _try_spot_history()
-    if ok3:
-        save_account_type(uid, "UNIFIED")
-        return True, res3, "SPOT_HISTORY"
-    if res3 == "401":
-        return False, "401", "SPOT_HISTORY"
-    # if futures endpoints succeeded but positions empty, treat as success
-    if ok:
-        save_account_type(uid, first)
-        return True, res, first
-    if ok2:
-        save_account_type(uid, second)
-        return True, res2, second
     return (
         False,
         "❌ Не удалось связаться с Bybit: оба типа аккаунта не поддерживаются",
@@ -761,8 +706,8 @@ def save_imported_trade(uid: int, pos: dict) -> int:
         if row:
             tid = row[0]
             cur.execute(
-                "UPDATE trades SET entry_price=?, position_size=?, leverage=?, percent=100, entry_date=? WHERE id=?",
-                (entry, size, lev, entry_date, tid),
+                "UPDATE trades SET entry_price=?, position_size=?, leverage=?, percent=?, entry_date=? WHERE id=?",
+                (entry, size, lev, None, entry_date, tid),
             )
         else:
             cur.execute(
@@ -776,7 +721,7 @@ def save_imported_trade(uid: int, pos: dict) -> int:
                     lev,
                     None,
                     None,
-                    100.0,
+                    None,
                     None,
                     entry_date,
                     "Импорт из Bybit",
@@ -2989,49 +2934,24 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
         )
         return
     ok_pos, positions, acc_type = await fetch_bybit_positions(uid, row[0], row[1], row[2])
-    if ok_pos and acc_type == "SPOT_HISTORY":
-        ok_spot, spot_orders = True, positions
-        ok_pos, positions = False, []
-    else:
-        ok_spot, spot_orders = await fetch_bybit_spot_history(row[0], row[1])
+    ok_spot, spot_orders = await fetch_bybit_spot_history(row[0], row[1])
     ok_bal, balinfo = await fetch_bybit_balance(uid, row[0], row[1], row[2])
     bal_details: list[tuple[str, float, float]] = []
     if ok_bal:
         _, _, bal_details = balinfo
         await sync_spot_balances(uid, row[0], row[1], bal_details)
-    if not ok_pos and not ok_spot and not (ok_bal and bal_details):
-        if positions == "401" or spot_orders == "401" or (not ok_bal and balinfo == "401"):
+    if ok_spot and spot_orders:
+        process_spot_history(uid, spot_orders)
+    if not ok_pos:
+        if positions == "401":
             await cb.message.answer("❌ Неверный API-ключ или Secret")
         else:
-            if ok_bal:
-                await cb.message.answer("✅ Ключи активны, но сделок пока не найдено")
-            else:
-                await cb.message.answer(
-                    "❌ Не удалось связаться с Bybit: оба типа аккаунта не поддерживаются"
-                )
+            await cb.message.answer(
+                "❌ Не удалось связаться с Bybit: оба типа аккаунта не поддерживаются"
+            )
         return
-    response_lines = []
-    if ok_pos:
-        label = "Unified" if acc_type == "UNIFIED" else "Contract"
-        if positions:
-            response_lines.append(
-                f"✅ Ключи активны ({label}), {len(positions)} сделок загружено"
-            )
-        else:
-            response_lines.append("❌ У тебя сейчас нет открытых фьючерсных сделок")
-    if ok_spot:
-        if spot_orders:
-            process_spot_history(uid, spot_orders)
-            response_lines.append(
-                f"✅ История спотовых сделок импортирована ({len(spot_orders)})"
-            )
-        elif not ok_pos or not positions:
-            response_lines.append("✅ Ключи активны (Spot), но сделок пока не найдено")
-    if ok_bal and bal_details:
-        response_lines.append("✅ Баланс загружен, спотовые позиции обновлены")
-    if response_lines:
-        await cb.message.answer("\n".join(response_lines))
-    if not ok_pos or not positions:
+    if not positions:
+        await cb.message.answer("❌ У тебя сейчас нет открытых фьючерсных сделок")
         return
     if is_automation_enabled(uid):
         for p in positions:
@@ -3043,7 +2963,8 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
             inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="optimization")]]
         )
         await cb.message.answer(
-            "✅ Сделки автоматически импортированы из Bybit!", reply_markup=with_back(kb)
+            "✅ Сделки автоматически импортированы с фьючерсного аккаунта Bybit!",
+            reply_markup=with_back(kb),
         )
         return
     buttons = []
@@ -3294,7 +3215,7 @@ async def import_bybit_trade(cb: types.CallbackQuery, state: FSMContext):
     trade_id = save_imported_trade(cb.from_user.id, pos)
     await state.clear()
     await cb.message.answer(
-        "✅ Сделка успешно импортирована из Bybit!\nНе забудь указать стоп и цели — нажми \"📝 Изменить\" в текущих сделках."
+        "✅ Сделка успешно импортирована с фьючерсного аккаунта Bybit!\nНе забудь указать стоп и цели — нажми \"📝 Изменить\" в текущих сделках."
     )
     await ask_notifications(cb.from_user.id, trade_id, state)
     await maybe_send_ai_advice(cb.from_user.id, trade_id)
