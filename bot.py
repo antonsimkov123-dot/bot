@@ -132,7 +132,8 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS bybit_keys (
             user_id INTEGER PRIMARY KEY,
             api_key TEXT,
-            api_secret TEXT
+            api_secret TEXT,
+            account_type TEXT
         )
         """
     )
@@ -206,6 +207,11 @@ def add_missing_columns() -> None:
             )
             cur.execute("DROP TABLE reminders_old")
             conn.commit()
+        cur.execute("PRAGMA table_info(bybit_keys)")
+        bk_cols = {row[1] for row in cur.fetchall()}
+        if "account_type" not in bk_cols:
+            cur.execute("ALTER TABLE bybit_keys ADD COLUMN account_type TEXT")
+            conn.commit()
 
         cur.execute(
             """
@@ -222,7 +228,8 @@ def add_missing_columns() -> None:
             CREATE TABLE IF NOT EXISTS bybit_keys (
                 user_id INTEGER PRIMARY KEY,
                 api_key TEXT,
-                api_secret TEXT
+                api_secret TEXT,
+                account_type TEXT
             )
             """
         )
@@ -473,10 +480,16 @@ def clock_emoji(time_str: str) -> str:
     return clocks[hour % 12]
 
 
-async def fetch_bybit_positions(api_key: str, api_secret: str) -> tuple[bool, list | str]:
+async def fetch_bybit_positions(
+    uid: int,
+    api_key: str,
+    api_secret: str,
+    account_type: str | None = None,
+) -> tuple[bool, list | str, str]:
+    account_type = account_type or "CONTRACT"
     ts = str(int(time.time() * 1000))
     recv = "5000"
-    params = {"category": "linear"}
+    params = {"category": "linear", "accountType": account_type}
     query = urlencode(params)
     sign_payload = ts + api_key + recv + query
     sign = hmac.new(api_secret.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
@@ -491,14 +504,17 @@ async def fetch_bybit_positions(api_key: str, api_secret: str) -> tuple[bool, li
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, headers=headers) as resp:
                 if resp.status == 401:
-                    return False, "401"
+                    return False, "401", account_type
                 if resp.status != 200:
-                    return False, "❌ Не удалось связаться с Bybit"
+                    return False, "❌ Не удалось связаться с Bybit", account_type
                 data = await resp.json()
     except Exception:
-        return False, "❌ Не удалось связаться с Bybit"
+        return False, "❌ Не удалось связаться с Bybit", account_type
     if data.get("retCode") != 0:
-        return False, "❌ Не удалось связаться с Bybit"
+        msg = data.get("retMsg", "")
+        if "CONTRACT" in msg.upper() and account_type == "CONTRACT":
+            return await fetch_bybit_positions(uid, api_key, api_secret, "UNIFIED")
+        return False, "❌ Не удалось связаться с Bybit", account_type
     items = [
         {
             "symbol": p.get("symbol"),
@@ -510,13 +526,17 @@ async def fetch_bybit_positions(api_key: str, api_secret: str) -> tuple[bool, li
         for p in data.get("result", {}).get("list", [])
         if float(p.get("size", 0)) != 0
     ]
-    return True, items
+    save_account_type(uid, account_type)
+    return True, items, account_type
 
 
-async def fetch_bybit_balance(api_key: str, api_secret: str) -> tuple[bool, float | str]:
+async def fetch_bybit_balance(
+    uid: int, api_key: str, api_secret: str, account_type: str | None = None
+) -> tuple[bool, float | str]:
+    account_type = account_type or "CONTRACT"
     ts = str(int(time.time() * 1000))
     recv = "5000"
-    params = {"accountType": "CONTRACT"}
+    params = {"accountType": account_type}
     query = urlencode(params)
     sign_payload = ts + api_key + recv + query
     sign = hmac.new(api_secret.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
@@ -538,6 +558,9 @@ async def fetch_bybit_balance(api_key: str, api_secret: str) -> tuple[bool, floa
     except Exception:
         return False, "❌ Не удалось связаться с Bybit"
     if data.get("retCode") != 0:
+        msg = data.get("retMsg", "")
+        if "CONTRACT" in msg.upper() and account_type == "CONTRACT":
+            return await fetch_bybit_balance(uid, api_key, api_secret, "UNIFIED")
         return False, "❌ Не удалось связаться с Bybit"
     bal = 0.0
     for acc in data.get("result", {}).get("list", []):
@@ -547,7 +570,17 @@ async def fetch_bybit_balance(api_key: str, api_secret: str) -> tuple[bool, floa
                 break
         if bal:
             break
+    save_account_type(uid, account_type)
     return True, bal
+
+
+def save_account_type(uid: int, account_type: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE bybit_keys SET account_type=? WHERE user_id=?",
+            (account_type, uid),
+        )
+        conn.commit()
 
 
 async def get_usd_rub_rate() -> float:
@@ -1169,9 +1202,12 @@ async def build_profile_text(uid: int, include_balance: bool = False) -> str:
         base = "📈 Профиль трейдера:\n"
         if include_balance:
             with sqlite3.connect(DB_PATH) as conn:
-                row = conn.execute("SELECT api_key, api_secret FROM bybit_keys WHERE user_id=?", (uid,)).fetchone()
+                row = conn.execute(
+                    "SELECT api_key, api_secret, account_type FROM bybit_keys WHERE user_id=?",
+                    (uid,),
+                ).fetchone()
             if row:
-                ok, bal = await fetch_bybit_balance(row[0], row[1])
+                ok, bal = await fetch_bybit_balance(uid, row[0], row[1], row[2])
                 if ok:
                     rate = await get_usd_rub_rate()
                     bal_rub = bal * rate
@@ -1210,9 +1246,12 @@ async def build_profile_text(uid: int, include_balance: bool = False) -> str:
     parts = ["📈 Профиль трейдера:\n"]
     if include_balance:
         with sqlite3.connect(DB_PATH) as conn:
-            row = conn.execute("SELECT api_key, api_secret FROM bybit_keys WHERE user_id=?", (uid,)).fetchone()
+            row = conn.execute(
+                "SELECT api_key, api_secret, account_type FROM bybit_keys WHERE user_id=?",
+                (uid,),
+            ).fetchone()
         if row:
-            ok, bal = await fetch_bybit_balance(row[0], row[1])
+            ok, bal = await fetch_bybit_balance(uid, row[0], row[1], row[2])
             if ok:
                 rate = await get_usd_rub_rate()
                 bal_rub = bal * rate
@@ -2444,7 +2483,7 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT api_key, api_secret FROM bybit_keys WHERE user_id=?",
+            "SELECT api_key, api_secret, account_type FROM bybit_keys WHERE user_id=?",
             (uid,),
         ).fetchone()
     if not row or not row[0] or not row[1]:
@@ -2453,7 +2492,7 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
             "🔐 Введите свой API-ключ и Secret от Bybit (USDT Perpetual)\n\nСначала отправьте API-ключ:",
         )
         return
-    ok, res = await fetch_bybit_positions(row[0], row[1])
+    ok, res, acc_type = await fetch_bybit_positions(uid, row[0], row[1], row[2])
     if not ok:
         if res == "401":
             await cb.message.answer("❌ Неверный API-ключ или Secret")
@@ -2461,9 +2500,11 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
             await cb.message.answer(res)
         return
     positions = res
+    label = "Unified" if acc_type == "UNIFIED" else "Contract"
     if not positions:
-        await cb.message.answer("✅ Ключи активны, но сделок пока не найдено")
+        await cb.message.answer(f"✅ Ключи активны ({label}), но сделок пока не найдено")
         return
+    await cb.message.answer(f"✅ Ключи активны ({label}), {len(positions)} сделок загружено")
     if is_automation_enabled(uid):
         for p in positions:
             tid = save_imported_trade(uid, p)
@@ -2690,8 +2731,8 @@ async def bybit_enter_secret(msg: types.Message, state: FSMContext):
     api_secret = msg.text.strip()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT OR REPLACE INTO bybit_keys (user_id, api_key, api_secret) VALUES (?,?,?)",
-            (msg.from_user.id, api_key, api_secret),
+            "INSERT OR REPLACE INTO bybit_keys (user_id, api_key, api_secret, account_type) VALUES (?,?,?,?)",
+            (msg.from_user.id, api_key, api_secret, None),
         )
         conn.commit()
     await state.clear()
