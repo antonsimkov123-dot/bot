@@ -210,7 +210,7 @@ async def require_subscription(message: types.Message, uid: int) -> bool:
         inline_keyboard=[[InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")]]
     )
     await message.answer(
-        "🔒 Чтобы использовать эту функцию, подпишитесь на канал @CryptoLens_MarketMinds и нажмите кнопку «🔄 Проверить подписку».",
+        "❌ Доступно только для подписчиков. Подпишись на канал @CryptoLens_MarketMinds и нажми кнопку «🔄 Проверить подписку».",
         reply_markup=kb,
     )
     return False
@@ -563,6 +563,7 @@ def main_menu_kb() -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="📅 Напоминания", callback_data="reminders"),
                 InlineKeyboardButton(text="🧹 Очистить всё", callback_data="clear_all"),
             ],
+            [InlineKeyboardButton(text="🔧 Оптимизация", callback_data="optimization")],
         ]
     )
 
@@ -605,6 +606,27 @@ def reports_menu_kb() -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton(text="🧹 Очистить сетапы", callback_data="reset_setup_analysis")],
             [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
+        ]
+    )
+    return with_back(kb)
+
+
+def optimization_menu_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🔁 Загрузить сделки с Bybit", callback_data="opt_bybit"),
+                InlineKeyboardButton(text="🧠 AI-Советник", callback_data="opt_ai"),
+            ],
+            [
+                InlineKeyboardButton(text="🛠️ Авторасчёт стопов", callback_data="opt_stops"),
+                InlineKeyboardButton(text="📬 Уведомления", callback_data="opt_notify"),
+            ],
+            [
+                InlineKeyboardButton(text="⚙️ Автоматизация [вкл/выкл]", callback_data="opt_toggle"),
+                InlineKeyboardButton(text="🤖 Автотрейдинг по стратегии", callback_data="opt_autotrade"),
+            ],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")],
         ]
     )
     return with_back(kb)
@@ -1866,6 +1888,31 @@ async def reports(cb: types.CallbackQuery, state: FSMContext):
         elif dd_total:
             text += "\n– Вывод: дисциплина не страдает."
     await cb.message.answer(text, reply_markup=reports_menu_kb())
+
+
+# ---------- OPTIMIZATION ----------
+@dp.callback_query(F.data == "optimization")
+async def optimization_menu(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    await state.clear()
+    await cb.message.answer("🔧 Оптимизация:", reply_markup=optimization_menu_kb())
+
+
+@dp.callback_query(lambda c: c.data in {
+    "opt_bybit",
+    "opt_ai",
+    "opt_stops",
+    "opt_notify",
+    "opt_toggle",
+    "opt_autotrade",
+})
+async def optimization_stub(cb: types.CallbackQuery):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    await cb.message.answer("🔒 Функция в разработке. Следи за обновлениями!")
 
 
 @dp.callback_query(F.data == "clear_reports")
