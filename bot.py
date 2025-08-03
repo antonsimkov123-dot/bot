@@ -486,92 +486,120 @@ async def fetch_bybit_positions(
     api_secret: str,
     account_type: str | None = None,
 ) -> tuple[bool, list | str, str]:
-    account_type = account_type or "CONTRACT"
-    ts = str(int(time.time() * 1000))
-    recv = "5000"
-    params = {"category": "linear", "accountType": account_type}
-    query = urlencode(params)
-    sign_payload = ts + api_key + recv + query
-    sign = hmac.new(api_secret.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY": api_key,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": recv,
-    }
-    url = "https://api.bybit.com/v5/position/list"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers=headers) as resp:
-                if resp.status == 401:
-                    return False, "401", account_type
-                if resp.status != 200:
-                    return False, "❌ Не удалось связаться с Bybit", account_type
-                data = await resp.json()
-    except Exception:
-        return False, "❌ Не удалось связаться с Bybit", account_type
-    if data.get("retCode") != 0:
-        msg = data.get("retMsg", "")
-        if "CONTRACT" in msg.upper() and account_type == "CONTRACT":
-            return await fetch_bybit_positions(uid, api_key, api_secret, "UNIFIED")
-        return False, "❌ Не удалось связаться с Bybit", account_type
-    items = [
-        {
-            "symbol": p.get("symbol"),
-            "side": p.get("side"),
-            "leverage": p.get("leverage"),
-            "avgPrice": p.get("avgPrice"),
-            "size": p.get("size"),
+    async def _try(acc_type: str) -> tuple[bool, list | str]:
+        ts = str(int(time.time() * 1000))
+        recv = "5000"
+        params = {"category": "linear", "accountType": acc_type}
+        query = urlencode(params)
+        sign_payload = ts + api_key + recv + query
+        sign = hmac.new(api_secret.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
+        headers = {
+            "X-BAPI-API-KEY": api_key,
+            "X-BAPI-SIGN": sign,
+            "X-BAPI-TIMESTAMP": ts,
+            "X-BAPI-RECV-WINDOW": recv,
         }
-        for p in data.get("result", {}).get("list", [])
-        if float(p.get("size", 0)) != 0
-    ]
-    save_account_type(uid, account_type)
-    return True, items, account_type
+        url = "https://api.bybit.com/v5/position/list"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, headers=headers) as resp:
+                    if resp.status == 401:
+                        return False, "401"
+                    if resp.status != 200:
+                        return False, "http"
+                    data = await resp.json()
+        except Exception:
+            return False, "http"
+        if data.get("retCode") != 0:
+            return False, data.get("retMsg", "")
+        items = [
+            {
+                "symbol": p.get("symbol"),
+                "side": p.get("side"),
+                "leverage": p.get("leverage"),
+                "avgPrice": p.get("avgPrice"),
+                "size": p.get("size"),
+            }
+            for p in data.get("result", {}).get("list", [])
+            if float(p.get("size", 0)) != 0
+        ]
+        return True, items
+
+    first = account_type or "CONTRACT"
+    ok, res = await _try(first)
+    if ok:
+        save_account_type(uid, first)
+        return True, res, first
+    if res == "401":
+        return False, "401", first
+    second = "UNIFIED" if first == "CONTRACT" else "CONTRACT"
+    ok2, res2 = await _try(second)
+    if ok2:
+        save_account_type(uid, second)
+        return True, res2, second
+    if res2 == "401":
+        return False, "401", second
+    return (
+        False,
+        "🔴 Не удалось связаться с Bybit: оба типа аккаунта не поддерживаются",
+        first,
+    )
 
 
 async def fetch_bybit_balance(
     uid: int, api_key: str, api_secret: str, account_type: str | None = None
 ) -> tuple[bool, float | str]:
-    account_type = account_type or "CONTRACT"
-    ts = str(int(time.time() * 1000))
-    recv = "5000"
-    params = {"accountType": account_type}
-    query = urlencode(params)
-    sign_payload = ts + api_key + recv + query
-    sign = hmac.new(api_secret.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
-    headers = {
-        "X-BAPI-API-KEY": api_key,
-        "X-BAPI-SIGN": sign,
-        "X-BAPI-TIMESTAMP": ts,
-        "X-BAPI-RECV-WINDOW": recv,
-    }
-    url = "https://api.bybit.com/v5/account/wallet-balance"
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers=headers) as resp:
-                if resp.status == 401:
-                    return False, "401"
-                if resp.status != 200:
-                    return False, "❌ Не удалось связаться с Bybit"
-                data = await resp.json()
-    except Exception:
-        return False, "❌ Не удалось связаться с Bybit"
-    if data.get("retCode") != 0:
-        msg = data.get("retMsg", "")
-        if "CONTRACT" in msg.upper() and account_type == "CONTRACT":
-            return await fetch_bybit_balance(uid, api_key, api_secret, "UNIFIED")
-        return False, "❌ Не удалось связаться с Bybit"
-    bal = 0.0
-    for acc in data.get("result", {}).get("list", []):
-        for coin in acc.get("coin", []):
-            if coin.get("coin") == "USDT":
-                bal = float(coin.get("walletBalance") or 0)
+    async def _try(acc_type: str) -> tuple[bool, float | str]:
+        ts = str(int(time.time() * 1000))
+        recv = "5000"
+        params = {"accountType": acc_type}
+        query = urlencode(params)
+        sign_payload = ts + api_key + recv + query
+        sign = hmac.new(api_secret.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
+        headers = {
+            "X-BAPI-API-KEY": api_key,
+            "X-BAPI-SIGN": sign,
+            "X-BAPI-TIMESTAMP": ts,
+            "X-BAPI-RECV-WINDOW": recv,
+        }
+        url = "https://api.bybit.com/v5/account/wallet-balance"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, headers=headers) as resp:
+                    if resp.status == 401:
+                        return False, "401"
+                    if resp.status != 200:
+                        return False, "http"
+                    data = await resp.json()
+        except Exception:
+            return False, "http"
+        if data.get("retCode") != 0:
+            return False, data.get("retMsg", "")
+        bal = 0.0
+        for acc in data.get("result", {}).get("list", []):
+            for coin in acc.get("coin", []):
+                if coin.get("coin") == "USDT":
+                    bal = float(coin.get("walletBalance") or 0)
+                    break
+            if bal:
                 break
-        if bal:
-            break
-    save_account_type(uid, account_type)
-    return True, bal
+        return True, bal
+
+    first = account_type or "CONTRACT"
+    ok, res = await _try(first)
+    if ok:
+        save_account_type(uid, first)
+        return True, res
+    if res == "401":
+        return False, "401"
+    second = "UNIFIED" if first == "CONTRACT" else "CONTRACT"
+    ok2, res2 = await _try(second)
+    if ok2:
+        save_account_type(uid, second)
+        return True, res2
+    if res2 == "401":
+        return False, "401"
+    return False, "🔴 Не удалось связаться с Bybit: оба типа аккаунта не поддерживаются"
 
 
 def save_account_type(uid: int, account_type: str) -> None:
