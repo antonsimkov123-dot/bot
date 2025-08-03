@@ -490,11 +490,15 @@ async def fetch_bybit_positions(api_key: str, api_secret: str) -> tuple[bool, li
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, params=params, headers=headers) as resp:
+                if resp.status == 401:
+                    return False, "401"
+                if resp.status != 200:
+                    return False, "❌ Не удалось связаться с Bybit"
                 data = await resp.json()
     except Exception:
         return False, "❌ Не удалось связаться с Bybit"
     if data.get("retCode") != 0:
-        return False, "❌ Неверный API-ключ"
+        return False, "❌ Не удалось связаться с Bybit"
     items = [
         {
             "symbol": p.get("symbol"),
@@ -2374,11 +2378,14 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
         return
     ok, res = await fetch_bybit_positions(row[0], row[1])
     if not ok:
-        await cb.message.answer(res)
+        if res == "401":
+            await cb.message.answer("❌ Неверный API-ключ или Secret")
+        else:
+            await cb.message.answer(res)
         return
     positions = res
     if not positions:
-        await cb.message.answer("❌ У тебя сейчас нет открытых сделок на Bybit")
+        await cb.message.answer("✅ Ключи активны, но сделок пока не найдено")
         return
     if is_automation_enabled(uid):
         for p in positions:
