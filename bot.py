@@ -538,7 +538,7 @@ async def fetch_bybit_positions(
             "X-BAPI-TIMESTAMP": ts,
             "X-BAPI-RECV-WINDOW": recv,
         }
-        url = "https://api.bybit.com/v5/order/history-trade"
+        url = "https://api.bybit.com/v5/spot/trade/history"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, params=params, headers=headers) as resp:
