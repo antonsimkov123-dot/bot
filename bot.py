@@ -513,6 +513,57 @@ async def fetch_bybit_positions(api_key: str, api_secret: str) -> tuple[bool, li
     return True, items
 
 
+async def fetch_bybit_balance(api_key: str, api_secret: str) -> tuple[bool, float | str]:
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    params = {"accountType": "CONTRACT"}
+    query = urlencode(params)
+    sign_payload = ts + api_key + recv + query
+    sign = hmac.new(api_secret.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": api_key,
+        "X-BAPI-SIGN": sign,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+    }
+    url = "https://api.bybit.com/v5/account/wallet-balance"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params, headers=headers) as resp:
+                if resp.status == 401:
+                    return False, "401"
+                if resp.status != 200:
+                    return False, "❌ Не удалось связаться с Bybit"
+                data = await resp.json()
+    except Exception:
+        return False, "❌ Не удалось связаться с Bybit"
+    if data.get("retCode") != 0:
+        return False, "❌ Не удалось связаться с Bybit"
+    bal = 0.0
+    for acc in data.get("result", {}).get("list", []):
+        for coin in acc.get("coin", []):
+            if coin.get("coin") == "USDT":
+                bal = float(coin.get("walletBalance") or 0)
+                break
+        if bal:
+            break
+    return True, bal
+
+
+async def get_usd_rub_rate() -> float:
+    url = "https://api.exchangerate.host/latest?base=USD&symbols=RUB"
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as resp:
+                data = await resp.json()
+                rate = data.get("rates", {}).get("RUB")
+                if rate:
+                    return float(rate)
+    except Exception:
+        pass
+    return 93.0
+
+
 def save_imported_trade(uid: int, pos: dict) -> int:
     t_type = "Long" if pos.get("side") == "Buy" else "Short"
     sym = pos.get("symbol", "")
@@ -1108,14 +1159,26 @@ async def cb_menu(cb: types.CallbackQuery, state: FSMContext):
     await go_home(cb.from_user.id, state)
 
 
-def build_profile_text(uid: int) -> str:
+async def build_profile_text(uid: int, include_balance: bool = False) -> str:
     df = pd.read_sql_query(
         "SELECT symbol, pnl, signals, entry_date, exit_date FROM trades WHERE user_id=? AND exit_price IS NOT NULL AND COALESCE(is_deleted,0)=0",
         sqlite3.connect(DB_PATH),
         params=(uid,),
     )
     if df.empty:
-        return "Нет завершённых сделок."
+        base = "📈 Профиль трейдера:\n"
+        if include_balance:
+            with sqlite3.connect(DB_PATH) as conn:
+                row = conn.execute("SELECT api_key, api_secret FROM bybit_keys WHERE user_id=?", (uid,)).fetchone()
+            if row:
+                ok, bal = await fetch_bybit_balance(row[0], row[1])
+                if ok:
+                    rate = await get_usd_rub_rate()
+                    bal_rub = bal * rate
+                    rub = f"₽{bal_rub:,.0f}".replace(",", " ")
+                    usd = f"${bal:.2f}"
+                    base += f"💰 Баланс: {usd} / {rub}\n"
+        return base + "Нет завершённых сделок."
     df["entry_date"] = pd.to_datetime(df["entry_date"], errors="coerce")
     df["exit_date"] = pd.to_datetime(df["exit_date"], errors="coerce")
     total = len(df)
@@ -1144,24 +1207,38 @@ def build_profile_text(uid: int) -> str:
         rank = "Профи"
     else:
         rank = "БОГ ТРЕЙДА" if total > 50 else "Профи"
-    return (
-        "📈 Профиль трейдера:\n"
-        f"🧮 Средняя прибыль: {avg_profit:+.2f}%\n"
-        f"📉 Средний убыток: {avg_loss:+.2f}%\n"
-        f"✅ Винрейт: {winrate:.1f}%\n"
-        f"⏳ Средняя длительность сделки: {avg_duration:.1f} дн.\n"
-        f"🔢 Количество сделок: {total}\n"
-        f"🧠 Самый частый сетап: {top_signal}\n"
-        f"💎 Самый прибыльный коин: {best_coin}\n"
-        f"🏅 Ранг: {rank}"
+    parts = ["📈 Профиль трейдера:\n"]
+    if include_balance:
+        with sqlite3.connect(DB_PATH) as conn:
+            row = conn.execute("SELECT api_key, api_secret FROM bybit_keys WHERE user_id=?", (uid,)).fetchone()
+        if row:
+            ok, bal = await fetch_bybit_balance(row[0], row[1])
+            if ok:
+                rate = await get_usd_rub_rate()
+                bal_rub = bal * rate
+                parts.append(
+                    f"💰 Баланс: ${bal:.2f} / ₽{bal_rub:,.0f}".replace(",", " ") + "\n"
+                )
+    parts.extend(
+        [
+            f"🧮 Средняя прибыль: {avg_profit:+.2f}%\n",
+            f"📉 Средний убыток: {avg_loss:+.2f}%\n",
+            f"✅ Винрейт: {winrate:.1f}%\n",
+            f"⏳ Средняя длительность сделки: {avg_duration:.1f} дн.\n",
+            f"🔢 Количество сделок: {total}\n",
+            f"🧠 Самый частый сетап: {top_signal}\n",
+            f"💎 Самый прибыльный коин: {best_coin}\n",
+            f"🏅 Ранг: {rank}",
+        ]
     )
+    return "".join(parts)
 
 
 @dp.callback_query(F.data == "profile")
 async def show_profile(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     await state.clear()
-    text = build_profile_text(cb.from_user.id)
+    text = await build_profile_text(cb.from_user.id, include_balance=True)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]])
     await cb.message.answer(text, reply_markup=with_back(kb))
 
@@ -1222,7 +1299,7 @@ async def rating_detail(cb: types.CallbackQuery):
     if not await require_subscription(cb.message, cb.from_user.id):
         return
     uid = int(cb.data.split("_", 1)[1])
-    text = build_profile_text(uid)
+    text = await build_profile_text(uid, include_balance=False)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="rating")]]
     )
