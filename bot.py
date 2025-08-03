@@ -1383,11 +1383,9 @@ class EditState(StatesGroup):
     """Состояния редактирования сделки"""
     choosing_field: State = State()
     entering_value: State = State()
+    choosing_signals: State = State()
 
-@dp.callback_query(lambda c: c.data.startswith("edit_"))
-async def edit_choose_field(cb: types.CallbackQuery, state: FSMContext):
-    await cb.answer()
-    tid = int(cb.data.split("_")[1])
+async def open_edit_trade(cb: types.CallbackQuery, tid: int, state: FSMContext):
     await state.update_data(tid=tid)
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
@@ -1414,29 +1412,41 @@ async def edit_choose_field(cb: types.CallbackQuery, state: FSMContext):
         )
         await cb.message.answer(text, reply_markup=kb_sum)
 
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🎯 Цели",   callback_data="field_targets")],
-        [InlineKeyboardButton(text="🛑 Стоп",   callback_data="field_sl")],
-        [InlineKeyboardButton(text="💼 %",      callback_data="field_pct")],
-        [InlineKeyboardButton(text="📆 Дата",   callback_data="field_date")],
-        [InlineKeyboardButton(text="💬 Коммент",callback_data="field_comment")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="active")]
-    ])
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📡 Сигналы", callback_data="field_signals")],
+            [InlineKeyboardButton(text="🎯 Цели",   callback_data="field_targets")],
+            [InlineKeyboardButton(text="🛑 Стоп",   callback_data="field_sl")],
+            [InlineKeyboardButton(text="💼 %",      callback_data="field_pct")],
+            [InlineKeyboardButton(text="📆 Дата",   callback_data="field_date")],
+            [InlineKeyboardButton(text="💬 Коммент",callback_data="field_comment")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="active")],
+        ]
+    )
     kb = with_back(kb)
     await cb.message.answer("Что изменить?", reply_markup=kb)
     await state.set_state(EditState.choosing_field)
 
+@dp.callback_query(lambda c: c.data.startswith("edit_"))
+async def edit_choose_field(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    tid = int(cb.data.split("_")[1])
+    await open_edit_trade(cb, tid, state)
+
 @dp.callback_query(lambda c: c.data.startswith("field_"))
 async def edit_enter_value(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    field = cb.data.split("_")[1]   # targets / sl / pct / date / comment
+    field = cb.data.split("_")[1]   # targets / sl / pct / date / comment / signals
+    if field == "signals":
+        await start_edit_signals(cb, state)
+        return
     await state.update_data(field=field)
     prompt = {
         "targets": "Новые цели (через запятую):",
         "sl":      "Новый стоп:",
         "pct":     "Новый % от депо:",
         "date":    "Новая дата (ГГГГ-ММ-ДД):",
-        "comment": "Новый комментарий:"
+        "comment": "Новый комментарий:",
     }[field]
     await cb.message.answer(prompt)
     await state.set_state(EditState.entering_value)
@@ -1469,6 +1479,61 @@ async def edit_save(msg: types.Message, state: FSMContext):
     await msg.answer("✅ Обновлено.")
     await state.clear()
     await go_home(msg.from_user.id, state)
+
+
+async def start_edit_signals(cb: types.CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    tid = data.get("tid")
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT signals FROM trades WHERE id=?", (tid,)).fetchone()
+    existing = [s for s in (row[0] or "").split(";") if s] if row else []
+    await state.update_data(signals=existing)
+    total, _, _, _ = signal_stats(existing)
+    await state.update_data(signals_total=total)
+    await cb.message.answer(SIGNALS_TEXT, reply_markup=signals_keyboard())
+    await state.set_state(EditState.choosing_signals)
+
+
+@dp.callback_query(EditState.choosing_signals, lambda c: c.data.startswith("sig_"))
+async def edit_add_signal(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    idx = int(cb.data.split("_")[1])
+    name, stars = SIGNAL_OPTIONS[idx]
+    data = await state.get_data()
+    signals = data.get("signals", [])
+    if name not in signals:
+        signals.append(name)
+        await state.update_data(signals=signals)
+        total, strong, medium, weak = signal_stats(signals)
+        await state.update_data(signals_total=total)
+        summary = (
+            f"✅ Сигнал добавлен: \"{name}\" ({'★'*stars})\n\n"
+            f"Всего: ★{total}\n"
+            f"Сильные: {strong}, Средние: {medium}, Слабые: {weak}\n"
+            f"Сила сделки: {strength_label(total)}\n"
+            "Шкала: ≤4 Слабая, 5–7 Умеренная, 8–11 Сильная, 12+ Очень сильная"
+        )
+        await cb.message.answer(summary)
+    else:
+        await cb.message.answer(f"⚠️ Сигнал уже выбран: \"{name}\"")
+    await cb.message.answer("Выбирай дальше:", reply_markup=signals_keyboard())
+
+
+@dp.callback_query(EditState.choosing_signals, F.data == "signals_done")
+async def edit_signals_done(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    data = await state.get_data()
+    tid = data.get("tid")
+    signals = data.get("signals", [])
+    total, _, _, _ = signal_stats(signals)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE trades SET signals=?, signal_stars=? WHERE id=?",
+            (";".join(signals), total, tid),
+        )
+        conn.commit()
+    await cb.message.answer("Сигналы обновлены.")
+    await open_edit_trade(cb, tid, state)
 
 # ---------- ADD TRADE ----------
 @dp.callback_query(lambda c: c.data == "add_trade")
@@ -2021,7 +2086,6 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
 
 
 @dp.callback_query(lambda c: c.data in {
-    "opt_ai",
     "opt_stops",
     "opt_notify",
     "opt_toggle",
@@ -2032,6 +2096,82 @@ async def optimization_stub(cb: types.CallbackQuery):
     if not await require_subscription(cb.message, cb.from_user.id):
         return
     await cb.message.answer("🔒 Функция в разработке. Следи за обновлениями!")
+
+
+@dp.callback_query(F.data == "opt_ai")
+async def ai_advisor_list(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    uid = cb.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT id, symbol, trade_type, signals, signal_stars FROM trades "
+            "WHERE user_id=? AND exit_price IS NULL AND COALESCE(is_deleted,0)=0",
+            (uid,),
+        ).fetchall()
+    if not rows:
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")]])
+        await cb.message.answer("У тебя нет активных сделок.", reply_markup=with_back(kb))
+        return
+    buttons = []
+    for i, (tid, sym, t_type, sigs, stars) in enumerate(rows, 1):
+        total = stars if stars is not None else sum(SIGNAL_STARS.get(s, 0) for s in (sigs or "").split(";") if s)
+        buttons.append([
+            InlineKeyboardButton(text=f"{i}. {sym} / {t_type.capitalize()} / +{total}★", callback_data=f"ai_{tid}")
+        ])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")])
+    kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
+    await cb.message.answer("Выбери сделку для анализа:", reply_markup=kb)
+
+
+@dp.callback_query(lambda c: c.data.startswith("ai_"))
+async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    tid = int(cb.data.split("_")[1])
+    uid = cb.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT signals, signal_stars, risk_percent FROM trades "
+            "WHERE id=? AND user_id=? AND exit_price IS NULL AND COALESCE(is_deleted,0)=0",
+            (tid, uid),
+        ).fetchone()
+    if not row:
+        await cb.message.answer("Сделка не найдена.")
+        return
+    signals, stars, risk = row
+    sig_list = [s for s in (signals or "").split(";") if s]
+    if not sig_list or not risk:
+        await cb.message.answer(
+            "🔒 В этой сделке не указаны сигналы или риск.\n\n❗ Сначала укажи их — нажми \"📝 Изменить\", выбери сигналы и % риска."
+        )
+        await open_edit_trade(cb, tid, state)
+        return
+    total, strong, _, _ = signal_stats(sig_list)
+    risk = float(risk)
+    if strong >= 2 and risk <= 10:
+        text = (
+            "💡 Сетап оценён!\n\n"
+            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}★\n"
+            f"— Риск: {risk:.1f}%\n\n"
+            "📊 Анализ:\n"
+            "✅ Отличное соотношение сигналов и риска.\n"
+            "💬 Совет: проверь объёмы на 4H, возможен откат."
+        )
+    else:
+        text = (
+            "⚠️ Осторожно: слабый сетап\n\n"
+            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}★\n"
+            f"— Риск: {risk:.1f}%\n\n"
+            "📊 Анализ:\n"
+            "❌ Недостаточно подтверждающих сигналов.\n"
+            "🔺 Повышенный риск.\n"
+            "💬 Совет: дождись ретеста или усиливающего сигнала."
+        )
+    kb = with_back(InlineKeyboardMarkup([[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]))
+    await cb.message.answer(text, reply_markup=kb)
 
 
 @dp.message(BybitKeyState.api_key)
