@@ -328,6 +328,7 @@ class AutoStopState(StatesGroup):
     choosing_trade = State()
     choosing_vol = State()
     entering_custom = State()
+    confirming = State()
 
 
 class NotifyState(StatesGroup):
