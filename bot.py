@@ -525,7 +525,7 @@ async def fetch_bybit_positions(
         ]
         return True, items
 
-    async def _try_spot() -> tuple[bool, list | str]:
+    async def _try_spot_history() -> tuple[bool, list | str]:
         ts = str(int(time.time() * 1000))
         recv = "5000"
         params = {"category": "spot", "limit": "50"}
@@ -538,7 +538,7 @@ async def fetch_bybit_positions(
             "X-BAPI-TIMESTAMP": ts,
             "X-BAPI-RECV-WINDOW": recv,
         }
-        url = "https://api.bybit.com/v5/spot/trade/history"
+        url = "https://api.bybit.com/v5/order/history-trade"
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, params=params, headers=headers) as resp:
@@ -553,13 +553,17 @@ async def fetch_bybit_positions(
             return False, data.get("retMsg", "")
         items = [
             {
-                "symbol": t.get("symbol"),
-                "side": t.get("side"),
+                "symbol": o.get("symbol"),
+                "side": o.get("side"),
                 "leverage": 1,
-                "avgPrice": t.get("execPrice"),
-                "size": t.get("execQty"),
+                "avgPrice": o.get("avgPrice") or o.get("execPrice"),
+                "size": o.get("execQty"),
+                "orderType": o.get("orderType"),
+                "execTime": o.get("execTime"),
             }
-            for t in data.get("result", {}).get("list", [])
+            for o in data.get("result", {}).get("list", [])
+            if o.get("orderType") in {"Market", "Limit"}
+            and o.get("side") in {"Buy", "Sell"}
         ]
         return True, items
 
@@ -577,12 +581,12 @@ async def fetch_bybit_positions(
         return True, res2, second
     if res2 == "401":
         return False, "401", second
-    ok3, res3 = await _try_spot()
+    ok3, res3 = await _try_spot_history()
     if ok3:
         save_account_type(uid, "UNIFIED")
-        return True, res3, "SPOT"
+        return True, res3, "SPOT_HISTORY"
     if res3 == "401":
-        return False, "401", "SPOT"
+        return False, "401", "SPOT_HISTORY"
     # if futures endpoints succeeded but positions empty, treat as success
     if ok:
         save_account_type(uid, first)
@@ -708,6 +712,43 @@ def save_imported_trade(uid: int, pos: dict) -> int:
         )
         conn.commit()
         return cur.lastrowid
+
+
+def save_spot_history_trade(uid: int, order: dict) -> None:
+    t_type = "Long" if order.get("side") == "Buy" else "Short"
+    sym = order.get("symbol", "")
+    if sym.endswith("USDT"):
+        sym = sym[:-4]
+    price = float(order.get("avgPrice") or order.get("execPrice") or 0)
+    size = float(order.get("size") or order.get("execQty") or 0)
+    ts = order.get("execTime")
+    if ts:
+        dt = datetime.fromtimestamp(int(ts) / 1000).strftime("%Y-%m-%d")
+    else:
+        dt = datetime.now().strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO trades (user_id, trade_type, symbol, entry_price, exit_price, position_size, leverage, stop_loss, targets, percent, risk_percent, entry_date, exit_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                uid,
+                t_type,
+                sym,
+                price,
+                price,
+                size,
+                1,
+                None,
+                None,
+                0,
+                None,
+                dt,
+                dt,
+                "Импорт Spot истории", 
+                None,
+                None,
+            ),
+        )
+        conn.commit()
 
 
 async def fetch_price(symbol: str) -> float | None:
@@ -2594,22 +2635,28 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
             await cb.message.answer(res)
         return
     positions = res
-    if acc_type == "SPOT":
-        label = "Spot"
-    elif acc_type == "UNIFIED":
+    if acc_type == "SPOT_HISTORY":
+        if not positions:
+            await cb.message.answer("✅ Ключи активны (Spot), но сделок пока не найдено")
+            return
+        for p in positions:
+            save_spot_history_trade(uid, p)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="optimization")]]
+        )
+        await cb.message.answer(
+            f"✅ История спотовых сделок импортирована ({len(positions)})",
+            reply_markup=with_back(kb),
+        )
+        return
+    if acc_type == "UNIFIED":
         label = "Unified"
     else:
         label = "Contract"
     if not positions:
-        if acc_type == "SPOT":
-            await cb.message.answer("✅ Ключи активны, но сделок пока не найдено")
-        else:
-            await cb.message.answer(f"✅ Ключи активны ({label}), но сделок пока не найдено")
+        await cb.message.answer(f"✅ Ключи активны ({label}), но сделок пока не найдено")
         return
-    if acc_type == "SPOT":
-        await cb.message.answer(f"✅ Ключи активны (Spot), {len(positions)} сделок загружено")
-    else:
-        await cb.message.answer(f"✅ Ключи активны ({label}), {len(positions)} сделок загружено")
+    await cb.message.answer(f"✅ Ключи активны ({label}), {len(positions)} сделок загружено")
     if is_automation_enabled(uid):
         for p in positions:
             tid = save_imported_trade(uid, p)
