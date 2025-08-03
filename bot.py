@@ -525,6 +525,44 @@ async def fetch_bybit_positions(
         ]
         return True, items
 
+    async def _try_spot() -> tuple[bool, list | str]:
+        ts = str(int(time.time() * 1000))
+        recv = "5000"
+        params = {"category": "spot", "limit": "50"}
+        query = urlencode(params)
+        sign_payload = ts + api_key + recv + query
+        sign = hmac.new(api_secret.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
+        headers = {
+            "X-BAPI-API-KEY": api_key,
+            "X-BAPI-SIGN": sign,
+            "X-BAPI-TIMESTAMP": ts,
+            "X-BAPI-RECV-WINDOW": recv,
+        }
+        url = "https://api.bybit.com/v5/spot/trade/history"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params, headers=headers) as resp:
+                    if resp.status == 401:
+                        return False, "401"
+                    if resp.status != 200:
+                        return False, "http"
+                    data = await resp.json()
+        except Exception:
+            return False, "http"
+        if data.get("retCode") != 0:
+            return False, data.get("retMsg", "")
+        items = [
+            {
+                "symbol": t.get("symbol"),
+                "side": t.get("side"),
+                "leverage": 1,
+                "avgPrice": t.get("execPrice"),
+                "size": t.get("execQty"),
+            }
+            for t in data.get("result", {}).get("list", [])
+        ]
+        return True, items
+
     first = account_type or "CONTRACT"
     ok, res = await _try(first)
     if ok:
@@ -539,9 +577,15 @@ async def fetch_bybit_positions(
         return True, res2, second
     if res2 == "401":
         return False, "401", second
+    ok3, res3 = await _try_spot()
+    if ok3:
+        save_account_type(uid, "UNIFIED")
+        return True, res3, "SPOT"
+    if res3 == "401":
+        return False, "401", "SPOT"
     return (
         False,
-        "🔴 Не удалось связаться с Bybit: оба типа аккаунта не поддерживаются",
+        "❌ Не удалось связаться с Bybit: оба типа аккаунта не поддерживаются",
         first,
     )
 
@@ -2528,11 +2572,22 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
             await cb.message.answer(res)
         return
     positions = res
-    label = "Unified" if acc_type == "UNIFIED" else "Contract"
+    if acc_type == "SPOT":
+        label = "Spot"
+    elif acc_type == "UNIFIED":
+        label = "Unified"
+    else:
+        label = "Contract"
     if not positions:
-        await cb.message.answer(f"✅ Ключи активны ({label}), но сделок пока не найдено")
+        if acc_type == "SPOT":
+            await cb.message.answer("✅ Ключи активны, но сделок пока не найдено")
+        else:
+            await cb.message.answer(f"✅ Ключи активны ({label}), но сделок пока не найдено")
         return
-    await cb.message.answer(f"✅ Ключи активны ({label}), {len(positions)} сделок загружено")
+    if acc_type == "SPOT":
+        await cb.message.answer(f"✅ Ключи активны (Spot), {len(positions)} сделок загружено")
+    else:
+        await cb.message.answer(f"✅ Ключи активны ({label}), {len(positions)} сделок загружено")
     if is_automation_enabled(uid):
         for p in positions:
             tid = save_imported_trade(uid, p)
@@ -2552,10 +2607,11 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
         sym = p.get("symbol", "")
         if sym.endswith("USDT"):
             sym = sym[:-4]
-        lev = p.get("leverage", "")
-        buttons.append([
-            InlineKeyboardButton(text=f"{side} {sym} {lev}x", callback_data=f"byimp_{idx}")
-        ])
+        lev = p.get("leverage")
+        text = f"{side} {sym}"
+        if lev:
+            text += f" {lev}x"
+        buttons.append([InlineKeyboardButton(text=text, callback_data=f"byimp_{idx}")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")])
     kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
     await state.set_state(BybitImportState.choosing)
