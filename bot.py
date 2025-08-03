@@ -3176,7 +3176,11 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
             "🔺 Повышенный риск.\n"
             "💬 Совет: дождись ретеста или усиливающего сигнала."
         )
-    kb = with_back(InlineKeyboardMarkup([[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]))
+    kb = with_back(
+        InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
+        )
+    )
     await cb.message.answer(text, reply_markup=kb)
 
 
