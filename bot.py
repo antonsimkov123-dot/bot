@@ -405,6 +405,13 @@ def fmt_price(val: float) -> str:
     return f"{val:.2f}".rstrip("0").rstrip(".")
 
 
+def fmt_targets(val: str | None) -> str:
+    if not val:
+        return "-"
+    parts = [p.strip() for p in str(val).split(",") if p.strip()]
+    return " | ".join(parts) if parts else "-"
+
+
 async def present_auto_calc(msg: types.Message, state: FSMContext, vol: float) -> None:
     data = await state.get_data()
     entry = data["entry"]
@@ -519,6 +526,8 @@ async def fetch_bybit_positions(
                 "leverage": p.get("leverage"),
                 "entryPrice": p.get("entryPrice") or p.get("avgPrice"),
                 "size": p.get("size"),
+                "stopLoss": p.get("stopLoss"),
+                "takeProfit": p.get("takeProfit"),
             }
             for p in data.get("result", {}).get("list", [])
             if float(p.get("size", 0)) != 0
@@ -696,6 +705,14 @@ def save_imported_trade(uid: int, pos: dict) -> int:
     entry = float(pos.get("entryPrice") or pos.get("avgPrice") or 0)
     size = float(pos.get("size") or 0)
     lev = float(pos.get("leverage") or 0)
+    sl_val = pos.get("stopLoss")
+    sl = float(sl_val) if sl_val not in (None, "", "0") else None
+    tp_val = pos.get("takeProfit")
+    if tp_val and tp_val != "0":
+        tgt = ",".join(t.strip() for t in str(tp_val).split(",") if t.strip() and float(t))
+    else:
+        tgt = None
+    risk = calc_risk(entry, sl, 100.0, t_type) if sl is not None else None
     entry_date = datetime.now().strftime("%Y-%m-%d")
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
@@ -706,8 +723,8 @@ def save_imported_trade(uid: int, pos: dict) -> int:
         if row:
             tid = row[0]
             cur.execute(
-                "UPDATE trades SET entry_price=?, position_size=?, leverage=?, percent=?, entry_date=? WHERE id=?",
-                (entry, size, lev, None, entry_date, tid),
+                "UPDATE trades SET entry_price=?, position_size=?, leverage=?, stop_loss=?, targets=?, percent=?, risk_percent=?, entry_date=? WHERE id=?",
+                (entry, size, lev, sl, tgt, 100.0, risk, entry_date, tid),
             )
         else:
             cur.execute(
@@ -719,10 +736,10 @@ def save_imported_trade(uid: int, pos: dict) -> int:
                     entry,
                     size,
                     lev,
-                    None,
-                    None,
-                    None,
-                    None,
+                    sl,
+                    tgt,
+                    100.0,
+                    risk,
                     entry_date,
                     "Импорт из Bybit",
                     None,
@@ -760,19 +777,28 @@ def process_spot_history(uid: int, orders: list[dict]) -> None:
             with sqlite3.connect(DB_PATH) as conn:
                 cur = conn.cursor()
                 row = cur.execute(
-                    "SELECT id, entry_price, position_size FROM trades WHERE user_id=? AND symbol=? AND exit_price IS NULL AND trade_type='SPOT' AND COALESCE(is_deleted,0)=0 ORDER BY entry_date, id LIMIT 1",
+                    "SELECT id, entry_price, position_size, percent FROM trades WHERE user_id=? AND symbol=? AND exit_price IS NULL AND trade_type='SPOT' AND COALESCE(is_deleted,0)=0 ORDER BY entry_date, id LIMIT 1",
                     (uid, base),
                 ).fetchone()
                 if row:
-                    tid, e_price, size = row
-                    new_size = (size or 0) + qty
-                    new_entry = (
-                        (e_price or 0) * (size or 0) + price * qty
-                    ) / new_size if (size or 0) > 0 else price
-                    cur.execute(
-                        "UPDATE trades SET entry_price=?, position_size=?, percent=100 WHERE id=?",
-                        (new_entry, new_size, tid),
-                    )
+                    tid, e_price, size, old_pct = row
+                    base_sz = (size or 0) / ((old_pct or 100) / 100) if (old_pct or 0) > 0 else (size or 0)
+                    if qty >= base_sz:
+                        cur.execute(
+                            "UPDATE trades SET entry_price=?, position_size=?, percent=100, entry_date=? WHERE id=?",
+                            (price, qty, dt, tid),
+                        )
+                    else:
+                        new_size = (size or 0) + qty
+                        new_entry = (
+                            (e_price or 0) * (size or 0) + price * qty
+                        ) / new_size if (size or 0) > 0 else price
+                        add_pct = qty / base_sz * 100 if base_sz else 0
+                        new_pct = min((old_pct or 0) + add_pct, 100.0)
+                        cur.execute(
+                            "UPDATE trades SET entry_price=?, position_size=?, percent=? WHERE id=?",
+                            (new_entry, new_size, new_pct, tid),
+                        )
                 else:
                     cur.execute(
                         "INSERT INTO trades (user_id, trade_type, symbol, entry_price, position_size, leverage, stop_loss, targets, percent, risk_percent, entry_date, comment, signals, signal_stars) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -979,9 +1005,15 @@ async def sync_spot_balances(
                     store_closed_trade(close_data, None)
                 else:
                     new_entry = entry if entry else e_price
+                    base_sz = (old_size or 0) / ((percent or 100) / 100) if (percent or 0) > 0 else (old_size or 0)
+                    if amt >= base_sz:
+                        new_pct = 100.0
+                    else:
+                        add_pct = (amt - (old_size or 0)) / base_sz * 100 if base_sz else 0
+                        new_pct = min((percent or 0) + add_pct, 100.0)
                     cur.execute(
-                        "UPDATE trades SET entry_price=?, position_size=?, percent=100 WHERE id=?",
-                        (new_entry, amt, tid),
+                        "UPDATE trades SET entry_price=?, position_size=?, percent=? WHERE id=?",
+                        (new_entry, amt, new_pct, tid),
                     )
                     conn.commit()
     # close trades absent in balance
@@ -1064,6 +1096,13 @@ async def sync_futures_positions(uid: int, positions: list[dict]) -> list[dict]:
             old_size = tr["position_size"]
             old_pct = tr["percent"]
             e_price = tr["entry_price"]
+            sl_val = pos.get("stopLoss")
+            sl = float(sl_val) if sl_val not in (None, "", "0") else None
+            tp_val = pos.get("takeProfit")
+            if tp_val and tp_val != "0":
+                tgt = ",".join(t.strip() for t in str(tp_val).split(",") if t.strip() and float(t))
+            else:
+                tgt = None
             if size < old_size:
                 closed_qty = old_size - size
                 close_pct = old_pct * closed_qty / (old_size or 1)
@@ -1073,6 +1112,7 @@ async def sync_futures_positions(uid: int, positions: list[dict]) -> list[dict]:
                 else:
                     pnl = ((e_price - exit_price) / e_price * 100) if exit_price else 0
                 profit = round(pnl * close_pct / 100, 2) if exit_price else 0
+                remaining = old_pct - close_pct
                 close_data = dict(
                     user_id=uid,
                     t_type=side,
@@ -1088,7 +1128,7 @@ async def sync_futures_positions(uid: int, positions: list[dict]) -> list[dict]:
                     exit_date=now,
                     pnl=pnl if exit_price else 0,
                     profit=profit if exit_price else 0,
-                    remaining=old_pct - close_pct,
+                    remaining=remaining,
                     close_pct=close_pct,
                     risk_close=None,
                     risk_remain=None,
@@ -1096,11 +1136,21 @@ async def sync_futures_positions(uid: int, positions: list[dict]) -> list[dict]:
                     remain_size=size,
                 )
                 store_closed_trade(close_data, None)
-            new_pct = 100.0 if size > old_size else old_pct
+                if remaining <= 0:
+                    seen.add(key)
+                    continue
+                new_pct = remaining
+            else:
+                base_sz = old_size / ((old_pct or 100) / 100) if (old_pct or 0) > 0 else old_size
+                if size >= base_sz:
+                    new_pct = 100.0
+                else:
+                    new_pct = min(size / base_sz * 100, 100.0)
+            risk = calc_risk(entry, sl, new_pct, side) if sl is not None else None
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute(
-                    "UPDATE trades SET entry_price=?, position_size=?, leverage=?, percent=? WHERE id=?",
-                    (entry, size, lev, new_pct, tid),
+                    "UPDATE trades SET entry_price=?, position_size=?, leverage=?, stop_loss=?, targets=?, percent=?, risk_percent=? WHERE id=?",
+                    (entry, size, lev, sl, tgt, new_pct, risk, tid),
                 )
                 conn.commit()
             seen.add(key)
@@ -1680,8 +1730,9 @@ def store_closed_trade(data: dict, reason: str | None) -> None:
 
 
 def format_trade(data: dict) -> str:
-    sl = data.get('stop_loss') or '-'
-    tgt = data.get('targets') or '-'
+    sl_val = data.get('stop_loss')
+    sl = fmt_price(float(sl_val)) if sl_val is not None else '-'
+    tgt = fmt_targets(data.get('targets'))
     pct = data.get('percent')
     pct_str = pct if pct is not None else '-'
     risk = data.get('risk')
@@ -2175,8 +2226,8 @@ async def show_active(cb: types.CallbackQuery):
     ikb = []
     for r in rows:
         tid, sym, ttype, entry, sl, tgt, pct, date, comm, risk = r
-        sl = sl or "-"
-        tgt = tgt or "-"
+        sl = fmt_price(float(sl)) if sl is not None else "-"
+        tgt = fmt_targets(tgt)
         pct_str = f"{pct}%" if pct is not None else "-"
         risk_str = f"{risk}%" if risk is not None else "-"
         if ttype and ttype.upper() == "SPOT":
