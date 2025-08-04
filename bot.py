@@ -148,6 +148,19 @@ def init_db() -> None:
         )
         """
     )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS price_alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            trade_id INTEGER,
+            price REAL,
+            direction TEXT,
+            mode TEXT,
+            near_pct REAL,
+            triggered INTEGER DEFAULT 0
+        )
+        """
+    )
     conn.commit()
     conn.close()
 
@@ -394,6 +407,14 @@ class NotifyState(StatesGroup):
     enter_near = State()
     confirm = State()
 
+
+class PriceAlertState(StatesGroup):
+    waiting_price = State()
+    choose_mode = State()
+    choose_direction = State()
+    choose_sensitivity = State()
+    enter_custom = State()
+
 # ---------- HELPERS ----------
 def is_float(text: str) -> bool:
     try:
@@ -451,6 +472,39 @@ def display_notify_mode(mode: str | None, pct: float | None) -> list[str]:
     else:
         lines.append("▪️ При касании: Нет")
     return lines
+
+
+def display_direction(direction: str) -> str:
+    return {"up": "Вверх", "down": "Вниз", "both": "Оба"}.get(direction, "-")
+
+
+def display_pa_mode(mode: str, pct: float | None) -> str:
+    return "При точном достижении" if mode == "touch" else f"Приближение ±{(pct or 0.3):.1f}%"
+
+
+async def save_price_alert(msg: types.Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    tid = data["pa_trade_id"]
+    aid = data.get("pa_edit_id")
+    price = data["pa_price"]
+    mode = data["pa_mode"]
+    direction = data["pa_direction"]
+    near_pct = data.get("pa_near_pct")
+    with sqlite3.connect(DB_PATH) as conn:
+        if aid:
+            conn.execute(
+                "UPDATE price_alerts SET price=?, direction=?, mode=?, near_pct=?, triggered=0 WHERE id=?",
+                (price, direction, mode, near_pct, aid),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO price_alerts(trade_id, price, direction, mode, near_pct) VALUES (?,?,?,?,?)",
+                (tid, price, direction, mode, near_pct),
+            )
+        conn.commit()
+    await msg.answer("✅ Уведомление сохранено.")
+    await state.clear()
+    await send_notif_config(msg, msg.from_user.id, tid)
 
 
 async def ask_notify_mode(cb: types.CallbackQuery, state: FSMContext) -> None:
@@ -1479,6 +1533,48 @@ async def process_notifications(uid: int) -> None:
             except Exception:
                 pass
 
+    with sqlite3.connect(DB_PATH) as conn:
+        pa_rows = conn.execute(
+            """
+            SELECT pa.id, t.symbol, t.trade_type, pa.price, pa.direction, pa.mode, pa.near_pct
+            FROM price_alerts pa
+            JOIN trades t ON pa.trade_id=t.id
+            WHERE t.user_id=? AND t.exit_price IS NULL AND pa.triggered=0 AND COALESCE(t.is_deleted,0)=0
+            """,
+            (uid,),
+        ).fetchall()
+    for aid, sym, t_type, target, direction, mode, npct in pa_rows:
+        price = await fetch_price(sym)
+        if price is None:
+            continue
+        triggered = False
+        if mode == "touch":
+            if direction in ("up", "both") and price >= target:
+                triggered = True
+            if direction in ("down", "both") and price <= target:
+                triggered = True
+        else:
+            pct = npct or 0.3
+            if direction == "up" and price >= target * (1 - pct / 100):
+                triggered = True
+            elif direction == "down" and price <= target * (1 + pct / 100):
+                triggered = True
+            elif direction == "both" and abs(price - target) / target * 100 <= pct:
+                triggered = True
+        if triggered:
+            text = (
+                f"🔔 {sym} достиг {target}" if mode == "touch" else f"🔔 {sym} приблизился к {target}"
+            )
+            text += f"\nТип: {display_pa_mode(mode, npct)}"
+            text += f"\nНаправление: {display_direction(direction)}"
+            try:
+                await bot.send_message(uid, text)
+            except Exception:
+                pass
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("DELETE FROM price_alerts WHERE id=?", (aid,))
+                conn.commit()
+
 
 async def show_reminders_menu(uid: int, message: types.Message) -> None:
     with sqlite3.connect(DB_PATH) as conn:
@@ -1521,7 +1617,12 @@ async def show_reminders_menu(uid: int, message: types.Message) -> None:
 async def show_notifications_menu(uid: int, message: types.Message) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT id, symbol, trade_type, notifications_enabled FROM trades WHERE user_id=? AND exit_price IS NULL AND COALESCE(is_deleted,0)=0",
+            """
+            SELECT t.id, t.symbol, t.trade_type, t.notifications_enabled,
+                   (SELECT COUNT(*) FROM price_alerts pa WHERE pa.trade_id=t.id) AS pa_cnt
+            FROM trades t
+            WHERE user_id=? AND exit_price IS NULL AND COALESCE(is_deleted,0)=0
+            """,
             (uid,),
         ).fetchall()
     if not rows:
@@ -1533,9 +1634,9 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
         await message.answer("У тебя нет активных сделок.", reply_markup=kb)
         return
     buttons = []
-    for tid, sym, t_type, enabled in rows:
+    for tid, sym, t_type, enabled, pa_cnt in rows:
         text = f"{sym} {t_type}"
-        if enabled:
+        if enabled or pa_cnt:
             text += " 🔔"
         buttons.append([InlineKeyboardButton(text=text, callback_data=f"notif_cfg_{tid}")])
     buttons.append([InlineKeyboardButton(text="🔕 Выключить все", callback_data="notif_disable_all")])
@@ -3634,6 +3735,50 @@ async def opt_notify(cb: types.CallbackQuery, state: FSMContext):
     await show_notifications_menu(cb.from_user.id, cb.message)
 
 
+async def send_notif_config(message: types.Message, uid: int, tid: int) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT symbol, trade_type, notifications_enabled, notify_type, notify_mode, notify_near_pct FROM trades WHERE id=? AND user_id=?",
+            (tid, uid),
+        ).fetchone()
+        alerts = conn.execute(
+            "SELECT id, price, direction, mode, near_pct FROM price_alerts WHERE trade_id=?",
+            (tid,),
+        ).fetchall()
+    if not row:
+        await message.answer("Сделка не найдена.")
+        return
+    sym, t_type, enabled, ntype, nmode, npct = row
+    lines = [f"Уведомления для {sym} {t_type}:"]
+    if enabled:
+        lines.append(f"Тип: {display_notify_type(ntype)}")
+        lines.extend(display_notify_mode(nmode, npct))
+    else:
+        lines.append("Стоп/цель: выключены")
+    if alerts:
+        lines.append("Ценовые уведомления:")
+        for i, (_, price, direction, mode, apct) in enumerate(alerts, 1):
+            dir_txt = {"up": "Вверх", "down": "Вниз", "both": "Оба"}.get(direction, "-")
+            mode_txt = "Точное" if mode == "touch" else f"Приближение ±{(apct or 0.3):.1f}%"
+            lines.append(f"{i}. {price} — {dir_txt}, {mode_txt}")
+    else:
+        lines.append("Ценовых уведомлений нет")
+    buttons: list[list[InlineKeyboardButton]] = []
+    if enabled:
+        buttons.append([InlineKeyboardButton(text="🔕 Отключить стоп/цель", callback_data=f"notif_disable_{tid}")])
+    else:
+        buttons.append([InlineKeyboardButton(text="🔔 Включить стоп/цель", callback_data=f"notif_enable_{tid}")])
+    for aid, price, _, _, _ in alerts:
+        buttons.append([
+            InlineKeyboardButton(text=f"✏ {price}", callback_data=f"pa_edit_{aid}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"pa_del_{aid}"),
+        ])
+    buttons.append([InlineKeyboardButton(text="➕ Добавить уведомление по цене", callback_data=f"pa_add_{tid}")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="opt_notify")])
+    kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
+    await message.answer("\n".join(lines), reply_markup=kb)
+
+
 @dp.callback_query(lambda c: c.data.startswith("notif_cfg_"))
 async def notif_cfg(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -3641,40 +3786,7 @@ async def notif_cfg(cb: types.CallbackQuery, state: FSMContext):
         return
     uid = cb.from_user.id
     tid = int(cb.data.split("_")[2])
-    with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute(
-            "SELECT symbol, trade_type, notifications_enabled, notify_type, notify_mode, notify_near_pct FROM trades WHERE id=? AND user_id=?",
-            (tid, uid),
-        ).fetchone()
-    if not row:
-        await cb.message.answer("Сделка не найдена.")
-        return
-    sym, t_type, enabled, ntype, nmode, npct = row
-    if enabled:
-        lines = [
-            f"Уведомления для {sym} {t_type} уже включены",
-            f"Тип: {display_notify_type(ntype)}",
-        ]
-        lines.extend(display_notify_mode(nmode, npct))
-        text = "\n".join(lines)
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="🔕 Отключить уведомления", callback_data=f"notif_disable_{tid}")],
-                [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_notify")],
-            ]
-        )
-        await cb.message.answer(text, reply_markup=with_back(kb))
-        return
-    await state.update_data(notif_trade_id=tid)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="🟢 Цель", callback_data="notif_type_target")],
-            [InlineKeyboardButton(text="🔴 Стоп", callback_data="notif_type_stop")],
-            [InlineKeyboardButton(text="🟡 Цель и Стоп", callback_data="notif_type_both")],
-        ]
-    )
-    await cb.message.answer("Что отслеживать?", reply_markup=with_back(kb))
-    await state.set_state(NotifyState.choose_type)
+    await send_notif_config(cb.message, uid, tid)
 
 
 @dp.callback_query(lambda c: c.data == "notif_disable_all")
@@ -3708,6 +3820,147 @@ async def notif_disable(cb: types.CallbackQuery):
         conn.commit()
     await cb.message.answer("🔕 Уведомления отключены.")
     await show_notifications_menu(uid, cb.message)
+
+
+@dp.callback_query(lambda c: c.data.startswith("pa_add_"))
+async def pa_add(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    tid = int(cb.data.split("_")[2])
+    await state.update_data(pa_trade_id=tid, pa_edit_id=None)
+    await cb.message.answer("Введи цену для уведомления:")
+    await state.set_state(PriceAlertState.waiting_price)
+
+
+@dp.callback_query(lambda c: c.data.startswith("pa_edit_"))
+async def pa_edit(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    aid = int(cb.data.split("_")[2])
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT trade_id, price FROM price_alerts WHERE id=?", (aid,)).fetchone()
+    if not row:
+        await cb.message.answer("Уведомление не найдено.")
+        return
+    tid, price = row
+    await state.update_data(pa_trade_id=tid, pa_edit_id=aid)
+    await cb.message.answer(f"Текущая цена: {price}\nВведи новую цену:")
+    await state.set_state(PriceAlertState.waiting_price)
+
+
+@dp.callback_query(lambda c: c.data.startswith("pa_del_"))
+async def pa_del(cb: types.CallbackQuery):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    aid = int(cb.data.split("_")[2])
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute("SELECT trade_id FROM price_alerts WHERE id=?", (aid,)).fetchone()
+        if row:
+            conn.execute("DELETE FROM price_alerts WHERE id=?", (aid,))
+            conn.commit()
+    if not row:
+        await cb.message.answer("Уведомление не найдено.")
+        return
+    tid = row[0]
+    await cb.message.answer("🗑 Уведомление удалено.")
+    await send_notif_config(cb.message, cb.from_user.id, tid)
+
+
+@dp.message(PriceAlertState.waiting_price)
+async def pa_enter_price(msg: types.Message, state: FSMContext):
+    if not is_float(msg.text):
+        await msg.answer("Введи число.")
+        return
+    price = float(msg.text.replace(",", "."))
+    await state.update_data(pa_price=price)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="При точном достижении", callback_data="pa_mode_touch")],
+            [InlineKeyboardButton(text="При приближении", callback_data="pa_mode_near")],
+        ]
+    )
+    await msg.answer("Выбери режим:", reply_markup=with_back(kb))
+    await state.set_state(PriceAlertState.choose_mode)
+
+
+@dp.callback_query(PriceAlertState.choose_mode)
+async def pa_mode_cb(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    mode = "touch" if cb.data.endswith("touch") else "near"
+    await state.update_data(pa_mode=mode)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Цена выше или равна", callback_data="pa_dir_up")],
+            [InlineKeyboardButton(text="Цена ниже или равна", callback_data="pa_dir_down")],
+            [InlineKeyboardButton(text="Оба варианта", callback_data="pa_dir_both")],
+        ]
+    )
+    await cb.message.answer("Укажи направление:", reply_markup=with_back(kb))
+    await state.set_state(PriceAlertState.choose_direction)
+
+
+@dp.callback_query(PriceAlertState.choose_direction)
+async def pa_dir_cb(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    direction = cb.data.split("_")[2]
+    await state.update_data(pa_direction=direction)
+    data = await state.get_data()
+    if data["pa_mode"] == "near":
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="±0.1%", callback_data="pa_near_0.1")],
+                [InlineKeyboardButton(text="±0.3%", callback_data="pa_near_0.3")],
+                [InlineKeyboardButton(text="±0.5%", callback_data="pa_near_0.5")],
+                [InlineKeyboardButton(text="Ввести вручную", callback_data="pa_near_custom")],
+            ]
+        )
+        await cb.message.answer("Насколько близко уведомлять?", reply_markup=with_back(kb))
+        await state.set_state(PriceAlertState.choose_sensitivity)
+    else:
+        await save_price_alert(cb.message, state)
+
+
+@dp.callback_query(PriceAlertState.choose_sensitivity)
+async def pa_sens_cb(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if cb.data.endswith("custom"):
+        await cb.message.answer("Введи процент (например 0.7):")
+        await state.set_state(PriceAlertState.enter_custom)
+    else:
+        pct = float(cb.data.split("_")[2])
+        await state.update_data(pa_near_pct=pct)
+        await save_price_alert(cb.message, state)
+
+
+@dp.message(PriceAlertState.enter_custom)
+async def pa_custom(msg: types.Message, state: FSMContext):
+    if not is_float(msg.text):
+        await msg.answer("Введи число.")
+        return
+    pct = float(msg.text.replace(",", "."))
+    await state.update_data(pa_near_pct=pct)
+    await save_price_alert(msg, state)
+
+
+@dp.callback_query(lambda c: c.data.startswith("notif_enable_"))
+async def notif_enable(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    tid = int(cb.data.split("_")[2])
+    await state.update_data(notif_trade_id=tid)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🟢 Цель", callback_data="notif_type_target")],
+            [InlineKeyboardButton(text="🔴 Стоп", callback_data="notif_type_stop")],
+            [InlineKeyboardButton(text="🟡 Цель и Стоп", callback_data="notif_type_both")],
+        ]
+    )
+    await cb.message.answer("Что отслеживать?", reply_markup=with_back(kb))
+    await state.set_state(NotifyState.choose_type)
 
 
 @dp.callback_query(F.data == "clear_reports")
