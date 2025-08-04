@@ -91,7 +91,9 @@ def init_db() -> None:
             signal_stars INTEGER,
             mistake_reason TEXT,
             is_deleted INTEGER DEFAULT 0,
-            notifications_enabled INTEGER DEFAULT 0
+            notifications_enabled INTEGER DEFAULT 0,
+            notify_type TEXT,
+            notify_mode TEXT
         )
         """
     )
@@ -184,6 +186,12 @@ def add_missing_columns() -> None:
             conn.commit()
         if "notifications_enabled" not in columns:
             cur.execute("ALTER TABLE trades ADD COLUMN notifications_enabled INTEGER DEFAULT 0")
+            conn.commit()
+        if "notify_type" not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN notify_type TEXT")
+            conn.commit()
+        if "notify_mode" not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN notify_mode TEXT")
             conn.commit()
 
         cur.execute("PRAGMA table_info(reminders)")
@@ -374,7 +382,10 @@ class AutoStopState(StatesGroup):
 
 
 class NotifyState(StatesGroup):
-    choosing = State()
+    ask = State()
+    choose_type = State()
+    choose_mode = State()
+    confirm = State()
 
 # ---------- HELPERS ----------
 def is_float(text: str) -> bool:
@@ -416,6 +427,15 @@ def fmt_percent(val: float | None) -> str:
     if val is None:
         return "-"
     return f"{val:.1f}%"
+
+
+def display_notify_type(ntype: str | None) -> str:
+    mapping = {"target": "Цель", "stop": "Стоп", "both": "Стоп и Цель"}
+    return mapping.get(ntype or "", "-")
+
+
+def display_notify_mode(mode: str | None) -> str:
+    return "При касании" if mode == "touch" else "Приближение (±0.3%)"
 
 
 async def present_auto_calc(msg: types.Message, state: FSMContext, vol: float) -> None:
@@ -1378,27 +1398,33 @@ async def process_notifications(uid: int) -> None:
     now = datetime.now()
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT trade_type, symbol, entry_price, stop_loss, targets, entry_date FROM trades WHERE user_id=? AND exit_price IS NULL AND notifications_enabled=1 AND COALESCE(is_deleted,0)=0",
+            "SELECT trade_type, symbol, entry_price, stop_loss, targets, entry_date, notify_type, notify_mode FROM trades WHERE user_id=? AND exit_price IS NULL AND notifications_enabled=1 AND COALESCE(is_deleted,0)=0",
             (uid,),
         ).fetchall()
-    for t_type, sym, entry, sl, tgt_str, entry_date in rows:
+    for t_type, sym, entry, sl, tgt_str, entry_date, ntype, nmode in rows:
         price = await fetch_price(sym)
         if price is None:
             continue
         alerts = []
-        if sl is not None:
-            if abs(price - sl) / sl * 100 <= 2:
-                alerts.append("⚠️ Цена близко к тейку/стопу!")
-        targets = [float(t) for t in (tgt_str or "").split(",") if t]
-        for t in targets:
-            if (t_type.lower() in {"long", "spot"} and price >= t) or (
-                t_type.lower() == "short" and price <= t
-            ):
-                alerts.append("🎯 Цель достигнута")
-                break
-            if abs(price - t) / t * 100 <= 2:
-                alerts.append("⚠️ Цена близко к тейку/стопу!")
-                break
+        long_like = t_type.lower() in {"long", "spot"}
+        if ntype in ("stop", "both") and sl is not None:
+            if nmode == "touch":
+                if (long_like and price <= sl) or (not long_like and price >= sl):
+                    alerts.append("🔴 Стоп достигнут")
+            else:
+                if abs(price - sl) / sl * 100 <= 0.3:
+                    alerts.append("⚠️ Цена близко к стопу")
+        if ntype in ("target", "both"):
+            targets = [float(t) for t in (tgt_str or "").split(",") if t]
+            for t in targets:
+                if nmode == "touch":
+                    if (long_like and price >= t) or (not long_like and price <= t):
+                        alerts.append("🎯 Цель достигнута")
+                        break
+                else:
+                    if abs(price - t) / t * 100 <= 0.3:
+                        alerts.append("⚠️ Цена близко к цели")
+                        break
         entry_dt = datetime.fromisoformat(entry_date)
         if now - entry_dt >= timedelta(hours=48) and abs(price - entry) / entry * 100 < 1:
             alerts.append("💤 Сделка в стагнации — подумай о действиях")
@@ -1450,7 +1476,7 @@ async def show_reminders_menu(uid: int, message: types.Message) -> None:
 async def show_notifications_menu(uid: int, message: types.Message) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT id, symbol, trade_type FROM trades WHERE user_id=? AND exit_price IS NULL AND notifications_enabled=1 AND COALESCE(is_deleted,0)=0",
+            "SELECT id, symbol, trade_type, notifications_enabled FROM trades WHERE user_id=? AND exit_price IS NULL AND COALESCE(is_deleted,0)=0",
             (uid,),
         ).fetchall()
     if not rows:
@@ -1459,16 +1485,18 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
                 inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")]]
             )
         )
-        await message.answer("У тебя нет сделок с уведомлениями.", reply_markup=kb)
+        await message.answer("У тебя нет активных сделок.", reply_markup=kb)
         return
-    buttons = [
-        [InlineKeyboardButton(text=f"{sym} {t_type}", callback_data=f"notif_off_{tid}")]
-        for tid, sym, t_type in rows
-    ]
-    buttons.append([InlineKeyboardButton(text="🔕 Выключить все", callback_data="notif_off_all")])
+    buttons = []
+    for tid, sym, t_type, enabled in rows:
+        text = f"{sym} {t_type}"
+        if enabled:
+            text += " 🔔"
+        buttons.append([InlineKeyboardButton(text=text, callback_data=f"notif_cfg_{tid}")])
+    buttons.append([InlineKeyboardButton(text="🔕 Выключить все", callback_data="notif_disable_all")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")])
     kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
-    await message.answer("📋 Сделки с уведомлениями:", reply_markup=kb)
+    await message.answer("🔔 Настройка уведомлений по сделкам:", reply_markup=kb)
 
 
 async def reminder_scheduler():
@@ -2727,7 +2755,7 @@ async def ask_notifications(uid: int, trade_id: int, state: FSMContext) -> None:
     if is_automation_enabled(uid):
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
-                "UPDATE trades SET notifications_enabled=1 WHERE id=?",
+                "UPDATE trades SET notifications_enabled=1, notify_type='both', notify_mode='near' WHERE id=?",
                 (trade_id,),
             )
             conn.commit()
@@ -2742,7 +2770,7 @@ async def ask_notifications(uid: int, trade_id: int, state: FSMContext) -> None:
     )
     await bot.send_message(uid, "🔔 Включить уведомления для этой сделки?", reply_markup=kb)
     await state.update_data(notif_trade_id=trade_id)
-    await state.set_state(NotifyState.choosing)
+    await state.set_state(NotifyState.ask)
 
 
 async def maybe_send_ai_advice(uid: int, tid: int) -> None:
@@ -2827,25 +2855,90 @@ async def add_trade_cancel(cb: types.CallbackQuery, state: FSMContext):
     await start_signals_choice(cb.from_user.id, state)
 
 
-@dp.callback_query(NotifyState.choosing, F.data == "notif_yes")
+@dp.callback_query(NotifyState.ask, F.data == "notif_yes")
 async def notif_yes(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     if not await require_subscription(cb.message, cb.from_user.id):
         return
-    data = await state.get_data()
-    tid = data.get("notif_trade_id")
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("UPDATE trades SET notifications_enabled=1 WHERE id=?", (tid,))
-        conn.commit()
-    await cb.message.answer("🔔 Уведомления включены.")
-    await go_home(cb.from_user.id, state)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🟢 Цель", callback_data="notif_type_target")],
+            [InlineKeyboardButton(text="🔴 Стоп", callback_data="notif_type_stop")],
+            [InlineKeyboardButton(text="🟡 Цель и Стоп", callback_data="notif_type_both")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_notify")],
+        ]
+    )
+    await cb.message.answer("Что отслеживать?", reply_markup=with_back(kb))
+    await state.set_state(NotifyState.choose_type)
 
 
-@dp.callback_query(NotifyState.choosing, F.data == "notif_no")
+@dp.callback_query(NotifyState.ask, F.data == "notif_no")
 async def notif_no(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     await cb.message.answer("Ок, уведомления выключены.")
     await go_home(cb.from_user.id, state)
+
+
+@dp.callback_query(NotifyState.choose_type, lambda c: c.data.startswith("notif_type_"))
+async def notif_choose_type(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    ntype = cb.data.split("_")[2]
+    await state.update_data(notify_type=ntype)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🚨 При касании", callback_data="notif_mode_touch")],
+            [InlineKeyboardButton(text="⚠️ При приближении", callback_data="notif_mode_near")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_notify")],
+        ]
+    )
+    await cb.message.answer("Когда уведомлять?", reply_markup=with_back(kb))
+    await state.set_state(NotifyState.choose_mode)
+
+
+@dp.callback_query(NotifyState.choose_mode, lambda c: c.data.startswith("notif_mode_"))
+async def notif_choose_mode(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    mode = cb.data.split("_")[2]
+    await state.update_data(notify_mode=mode)
+    data = await state.get_data()
+    text = (
+        "Уведомления будут настроены:\n"
+        f"▪️ Тип: {display_notify_type(data['notify_type'])}\n"
+        f"▪️ Способ: {display_notify_mode(mode)}"
+    )
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Включить уведомления", callback_data="notif_enable")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_notify")],
+        ]
+    )
+    await cb.message.answer(text, reply_markup=with_back(kb))
+    await state.set_state(NotifyState.confirm)
+
+
+@dp.callback_query(NotifyState.confirm, F.data == "notif_enable")
+async def notif_enable(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    data = await state.get_data()
+    tid = data["notif_trade_id"]
+    ntype = data["notify_type"]
+    nmode = data["notify_mode"]
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE trades SET notifications_enabled=1, notify_type=?, notify_mode=? WHERE id=?",
+            (ntype, nmode, tid),
+        )
+        conn.commit()
+    text = (
+        "Уведомления активированы:\n"
+        f"▪️ Тип: {display_notify_type(ntype)}\n"
+        f"▪️ Способ: {display_notify_mode(nmode)}"
+    )
+    await cb.message.answer(text)
+    await state.clear()
+    await show_notifications_menu(cb.from_user.id, cb.message)
 
 # ---------- CLOSE TRADE ----------
 @dp.callback_query(lambda c: c.data == "close_trade")
@@ -3452,32 +3545,83 @@ async def opt_notify(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     if not await require_subscription(cb.message, cb.from_user.id):
         return
+    await state.clear()
     await process_notifications(cb.from_user.id)
     await show_notifications_menu(cb.from_user.id, cb.message)
 
 
-@dp.callback_query(lambda c: c.data.startswith("notif_off"))
-async def notif_off(cb: types.CallbackQuery):
+@dp.callback_query(lambda c: c.data.startswith("notif_cfg_"))
+async def notif_cfg(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     if not await require_subscription(cb.message, cb.from_user.id):
         return
     uid = cb.from_user.id
-    if cb.data == "notif_off_all":
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "UPDATE trades SET notifications_enabled=0 WHERE user_id=?", (uid,)
-            )
-            conn.commit()
-        await cb.message.answer("🔕 Уведомления отключены для всех сделок.")
-    else:
-        tid = int(cb.data.split("_")[2])
-        with sqlite3.connect(DB_PATH) as conn:
-            conn.execute(
-                "UPDATE trades SET notifications_enabled=0 WHERE id=? AND user_id=?",
-                (tid, uid),
-            )
-            conn.commit()
-        await cb.message.answer("🔕 Уведомления отключены.")
+    tid = int(cb.data.split("_")[2])
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT symbol, trade_type, notifications_enabled, notify_type, notify_mode FROM trades WHERE id=? AND user_id=?",
+            (tid, uid),
+        ).fetchone()
+    if not row:
+        await cb.message.answer("Сделка не найдена.")
+        return
+    sym, t_type, enabled, ntype, nmode = row
+    if enabled:
+        text = (
+            f"Уведомления для {sym} {t_type} уже включены\n"
+            f"Тип: {display_notify_type(ntype)}\n"
+            f"Способ: {display_notify_mode(nmode)}"
+        )
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🔕 Отключить уведомления", callback_data=f"notif_disable_{tid}")],
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_notify")],
+            ]
+        )
+        await cb.message.answer(text, reply_markup=with_back(kb))
+        return
+    await state.update_data(notif_trade_id=tid)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🟢 Цель", callback_data="notif_type_target")],
+            [InlineKeyboardButton(text="🔴 Стоп", callback_data="notif_type_stop")],
+            [InlineKeyboardButton(text="🟡 Цель и Стоп", callback_data="notif_type_both")],
+        ]
+    )
+    await cb.message.answer("Что отслеживать?", reply_markup=with_back(kb))
+    await state.set_state(NotifyState.choose_type)
+
+
+@dp.callback_query(lambda c: c.data == "notif_disable_all")
+async def notif_disable_all(cb: types.CallbackQuery):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    uid = cb.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE trades SET notifications_enabled=0, notify_type=NULL, notify_mode=NULL WHERE user_id=?",
+            (uid,),
+        )
+        conn.commit()
+    await cb.message.answer("🔕 Уведомления отключены для всех сделок.")
+    await show_notifications_menu(uid, cb.message)
+
+
+@dp.callback_query(lambda c: c.data.startswith("notif_disable_"))
+async def notif_disable(cb: types.CallbackQuery):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    uid = cb.from_user.id
+    tid = int(cb.data.split("_")[2])
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE trades SET notifications_enabled=0, notify_type=NULL, notify_mode=NULL WHERE id=? AND user_id=?",
+            (tid, uid),
+        )
+        conn.commit()
+    await cb.message.answer("🔕 Уведомления отключены.")
     await show_notifications_menu(uid, cb.message)
 
 
