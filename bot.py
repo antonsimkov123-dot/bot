@@ -154,7 +154,8 @@ def init_db() -> None:
         """
         CREATE TABLE IF NOT EXISTS user_settings (
             user_id INTEGER PRIMARY KEY,
-            is_automation_enabled INTEGER DEFAULT 0
+            is_automation_enabled INTEGER DEFAULT 0,
+            subscription TEXT DEFAULT 'none'
         )
         """
     )
@@ -222,6 +223,14 @@ def add_missing_columns() -> None:
             conn.commit()
         if "notify_near_pct" not in columns:
             cur.execute("ALTER TABLE trades ADD COLUMN notify_near_pct REAL DEFAULT 0.3")
+            conn.commit()
+
+        cur.execute("PRAGMA table_info(user_settings)")
+        us_cols = {row[1] for row in cur.fetchall()}
+        if "subscription" not in us_cols:
+            cur.execute(
+                "ALTER TABLE user_settings ADD COLUMN subscription TEXT DEFAULT 'none'"
+            )
             conn.commit()
 
         cur.execute("PRAGMA table_info(price_alerts)")
@@ -297,7 +306,8 @@ def add_missing_columns() -> None:
             """
             CREATE TABLE IF NOT EXISTS user_settings (
                 user_id INTEGER PRIMARY KEY,
-                is_automation_enabled INTEGER DEFAULT 0
+                is_automation_enabled INTEGER DEFAULT 0,
+                subscription TEXT DEFAULT 'none'
             )
             """
         )
@@ -311,6 +321,7 @@ storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
 CHANNEL_USERNAME = "@CryptoLens_MarketMinds"
+ADMIN_ID = 800029273
 
 
 async def is_subscribed(uid: int) -> bool:
@@ -320,18 +331,53 @@ async def is_subscribed(uid: int) -> bool:
     except Exception:
         return False
 
+def get_subscription(uid: int) -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT subscription FROM user_settings WHERE user_id=?", (uid,)
+        ).fetchone()
+    return row[0] if row and row[0] else "none"
+
+
+def set_subscription(uid: int, sub: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO user_settings (user_id, subscription) VALUES (?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET subscription=excluded.subscription",
+            (uid, sub),
+        )
+        conn.commit()
+
 
 async def require_subscription(message: types.Message, uid: int) -> bool:
-    if await is_subscribed(uid):
-        return True
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")]]
-    )
-    await message.answer(
-        "❌ Доступно только для подписчиков. Подпишись на канал @CryptoLens_MarketMinds и нажми кнопку «🔄 Проверить подписку».",
-        reply_markup=kb,
-    )
-    return False
+    if not await is_subscribed(uid) or get_subscription(uid) == "none":
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")]]
+        )
+        await message.answer(
+            "❌ Доступно только для подписчиков. Подпишись на канал @CryptoLens_MarketMinds и нажми кнопку «🔄 Проверить подписку».",
+            reply_markup=kb,
+        )
+        return False
+    return True
+
+
+async def require_basic(message: types.Message, uid: int) -> bool:
+    if not await require_subscription(message, uid):
+        return False
+    if get_subscription(uid) not in {"basic", "pro"}:
+        await message.answer("🔒 Раздел доступен только с платной подпиской (от 500₽)")
+        return False
+    return True
+
+
+async def require_pro(message: types.Message, uid: int) -> bool:
+    if not await require_basic(message, uid):
+        return False
+    if get_subscription(uid) != "pro":
+        await message.answer("🔒 Доступно только с PRO-подпиской (от 2500₽)")
+        return False
+    return True
 
 
 @dp.callback_query(F.data == "check_sub")
@@ -406,6 +452,10 @@ class ReminderDelState(StatesGroup):
 
 class ClearAllState(StatesGroup):
     confirming = State()
+
+
+class SubscriptionState(StatesGroup):
+    waiting_user = State()
 
 
 class AutoReportState(StatesGroup):
@@ -1790,7 +1840,7 @@ async def show_manual_alerts(uid: int, message: types.Message) -> None:
 @dp.callback_query(F.data == "pa_manual_list")
 async def pa_manual_list_cb(cb: types.CallbackQuery):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     await show_manual_alerts(cb.from_user.id, cb.message)
 
@@ -1798,7 +1848,7 @@ async def pa_manual_list_cb(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "auto_sync")
 async def auto_sync_cb(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     uid = cb.from_user.id
     kb = InlineKeyboardMarkup(
@@ -1825,7 +1875,7 @@ async def auto_sync_cb(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(lambda c: c.data in {"aus_daily", "aus_weekly"})
 async def auto_sync_choose_time(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     period = 1 if cb.data == "aus_daily" else 7
     await state.update_data(auto_period=period)
@@ -1838,7 +1888,7 @@ async def auto_sync_choose_time(cb: types.CallbackQuery, state: FSMContext):
 
 @dp.message(AutoUpdateState.entering_time)
 async def auto_sync_set_time(msg: types.Message, state: FSMContext):
-    if not await require_subscription(msg, msg.from_user.id):
+    if not await require_basic(msg, msg.from_user.id):
         return
     time_str = msg.text.strip()
     if not is_time(time_str):
@@ -1867,7 +1917,7 @@ async def auto_sync_set_time(msg: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "aus_off")
 async def auto_sync_off(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
@@ -1989,21 +2039,22 @@ def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
     opt_text = (
         "🔧 Оптимизация 🟢" if is_automation_enabled(uid) else "🔧 Оптимизация 🔴"
     )
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📈 Профиль", callback_data="profile")],
-            [InlineKeyboardButton(text="🏆 Рейтинг трейдеров", callback_data="rating")],
-            [
-                InlineKeyboardButton(text="📦 Сделки", callback_data="trades_menu"),
-                InlineKeyboardButton(text="📊 Отчёты", callback_data="reports"),
-            ],
-            [
-                InlineKeyboardButton(text="📅 Напоминания", callback_data="reminders"),
-                InlineKeyboardButton(text="🧹 Очистить всё", callback_data="clear_all"),
-            ],
-            [InlineKeyboardButton(text=opt_text, callback_data="optimization")],
-        ]
-    )
+    rows = [
+        [InlineKeyboardButton(text="📈 Профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="🏆 Рейтинг трейдеров", callback_data="rating")],
+        [
+            InlineKeyboardButton(text="📦 Сделки", callback_data="trades_menu"),
+            InlineKeyboardButton(text="📊 Отчёты", callback_data="reports"),
+        ],
+        [
+            InlineKeyboardButton(text="📅 Напоминания", callback_data="reminders"),
+            InlineKeyboardButton(text="🧹 Очистить всё", callback_data="clear_all"),
+        ],
+    ]
+    if uid == ADMIN_ID:
+        rows.append([InlineKeyboardButton(text="🛂 Управление подпиской", callback_data="sub_manage")])
+    rows.append([InlineKeyboardButton(text=opt_text, callback_data="optimization")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def trades_menu_kb() -> InlineKeyboardMarkup:
@@ -3285,7 +3336,7 @@ async def add_trade_cancel(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(NotifyState.ask, F.data == "notif_yes")
 async def notif_yes(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -3387,7 +3438,7 @@ async def notif_enter_near(msg: types.Message, state: FSMContext):
 @dp.callback_query(NotifyState.confirm, F.data == "notif_enable")
 async def notif_enable(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     data = await state.get_data()
     tid = data["notif_trade_id"]
@@ -3670,7 +3721,7 @@ async def reports(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "optimization")
 async def optimization_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     await state.clear()
     await cb.message.answer(
@@ -3681,7 +3732,7 @@ async def optimization_menu(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "opt_toggle")
 async def toggle_automation(cb: types.CallbackQuery):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     uid = cb.from_user.id
     enabled = is_automation_enabled(uid)
@@ -3701,7 +3752,7 @@ async def toggle_automation(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "opt_bybit")
 async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
@@ -3775,7 +3826,7 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "opt_autotrade")
 async def optimization_stub(cb: types.CallbackQuery):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_pro(cb.message, cb.from_user.id):
         return
     await cb.message.answer("🔒 Функция в разработке. Следи за обновлениями!")
 
@@ -3783,7 +3834,7 @@ async def optimization_stub(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "opt_stops")
 async def auto_stop_choose_trade(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
@@ -3891,7 +3942,7 @@ async def auto_stop_save(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "opt_ai")
 async def ai_advisor_list(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
@@ -3923,7 +3974,7 @@ async def ai_advisor_list(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(lambda c: c.data.startswith("ai_"))
 async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     tid = int(cb.data.split("_")[1])
     uid = cb.from_user.id
@@ -4017,7 +4068,7 @@ async def import_bybit_trade(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "opt_notify")
 async def opt_notify(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     await state.clear()
     await process_notifications(cb.from_user.id)
@@ -4071,7 +4122,7 @@ async def send_notif_config(message: types.Message, uid: int, tid: int) -> None:
 @dp.callback_query(lambda c: c.data.startswith("notif_cfg_"))
 async def notif_cfg(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     uid = cb.from_user.id
     tid = int(cb.data.split("_")[2])
@@ -4081,7 +4132,7 @@ async def notif_cfg(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(lambda c: c.data == "notif_disable_all")
 async def notif_disable_all(cb: types.CallbackQuery):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
@@ -4097,7 +4148,7 @@ async def notif_disable_all(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("notif_disable_"))
 async def notif_disable(cb: types.CallbackQuery):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     uid = cb.from_user.id
     tid = int(cb.data.split("_")[2])
@@ -4114,7 +4165,7 @@ async def notif_disable(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("pa_add_"))
 async def pa_add(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     tid = int(cb.data.split("_")[2])
     await state.update_data(pa_trade_id=tid, pa_edit_id=None, pa_symbol=None)
@@ -4125,7 +4176,7 @@ async def pa_add(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "pa_manual_add")
 async def pa_manual_add(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     await state.update_data(pa_trade_id=None, pa_edit_id=None, pa_symbol=None)
     await cb.message.answer("Введи тикер (например BTC):")
@@ -4150,7 +4201,7 @@ async def pa_manual_symbol(msg: types.Message, state: FSMContext):
 @dp.callback_query(lambda c: c.data.startswith("pa_edit_"))
 async def pa_edit(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     aid = int(cb.data.split("_")[2])
     with sqlite3.connect(DB_PATH) as conn:
@@ -4167,7 +4218,7 @@ async def pa_edit(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(lambda c: c.data.startswith("pa_del_"))
 async def pa_del(cb: types.CallbackQuery):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     aid = int(cb.data.split("_")[2])
     with sqlite3.connect(DB_PATH) as conn:
@@ -4189,7 +4240,7 @@ async def pa_del(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "pa_manual_disable_all")
 async def pa_manual_disable_all(cb: types.CallbackQuery):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
@@ -4284,7 +4335,7 @@ async def pa_custom(msg: types.Message, state: FSMContext):
 @dp.callback_query(lambda c: c.data.startswith("notif_enable_"))
 async def notif_enable(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
     tid = int(cb.data.split("_")[2])
     await state.update_data(notif_trade_id=tid)
@@ -4394,6 +4445,75 @@ async def clear_all_confirm(msg: types.Message, state: FSMContext):
     else:
         await msg.answer("Очистка отменена.")
     await go_home(msg.from_user.id, state)
+
+
+@dp.callback_query(F.data == "sub_manage")
+async def sub_manage(cb: types.CallbackQuery, state: FSMContext):
+    if cb.from_user.id != ADMIN_ID:
+        await cb.answer()
+        return
+    await cb.answer()
+    await cb.message.answer("Введи ID пользователя:")
+    await state.set_state(SubscriptionState.waiting_user)
+
+
+@dp.message(SubscriptionState.waiting_user)
+async def sub_manage_user(msg: types.Message, state: FSMContext):
+    try:
+        target = int(msg.text.strip())
+    except Exception:
+        await msg.answer("Некорректный ID. Введи число.")
+        return
+    await state.update_data(target=target)
+    sub = get_subscription(target)
+    names = {
+        "none": "Без подписки",
+        "free": "Free",
+        "basic": "Basic",
+        "pro": "Pro",
+    }
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Включить Basic-подписку", callback_data="subset_basic")],
+            [InlineKeyboardButton(text="✅ Включить Pro-подписку", callback_data="subset_pro")],
+            [InlineKeyboardButton(text="✅ Включить Free-подписку", callback_data="subset_free")],
+            [InlineKeyboardButton(text="❌ Включить режим “Без подписки вообще”", callback_data="subset_none")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")],
+        ]
+    )
+    await msg.answer(
+        f"🔍 Текущая подписка: {names.get(sub, 'Без подписки')}\nВыберите нужный режим:",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(F.data.startswith("subset_"))
+async def sub_manage_set(cb: types.CallbackQuery, state: FSMContext):
+    if cb.from_user.id != ADMIN_ID:
+        await cb.answer()
+        return
+    await cb.answer()
+    data = await state.get_data()
+    target = data.get("target")
+    if not target:
+        await cb.message.answer("ID пользователя не задан.")
+        return
+    sub = cb.data.split("_", 1)[1]
+    set_subscription(target, sub)
+    names = {
+        "none": "Без подписки",
+        "free": "Free",
+        "basic": "Basic",
+        "pro": "Pro",
+    }
+    await cb.message.answer(
+        f"✅ Подписка изменена: теперь у пользователя {target} {names[sub]}"
+    )
+    try:
+        await bot.send_message(target, f"✅ Подписка изменена: теперь у тебя {names[sub]}")
+    except Exception:
+        pass
+    await state.clear()
 
 
 def build_setup_battle(uid: int) -> str:
