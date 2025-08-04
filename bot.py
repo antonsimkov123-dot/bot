@@ -495,7 +495,11 @@ def display_direction(direction: str) -> str:
 
 
 def display_pa_mode(mode: str, pct: float | None) -> str:
-    return "При точном достижении" if mode == "touch" else f"Приближение ±{(pct or 0.3):.1f}%"
+    if mode == "touch":
+        return "При точном достижении"
+    if mode == "both":
+        return f"При касании и приближении ±{(pct or 0.3):.1f}%"
+    return f"Приближение ±{(pct or 0.3):.1f}%"
 
 
 async def save_price_alert(msg: types.Message, state: FSMContext) -> None:
@@ -525,7 +529,7 @@ async def save_price_alert(msg: types.Message, state: FSMContext) -> None:
     if tid:
         await send_notif_config(msg, uid, tid)
     else:
-        await show_notifications_menu(uid, msg)
+        await show_manual_alerts(uid, msg)
 
 
 async def ask_notify_mode(cb: types.CallbackQuery, state: FSMContext) -> None:
@@ -1573,12 +1577,14 @@ async def process_notifications(uid: int) -> None:
         if price is None:
             continue
         triggered = False
-        if mode == "touch":
-            if direction in ("up", "both") and price >= target:
-                triggered = True
-            if direction in ("down", "both") and price <= target:
-                triggered = True
-        else:
+        touched = False
+        if direction in ("up", "both") and price >= target:
+            touched = True
+            triggered = True
+        if direction in ("down", "both") and price <= target:
+            touched = True
+            triggered = True
+        if not triggered or mode in ("near", "both"):
             pct = npct or 0.3
             if direction == "up" and price >= target * (1 - pct / 100):
                 triggered = True
@@ -1587,9 +1593,7 @@ async def process_notifications(uid: int) -> None:
             elif direction == "both" and abs(price - target) / target * 100 <= pct:
                 triggered = True
         if triggered:
-            text = (
-                f"🔔 {sym} достиг {target}" if mode == "touch" else f"🔔 {sym} приблизился к {target}"
-            )
+            text = f"🔔 {sym} достиг {target}" if touched else f"🔔 {sym} приблизился к {target}"
             text += f"\nТип: {display_pa_mode(mode, npct)}"
             text += f"\nНаправление: {display_direction(direction)}"
             try:
@@ -1610,12 +1614,14 @@ async def process_notifications(uid: int) -> None:
         if price is None:
             continue
         triggered = False
-        if mode == "touch":
-            if direction in ("up", "both") and price >= target:
-                triggered = True
-            if direction in ("down", "both") and price <= target:
-                triggered = True
-        else:
+        touched = False
+        if direction in ("up", "both") and price >= target:
+            touched = True
+            triggered = True
+        if direction in ("down", "both") and price <= target:
+            touched = True
+            triggered = True
+        if not triggered or mode in ("near", "both"):
             pct = npct or 0.3
             if direction == "up" and price >= target * (1 - pct / 100):
                 triggered = True
@@ -1624,9 +1630,7 @@ async def process_notifications(uid: int) -> None:
             elif direction == "both" and abs(price - target) / target * 100 <= pct:
                 triggered = True
         if triggered:
-            text = (
-                f"🔔 {sym} достиг {target}" if mode == "touch" else f"🔔 {sym} приблизился к {target}"
-            )
+            text = f"🔔 {sym} достиг {target}" if touched else f"🔔 {sym} приблизился к {target}"
             text += f"\nТип: {display_pa_mode(mode, npct)}"
             text += f"\nНаправление: {display_direction(direction)}"
             try:
@@ -1687,10 +1691,10 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
             """,
             (uid,),
         ).fetchall()
-        manual = conn.execute(
-            "SELECT id, symbol, price, direction, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1 AND triggered=0",
+        manual_cnt = conn.execute(
+            "SELECT COUNT(*) FROM price_alerts WHERE user_id=? AND manual=1 AND triggered=0",
             (uid,),
-        ).fetchall()
+        ).fetchone()[0]
     buttons: list[list[InlineKeyboardButton]] = []
     for tid, sym, t_type, enabled, pa_cnt in rows:
         text = f"{sym} {t_type}"
@@ -1699,7 +1703,15 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
         buttons.append([InlineKeyboardButton(text=text, callback_data=f"notif_cfg_{tid}")])
     buttons.append([
         InlineKeyboardButton(
-            text="Уведомление по цене для тикера", callback_data="pa_manual_add"
+            text="Уведомление по цене для тикера", callback_data="pa_manual_add",
+        )
+    ])
+    buttons.append([
+        InlineKeyboardButton(
+            text=(
+                "🔔 Вне-сделочные уведомления" + (f" ({manual_cnt})" if manual_cnt else "")
+            ),
+            callback_data="pa_manual_list",
         )
     ])
     if rows:
@@ -1708,19 +1720,40 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
     kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
     head = "🔔 Настройка уведомлений по сделкам:" if rows else "У тебя нет активных сделок."
     await message.answer(head, reply_markup=kb)
-    if manual:
-        lines = ["🔔 Вне-сделочные уведомления:"]
-        m_buttons: list[list[InlineKeyboardButton]] = []
-        for i, (aid, sym, price, direction, mode, npct) in enumerate(manual, 1):
-            dir_txt = display_direction(direction)
-            mode_txt = display_pa_mode(mode, npct)
-            lines.append(f"{i}. {sym} {price} — {dir_txt}, {mode_txt}")
-            m_buttons.append([
-                InlineKeyboardButton(text="✏", callback_data=f"pa_edit_{aid}"),
-                InlineKeyboardButton(text="🗑", callback_data=f"pa_del_{aid}"),
-            ])
-        m_buttons.append([InlineKeyboardButton(text="🔕 Отключить все", callback_data="pa_manual_disable_all")])
-        await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=m_buttons))
+
+
+async def show_manual_alerts(uid: int, message: types.Message) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT id, symbol, price, direction, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1 AND triggered=0",
+            (uid,),
+        ).fetchall()
+    lines = ["🔔 Вне-сделочные уведомления:"]
+    buttons: list[list[InlineKeyboardButton]] = []
+    for i, (aid, sym, price, direction, mode, npct) in enumerate(rows, 1):
+        dir_txt = display_direction(direction)
+        mode_txt = display_pa_mode(mode, npct)
+        lines.append(f"{i}. {sym} {price} — {dir_txt}, {mode_txt}")
+        buttons.append([
+            InlineKeyboardButton(text=f"✏ {price}", callback_data=f"pa_edit_{aid}"),
+            InlineKeyboardButton(text="🗑", callback_data=f"pa_del_{aid}"),
+        ])
+    if rows:
+        buttons.append([InlineKeyboardButton(text="🔕 Отключить все", callback_data="pa_manual_disable_all")])
+    buttons.append([InlineKeyboardButton(text="➕ Добавить уведомление", callback_data="pa_manual_add")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="opt_notify")])
+    kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
+    if not rows:
+        lines.append("У тебя нет вне-сделочных уведомлений.")
+    await message.answer("\n".join(lines), reply_markup=kb)
+
+
+@dp.callback_query(F.data == "pa_manual_list")
+async def pa_manual_list_cb(cb: types.CallbackQuery):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    await show_manual_alerts(cb.from_user.id, cb.message)
 
 
 async def reminder_scheduler():
@@ -3837,7 +3870,7 @@ async def send_notif_config(message: types.Message, uid: int, tid: int) -> None:
         lines.append("Ценовые уведомления:")
         for i, (_, price, direction, mode, apct) in enumerate(alerts, 1):
             dir_txt = {"up": "Вверх", "down": "Вниз", "both": "Оба"}.get(direction, "-")
-            mode_txt = "Точное" if mode == "touch" else f"Приближение ±{(apct or 0.3):.1f}%"
+            mode_txt = display_pa_mode(mode, apct)
             lines.append(f"{i}. {price} — {dir_txt}, {mode_txt}")
     else:
         lines.append("Ценовых уведомлений нет")
@@ -3972,7 +4005,7 @@ async def pa_del(cb: types.CallbackQuery):
     if tid:
         await send_notif_config(cb.message, cb.from_user.id, tid)
     else:
-        await show_notifications_menu(cb.from_user.id, cb.message)
+        await show_manual_alerts(cb.from_user.id, cb.message)
 
 
 @dp.callback_query(F.data == "pa_manual_disable_all")
@@ -3985,7 +4018,7 @@ async def pa_manual_disable_all(cb: types.CallbackQuery):
         conn.execute("DELETE FROM price_alerts WHERE user_id=? AND manual=1", (uid,))
         conn.commit()
     await cb.message.answer("🔕 Вне-сделочные уведомления отключены.")
-    await show_notifications_menu(uid, cb.message)
+    await show_manual_alerts(uid, cb.message)
 
 
 @dp.message(PriceAlertState.waiting_price)
@@ -3999,6 +4032,7 @@ async def pa_enter_price(msg: types.Message, state: FSMContext):
         inline_keyboard=[
             [InlineKeyboardButton(text="При точном достижении", callback_data="pa_mode_touch")],
             [InlineKeyboardButton(text="При приближении", callback_data="pa_mode_near")],
+            [InlineKeyboardButton(text="При касании и приближении", callback_data="pa_mode_both")],
         ]
     )
     await msg.answer("Выбери режим:", reply_markup=with_back(kb))
@@ -4008,7 +4042,12 @@ async def pa_enter_price(msg: types.Message, state: FSMContext):
 @dp.callback_query(PriceAlertState.choose_mode)
 async def pa_mode_cb(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    mode = "touch" if cb.data.endswith("touch") else "near"
+    if cb.data.endswith("touch"):
+        mode = "touch"
+    elif cb.data.endswith("near"):
+        mode = "near"
+    else:
+        mode = "both"
     await state.update_data(pa_mode=mode)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -4027,7 +4066,7 @@ async def pa_dir_cb(cb: types.CallbackQuery, state: FSMContext):
     direction = cb.data.split("_")[2]
     await state.update_data(pa_direction=direction)
     data = await state.get_data()
-    if data["pa_mode"] == "near":
+    if data["pa_mode"] in ("near", "both"):
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="±0.1%", callback_data="pa_near_0.1")],
