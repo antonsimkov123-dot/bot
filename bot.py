@@ -2803,7 +2803,13 @@ async def close_trade_get_percent(msg: types.Message, state: FSMContext):
     pct = float(msg.text.replace(",", "."))
     tid = (await state.get_data())["trade_id"]
     with sqlite3.connect(DB_PATH) as conn:
-        total_pct = conn.execute("SELECT percent FROM trades WHERE id=? AND COALESCE(is_deleted,0)=0", (tid,)).fetchone()[0]
+        total_pct = conn.execute(
+            "SELECT percent FROM trades WHERE id=? AND COALESCE(is_deleted,0)=0",
+            (tid,),
+        ).fetchone()[0]
+    # если процент не указан (NULL), считаем что доступно 100%
+    if total_pct is None:
+        total_pct = 100.0
     if pct <= 0 or pct > total_pct:
         await msg.answer(f"Доступно от 1 до {total_pct}%.")
         return
@@ -2826,14 +2832,18 @@ async def close_trade_finish(msg: types.Message, state: FSMContext):
             "SELECT user_id, trade_type, symbol, entry_price, stop_loss, targets, percent, entry_date, comment, signals, signal_stars FROM trades WHERE id=? AND COALESCE(is_deleted,0)=0",
             (tid,),
         ).fetchone()
+    # если процент не был задан, считаем, что изначально открыто 100%
+    percent = percent if percent is not None else 100.0
     pnl = ((exit_price - entry_price) / entry_price) * (
         100 if t_type.lower() in {"long", "spot"} else -100
     )
     profit = round(pnl * close_pct / 100, 2)
     exit_date = datetime.now().strftime("%Y-%m-%d")
-    risk_close = calc_risk(entry_price, sl, close_pct, t_type)
+    risk_close = calc_risk(entry_price, sl, close_pct, t_type) if sl is not None else None
     remaining = percent - close_pct
-    risk_remain = calc_risk(entry_price, sl, remaining, t_type) if remaining > 0 else None
+    risk_remain = (
+        calc_risk(entry_price, sl, remaining, t_type) if sl is not None and remaining > 0 else None
+    )
     close_data = dict(
         user_id=user_id,
         t_type=t_type,
