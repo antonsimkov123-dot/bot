@@ -121,6 +121,16 @@ def init_db() -> None:
     )
     cur.execute(
         """
+        CREATE TABLE IF NOT EXISTS auto_updates (
+            user_id INTEGER PRIMARY KEY,
+            update_time TEXT,
+            period_days INTEGER,
+            next_run TEXT
+        )
+        """
+    )
+    cur.execute(
+        """
         CREATE TABLE IF NOT EXISTS danger_days (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id INTEGER,
@@ -265,6 +275,16 @@ def add_missing_columns() -> None:
         )
         cur.execute(
             """
+            CREATE TABLE IF NOT EXISTS auto_updates (
+                user_id INTEGER PRIMARY KEY,
+                update_time TEXT,
+                period_days INTEGER,
+                next_run TEXT
+            )
+            """
+        )
+        cur.execute(
+            """
             CREATE TABLE IF NOT EXISTS bybit_keys (
                 user_id INTEGER PRIMARY KEY,
                 api_key TEXT,
@@ -391,6 +411,10 @@ class ClearAllState(StatesGroup):
 class AutoReportState(StatesGroup):
     entering_time = State()
     choosing_period = State()
+
+
+class AutoUpdateState(StatesGroup):
+    entering_time = State()
 
 class DangerDayState(StatesGroup):
     choosing_reason = State()
@@ -1705,6 +1729,10 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
             "SELECT COUNT(*) FROM price_alerts WHERE user_id=? AND manual=1 AND triggered=0",
             (uid,),
         ).fetchone()[0]
+        auto_row = conn.execute(
+            "SELECT update_time, period_days FROM auto_updates WHERE user_id=?",
+            (uid,),
+        ).fetchone()
     buttons: list[list[InlineKeyboardButton]] = []
     for tid, sym, t_type, lev, enabled, pa_cnt in rows:
         lev_str = fmt_leverage(lev)
@@ -1720,6 +1748,11 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
             callback_data="pa_manual_list",
         )
     ])
+    auto_text = "⏱ Автообновление"
+    if auto_row:
+        mode = "ежедневно" if auto_row[1] == 1 else "еженедельно"
+        auto_text += f" ({mode} {auto_row[0]})"
+    buttons.append([InlineKeyboardButton(text=auto_text, callback_data="auto_sync")])
     if rows:
         buttons.append([InlineKeyboardButton(text="🔕 Выключить все", callback_data="notif_disable_all")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")])
@@ -1760,6 +1793,136 @@ async def pa_manual_list_cb(cb: types.CallbackQuery):
     if not await require_subscription(cb.message, cb.from_user.id):
         return
     await show_manual_alerts(cb.from_user.id, cb.message)
+
+
+@dp.callback_query(F.data == "auto_sync")
+async def auto_sync_cb(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    uid = cb.from_user.id
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🕐 Ежедневно", callback_data="aus_daily")],
+            [InlineKeyboardButton(text="📅 Еженедельно", callback_data="aus_weekly")],
+            [InlineKeyboardButton(text="❌ Отключить автообновление", callback_data="aus_off")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_notify")],
+        ]
+    )
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT update_time, period_days FROM auto_updates WHERE user_id=?",
+            (uid,),
+        ).fetchone()
+    if row:
+        mode = "ежедневно" if row[1] == 1 else "еженедельно"
+        status = f"✅ Автообновление включено: {mode} в {row[0]}"
+    else:
+        status = "❌ Автообновление отключено"
+    await cb.message.answer(status, reply_markup=with_back(kb))
+
+
+@dp.callback_query(lambda c: c.data in {"aus_daily", "aus_weekly"})
+async def auto_sync_choose_time(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    period = 1 if cb.data == "aus_daily" else 7
+    await state.update_data(auto_period=period)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="auto_sync")]]
+    )
+    await cb.message.answer("Введи время в формате HH:MM", reply_markup=with_back(kb))
+    await state.set_state(AutoUpdateState.entering_time)
+
+
+@dp.message(AutoUpdateState.entering_time)
+async def auto_sync_set_time(msg: types.Message, state: FSMContext):
+    if not await require_subscription(msg, msg.from_user.id):
+        return
+    time_str = msg.text.strip()
+    if not is_time(time_str):
+        await msg.answer("Неверный формат времени. Введи HH:MM")
+        return
+    data = await state.get_data()
+    period = data.get("auto_period", 1)
+    uid = msg.from_user.id
+    t = datetime.strptime(time_str, "%H:%M").time()
+    now = datetime.now()
+    next_run = datetime.combine(now.date(), t)
+    if next_run <= now:
+        next_run += timedelta(days=period)
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO auto_updates (user_id, update_time, period_days, next_run) VALUES (?,?,?,?)",
+            (uid, time_str, period, next_run.isoformat()),
+        )
+        conn.commit()
+    await state.clear()
+    mode = "ежедневно" if period == 1 else "еженедельно"
+    await msg.answer(f"✅ Автообновление включено: {mode} в {time_str}")
+    await show_notifications_menu(uid, msg)
+
+
+@dp.callback_query(F.data == "aus_off")
+async def auto_sync_off(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    uid = cb.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM auto_updates WHERE user_id=?", (uid,))
+        conn.commit()
+    await state.clear()
+    await cb.message.answer("❌ Автообновление отключено")
+    await show_notifications_menu(uid, cb.message)
+
+
+async def run_auto_update(uid: int) -> bool:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT api_key, api_secret, account_type FROM bybit_keys WHERE user_id=?",
+            (uid,),
+        ).fetchone()
+    if not row or not row[0] or not row[1]:
+        return False
+    api_key, api_secret, acc_type = row
+    ok_pos, positions, _ = await fetch_bybit_positions(uid, api_key, api_secret, acc_type)
+    ok_spot, spot_orders = await fetch_bybit_spot_history(api_key, api_secret)
+    ok_bal, balinfo = await fetch_bybit_balance(uid, api_key, api_secret, acc_type)
+    if ok_bal:
+        _, _, bal_details = balinfo
+        await sync_spot_balances(uid, api_key, api_secret, bal_details)
+    if ok_spot and spot_orders:
+        process_spot_history(uid, spot_orders)
+    if ok_pos:
+        await sync_futures_positions(uid, positions)
+    return ok_pos or ok_spot or ok_bal
+
+
+async def auto_update_scheduler():
+    while True:
+        now = datetime.now()
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT user_id, period_days, next_run FROM auto_updates WHERE next_run<=?",
+                (now.isoformat(),),
+            ).fetchall()
+        for uid, period, next_run in rows:
+            success = await run_auto_update(uid)
+            next_time = datetime.fromisoformat(next_run) + timedelta(days=period)
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "UPDATE auto_updates SET next_run=? WHERE user_id=?",
+                    (next_time.isoformat(), uid),
+                )
+                conn.commit()
+            if success:
+                try:
+                    await bot.send_message(uid, "⏱ Автообновление\n🔁 Ваши новые сделки были автоматом подгружены")
+                except Exception:
+                    pass
+        await asyncio.sleep(60)
 
 
 async def reminder_scheduler():
@@ -4225,6 +4388,7 @@ async def clear_all_confirm(msg: types.Message, state: FSMContext):
             conn.execute("DELETE FROM trades WHERE user_id=?", (uid,))
             conn.execute("DELETE FROM reminders WHERE user_id=?", (uid,))
             conn.execute("DELETE FROM auto_reports WHERE user_id=?", (uid,))
+            conn.execute("DELETE FROM auto_updates WHERE user_id=?", (uid,))
             conn.commit()
         await msg.answer("Все данные очищены.")
     else:
@@ -4531,6 +4695,7 @@ async def main():
     asyncio.create_task(reminder_scheduler())
     asyncio.create_task(report_scheduler())
     asyncio.create_task(notification_scheduler())
+    asyncio.create_task(auto_update_scheduler())
     await dp.start_polling(bot)
 
 
