@@ -1103,16 +1103,24 @@ async def sync_futures_positions(uid: int, positions: list[dict]) -> list[dict]:
                 tgt = ",".join(t.strip() for t in str(tp_val).split(",") if t.strip() and float(t))
             else:
                 tgt = None
+            base_sz = old_size / ((old_pct or 100) / 100) if (old_pct or 0) > 0 else old_size
             if size < old_size:
-                closed_qty = old_size - size
-                close_pct = old_pct * closed_qty / (old_size or 1)
+                new_pct = min(size / base_sz * 100, 100.0) if base_sz else 0.0
+                close_pct = max(old_pct - new_pct, 0)
                 exit_price = await fetch_price(sym)
                 if side == "Long":
                     pnl = ((exit_price - e_price) / e_price * 100) if exit_price else 0
                 else:
                     pnl = ((e_price - exit_price) / e_price * 100) if exit_price else 0
                 profit = round(pnl * close_pct / 100, 2) if exit_price else 0
-                remaining = old_pct - close_pct
+                risk_close = (
+                    calc_risk(e_price, tr["stop_loss"], close_pct, side)
+                    if tr["stop_loss"] is not None
+                    else None
+                )
+                risk_remain = (
+                    calc_risk(entry, sl, new_pct, side) if sl is not None else None
+                )
                 close_data = dict(
                     user_id=uid,
                     t_type=side,
@@ -1128,29 +1136,29 @@ async def sync_futures_positions(uid: int, positions: list[dict]) -> list[dict]:
                     exit_date=now,
                     pnl=pnl if exit_price else 0,
                     profit=profit if exit_price else 0,
-                    remaining=remaining,
+                    remaining=new_pct,
                     close_pct=close_pct,
-                    risk_close=None,
-                    risk_remain=None,
+                    risk_close=risk_close,
+                    risk_remain=risk_remain,
                     trade_id=tid,
                     remain_size=size,
                 )
                 store_closed_trade(close_data, None)
-                if remaining <= 0:
+                if new_pct <= 0:
                     seen.add(key)
                     continue
-                new_pct = remaining
             else:
-                base_sz = old_size / ((old_pct or 100) / 100) if (old_pct or 0) > 0 else old_size
                 if size >= base_sz:
                     new_pct = 100.0
                 else:
                     new_pct = min(size / base_sz * 100, 100.0)
-            risk = calc_risk(entry, sl, new_pct, side) if sl is not None else None
+                risk_remain = (
+                    calc_risk(entry, sl, new_pct, side) if sl is not None else None
+                )
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute(
                     "UPDATE trades SET entry_price=?, position_size=?, leverage=?, stop_loss=?, targets=?, percent=?, risk_percent=? WHERE id=?",
-                    (entry, size, lev, sl, tgt, new_pct, risk, tid),
+                    (entry, size, lev, sl, tgt, new_pct, risk_remain, tid),
                 )
                 conn.commit()
             seen.add(key)
@@ -3151,7 +3159,7 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
             inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="optimization")]]
         )
         await cb.message.answer(
-            "✅ Сделки автоматически импортированы с фьючерсного аккаунта Bybit!",
+            "✅ Сделки автоматически импортированы с фьючерсного аккаунта Bybit!\nСтопы, цели и риск подтянуты автоматически.",
             reply_markup=with_back(kb),
         )
         return
@@ -3407,7 +3415,7 @@ async def import_bybit_trade(cb: types.CallbackQuery, state: FSMContext):
     trade_id = save_imported_trade(cb.from_user.id, pos)
     await state.clear()
     await cb.message.answer(
-        "✅ Сделка успешно импортирована с фьючерсного аккаунта Bybit!\nНе забудь указать стоп и цели — нажми \"📝 Изменить\" в текущих сделках."
+        "✅ Сделка успешно импортирована с фьючерсного аккаунта Bybit!\nСтопы, цели и риск подтянуты автоматически. При необходимости отредактируй через \"📝 Изменить\" в текущих сделках."
     )
     await ask_notifications(cb.from_user.id, trade_id, state)
     await maybe_send_ai_advice(cb.from_user.id, trade_id)
