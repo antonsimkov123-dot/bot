@@ -152,12 +152,15 @@ def init_db() -> None:
         """
         CREATE TABLE IF NOT EXISTS price_alerts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
             trade_id INTEGER,
+            symbol TEXT,
             price REAL,
             direction TEXT,
             mode TEXT,
             near_pct REAL,
-            triggered INTEGER DEFAULT 0
+            triggered INTEGER DEFAULT 0,
+            manual INTEGER DEFAULT 0
         )
         """
     )
@@ -209,6 +212,18 @@ def add_missing_columns() -> None:
             conn.commit()
         if "notify_near_pct" not in columns:
             cur.execute("ALTER TABLE trades ADD COLUMN notify_near_pct REAL DEFAULT 0.3")
+            conn.commit()
+
+        cur.execute("PRAGMA table_info(price_alerts)")
+        pa_cols = {row[1] for row in cur.fetchall()}
+        if "user_id" not in pa_cols:
+            cur.execute("ALTER TABLE price_alerts ADD COLUMN user_id INTEGER")
+            conn.commit()
+        if "symbol" not in pa_cols:
+            cur.execute("ALTER TABLE price_alerts ADD COLUMN symbol TEXT")
+            conn.commit()
+        if "manual" not in pa_cols:
+            cur.execute("ALTER TABLE price_alerts ADD COLUMN manual INTEGER DEFAULT 0")
             conn.commit()
 
         cur.execute("PRAGMA table_info(reminders)")
@@ -409,6 +424,7 @@ class NotifyState(StatesGroup):
 
 
 class PriceAlertState(StatesGroup):
+    enter_symbol = State()
     waiting_price = State()
     choose_mode = State()
     choose_direction = State()
@@ -484,12 +500,14 @@ def display_pa_mode(mode: str, pct: float | None) -> str:
 
 async def save_price_alert(msg: types.Message, state: FSMContext) -> None:
     data = await state.get_data()
-    tid = data["pa_trade_id"]
+    tid = data.get("pa_trade_id")
+    symbol = data.get("pa_symbol")
     aid = data.get("pa_edit_id")
     price = data["pa_price"]
     mode = data["pa_mode"]
     direction = data["pa_direction"]
     near_pct = data.get("pa_near_pct")
+    uid = msg.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
         if aid:
             conn.execute(
@@ -498,13 +516,16 @@ async def save_price_alert(msg: types.Message, state: FSMContext) -> None:
             )
         else:
             conn.execute(
-                "INSERT INTO price_alerts(trade_id, price, direction, mode, near_pct) VALUES (?,?,?,?,?)",
-                (tid, price, direction, mode, near_pct),
+                "INSERT INTO price_alerts(user_id, trade_id, symbol, price, direction, mode, near_pct, manual) VALUES (?,?,?,?,?,?,?,?)",
+                (uid, tid, symbol, price, direction, mode, near_pct, 1 if symbol and not tid else 0),
             )
         conn.commit()
     await msg.answer("✅ Уведомление сохранено.")
     await state.clear()
-    await send_notif_config(msg, msg.from_user.id, tid)
+    if tid:
+        await send_notif_config(msg, uid, tid)
+    else:
+        await show_notifications_menu(uid, msg)
 
 
 async def ask_notify_mode(cb: types.CallbackQuery, state: FSMContext) -> None:
@@ -1335,17 +1356,21 @@ async def sync_futures_positions(uid: int, positions: list[dict]) -> list[dict]:
 
 async def fetch_price(symbol: str) -> float | None:
     url = "https://api.bybit.com/v5/market/tickers"
-    params = {"category": "linear", "symbol": f"{symbol}USDT"}
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params) as resp:
-                data = await resp.json()
-    except Exception:
-        return None
-    try:
-        return float(data.get("result", {}).get("list", [{}])[0].get("lastPrice"))
-    except Exception:
-        return None
+    for category in ("linear", "spot"):
+        params = {"category": category, "symbol": f"{symbol}USDT"}
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params) as resp:
+                    data = await resp.json()
+        except Exception:
+            return None
+        try:
+            price = float(data.get("result", {}).get("list", [{}])[0].get("lastPrice"))
+            if price:
+                return price
+        except Exception:
+            continue
+    return None
 
 
 def describe_reminder(t: str, period: int, next_run: str) -> str:
@@ -1575,6 +1600,43 @@ async def process_notifications(uid: int) -> None:
                 conn.execute("DELETE FROM price_alerts WHERE id=?", (aid,))
                 conn.commit()
 
+    with sqlite3.connect(DB_PATH) as conn:
+        man_rows = conn.execute(
+            "SELECT id, symbol, price, direction, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1 AND triggered=0",
+            (uid,),
+        ).fetchall()
+    for aid, sym, target, direction, mode, npct in man_rows:
+        price = await fetch_price(sym)
+        if price is None:
+            continue
+        triggered = False
+        if mode == "touch":
+            if direction in ("up", "both") and price >= target:
+                triggered = True
+            if direction in ("down", "both") and price <= target:
+                triggered = True
+        else:
+            pct = npct or 0.3
+            if direction == "up" and price >= target * (1 - pct / 100):
+                triggered = True
+            elif direction == "down" and price <= target * (1 + pct / 100):
+                triggered = True
+            elif direction == "both" and abs(price - target) / target * 100 <= pct:
+                triggered = True
+        if triggered:
+            text = (
+                f"🔔 {sym} достиг {target}" if mode == "touch" else f"🔔 {sym} приблизился к {target}"
+            )
+            text += f"\nТип: {display_pa_mode(mode, npct)}"
+            text += f"\nНаправление: {display_direction(direction)}"
+            try:
+                await bot.send_message(uid, text)
+            except Exception:
+                pass
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute("DELETE FROM price_alerts WHERE id=?", (aid,))
+                conn.commit()
+
 
 async def show_reminders_menu(uid: int, message: types.Message) -> None:
     with sqlite3.connect(DB_PATH) as conn:
@@ -1625,24 +1687,40 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
             """,
             (uid,),
         ).fetchall()
-    if not rows:
-        kb = with_back(
-            InlineKeyboardMarkup(
-                inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")]]
-            )
-        )
-        await message.answer("У тебя нет активных сделок.", reply_markup=kb)
-        return
-    buttons = []
+        manual = conn.execute(
+            "SELECT id, symbol, price, direction, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1 AND triggered=0",
+            (uid,),
+        ).fetchall()
+    buttons: list[list[InlineKeyboardButton]] = []
     for tid, sym, t_type, enabled, pa_cnt in rows:
         text = f"{sym} {t_type}"
         if enabled or pa_cnt:
             text += " 🔔"
         buttons.append([InlineKeyboardButton(text=text, callback_data=f"notif_cfg_{tid}")])
-    buttons.append([InlineKeyboardButton(text="🔕 Выключить все", callback_data="notif_disable_all")])
+    buttons.append([
+        InlineKeyboardButton(
+            text="Уведомление по цене для тикера", callback_data="pa_manual_add"
+        )
+    ])
+    if rows:
+        buttons.append([InlineKeyboardButton(text="🔕 Выключить все", callback_data="notif_disable_all")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")])
     kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
-    await message.answer("🔔 Настройка уведомлений по сделкам:", reply_markup=kb)
+    head = "🔔 Настройка уведомлений по сделкам:" if rows else "У тебя нет активных сделок."
+    await message.answer(head, reply_markup=kb)
+    if manual:
+        lines = ["🔔 Вне-сделочные уведомления:"]
+        m_buttons: list[list[InlineKeyboardButton]] = []
+        for i, (aid, sym, price, direction, mode, npct) in enumerate(manual, 1):
+            dir_txt = display_direction(direction)
+            mode_txt = display_pa_mode(mode, npct)
+            lines.append(f"{i}. {sym} {price} — {dir_txt}, {mode_txt}")
+            m_buttons.append([
+                InlineKeyboardButton(text="✏", callback_data=f"pa_edit_{aid}"),
+                InlineKeyboardButton(text="🗑", callback_data=f"pa_del_{aid}"),
+            ])
+        m_buttons.append([InlineKeyboardButton(text="🔕 Отключить все", callback_data="pa_manual_disable_all")])
+        await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=m_buttons))
 
 
 async def reminder_scheduler():
@@ -3828,8 +3906,33 @@ async def pa_add(cb: types.CallbackQuery, state: FSMContext):
     if not await require_subscription(cb.message, cb.from_user.id):
         return
     tid = int(cb.data.split("_")[2])
-    await state.update_data(pa_trade_id=tid, pa_edit_id=None)
+    await state.update_data(pa_trade_id=tid, pa_edit_id=None, pa_symbol=None)
     await cb.message.answer("Введи цену для уведомления:")
+    await state.set_state(PriceAlertState.waiting_price)
+
+
+@dp.callback_query(F.data == "pa_manual_add")
+async def pa_manual_add(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    await state.update_data(pa_trade_id=None, pa_edit_id=None, pa_symbol=None)
+    await cb.message.answer("Введи тикер (например BTC):")
+    await state.set_state(PriceAlertState.enter_symbol)
+
+
+@dp.message(PriceAlertState.enter_symbol)
+async def pa_manual_symbol(msg: types.Message, state: FSMContext):
+    sym = msg.text.strip().upper()
+    if not sym:
+        await msg.answer("Введите тикер.")
+        return
+    price = await fetch_price(sym)
+    if price is None:
+        await msg.answer("Тикер не найден на Bybit.")
+        return
+    await state.update_data(pa_symbol=sym)
+    await msg.answer("Введи цену для уведомления:")
     await state.set_state(PriceAlertState.waiting_price)
 
 
@@ -3840,12 +3943,12 @@ async def pa_edit(cb: types.CallbackQuery, state: FSMContext):
         return
     aid = int(cb.data.split("_")[2])
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT trade_id, price FROM price_alerts WHERE id=?", (aid,)).fetchone()
+        row = conn.execute("SELECT trade_id, price, symbol FROM price_alerts WHERE id=?", (aid,)).fetchone()
     if not row:
         await cb.message.answer("Уведомление не найдено.")
         return
-    tid, price = row
-    await state.update_data(pa_trade_id=tid, pa_edit_id=aid)
+    tid, price, sym = row
+    await state.update_data(pa_trade_id=tid, pa_edit_id=aid, pa_symbol=sym)
     await cb.message.answer(f"Текущая цена: {price}\nВведи новую цену:")
     await state.set_state(PriceAlertState.waiting_price)
 
@@ -3857,7 +3960,7 @@ async def pa_del(cb: types.CallbackQuery):
         return
     aid = int(cb.data.split("_")[2])
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT trade_id FROM price_alerts WHERE id=?", (aid,)).fetchone()
+        row = conn.execute("SELECT trade_id, user_id FROM price_alerts WHERE id=?", (aid,)).fetchone()
         if row:
             conn.execute("DELETE FROM price_alerts WHERE id=?", (aid,))
             conn.commit()
@@ -3866,7 +3969,23 @@ async def pa_del(cb: types.CallbackQuery):
         return
     tid = row[0]
     await cb.message.answer("🗑 Уведомление удалено.")
-    await send_notif_config(cb.message, cb.from_user.id, tid)
+    if tid:
+        await send_notif_config(cb.message, cb.from_user.id, tid)
+    else:
+        await show_notifications_menu(cb.from_user.id, cb.message)
+
+
+@dp.callback_query(F.data == "pa_manual_disable_all")
+async def pa_manual_disable_all(cb: types.CallbackQuery):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    uid = cb.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM price_alerts WHERE user_id=? AND manual=1", (uid,))
+        conn.commit()
+    await cb.message.answer("🔕 Вне-сделочные уведомления отключены.")
+    await show_notifications_menu(uid, cb.message)
 
 
 @dp.message(PriceAlertState.waiting_price)
