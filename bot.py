@@ -1021,6 +1021,131 @@ async def sync_spot_balances(
             store_closed_trade(close_data, None)
 
 
+async def sync_futures_positions(uid: int, positions: list[dict]) -> list[dict]:
+    """Sync futures positions with trades table.
+
+    Returns positions not yet stored so user can import them manually."""
+    now = datetime.now().strftime("%Y-%m-%d")
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT id, symbol, trade_type, entry_price, position_size, percent, stop_loss, targets, entry_date, comment, signals, signal_stars FROM trades WHERE user_id=? AND trade_type IN ('Long','Short') AND exit_price IS NULL AND COALESCE(is_deleted,0)=0",
+            (uid,),
+        ).fetchall()
+    trade_map: dict[tuple[str, str], dict] = {}
+    for r in rows:
+        trade_map[(r[1], r[2])] = {
+            "id": r[0],
+            "symbol": r[1],
+            "trade_type": r[2],
+            "entry_price": r[3],
+            "position_size": r[4] or 0.0,
+            "percent": r[5] if r[5] is not None else 100.0,
+            "stop_loss": r[6],
+            "targets": r[7],
+            "entry_date": r[8],
+            "comment": r[9],
+            "signals": r[10],
+            "sstars": r[11],
+        }
+    seen: set[tuple[str, str]] = set()
+    new_positions: list[dict] = []
+    for pos in positions:
+        sym = pos.get("symbol", "")
+        if sym.endswith("USDT"):
+            sym = sym[:-4]
+        side = "Long" if pos.get("side") in {"Buy", "Long"} else "Short"
+        size = float(pos.get("size") or 0)
+        entry = float(pos.get("entryPrice") or pos.get("avgPrice") or 0)
+        lev = float(pos.get("leverage") or 0)
+        key = (sym, side)
+        if key in trade_map:
+            tr = trade_map[key]
+            tid = tr["id"]
+            old_size = tr["position_size"]
+            old_pct = tr["percent"]
+            e_price = tr["entry_price"]
+            if size < old_size:
+                closed_qty = old_size - size
+                close_pct = old_pct * closed_qty / (old_size or 1)
+                exit_price = await fetch_price(sym)
+                if side == "Long":
+                    pnl = ((exit_price - e_price) / e_price * 100) if exit_price else 0
+                else:
+                    pnl = ((e_price - exit_price) / e_price * 100) if exit_price else 0
+                profit = round(pnl * close_pct / 100, 2) if exit_price else 0
+                close_data = dict(
+                    user_id=uid,
+                    t_type=side,
+                    sym=sym,
+                    entry_price=e_price,
+                    sl=tr["stop_loss"],
+                    tgt=tr["targets"],
+                    entry_date=tr["entry_date"],
+                    comment=tr["comment"],
+                    signals=tr["signals"],
+                    sstars=tr["sstars"],
+                    exit_price=exit_price or e_price,
+                    exit_date=now,
+                    pnl=pnl if exit_price else 0,
+                    profit=profit if exit_price else 0,
+                    remaining=old_pct - close_pct,
+                    close_pct=close_pct,
+                    risk_close=None,
+                    risk_remain=None,
+                    trade_id=tid,
+                    remain_size=size,
+                )
+                store_closed_trade(close_data, None)
+            new_pct = 100.0 if size > old_size else old_pct
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "UPDATE trades SET entry_price=?, position_size=?, leverage=?, percent=? WHERE id=?",
+                    (entry, size, lev, new_pct, tid),
+                )
+                conn.commit()
+            seen.add(key)
+        else:
+            new_positions.append(pos)
+    for key, tr in trade_map.items():
+        if key in seen:
+            continue
+        tid = tr["id"]
+        sym = tr["symbol"]
+        side = tr["trade_type"]
+        e_price = tr["entry_price"]
+        pct = tr["percent"]
+        exit_price = await fetch_price(sym)
+        if side == "Long":
+            pnl = ((exit_price - e_price) / e_price * 100) if exit_price else 0
+        else:
+            pnl = ((e_price - exit_price) / e_price * 100) if exit_price else 0
+        profit = round(pnl * pct / 100, 2) if exit_price else 0
+        close_data = dict(
+            user_id=uid,
+            t_type=side,
+            sym=sym,
+            entry_price=e_price,
+            sl=tr["stop_loss"],
+            tgt=tr["targets"],
+            entry_date=tr["entry_date"],
+            comment=tr["comment"],
+            signals=tr["signals"],
+            sstars=tr["sstars"],
+            exit_price=exit_price or e_price,
+            exit_date=now,
+            pnl=pnl if exit_price else 0,
+            profit=profit if exit_price else 0,
+            remaining=0,
+            close_pct=pct,
+            risk_close=None,
+            risk_remain=None,
+            trade_id=tid,
+            remain_size=0,
+        )
+        store_closed_trade(close_data, None)
+    return new_positions
+
+
 async def fetch_price(symbol: str) -> float | None:
     url = "https://api.bybit.com/v5/market/tickers"
     params = {"category": "linear", "symbol": f"{symbol}USDT"}
@@ -2942,6 +3067,8 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
         await sync_spot_balances(uid, row[0], row[1], bal_details)
     if ok_spot and spot_orders:
         process_spot_history(uid, spot_orders)
+    if ok_pos:
+        positions = await sync_futures_positions(uid, positions)
     if not ok_pos:
         if positions == "401":
             await cb.message.answer("❌ Неверный API-ключ или Secret")
