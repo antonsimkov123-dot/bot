@@ -412,6 +412,12 @@ def fmt_targets(val: str | None) -> str:
     return " | ".join(parts) if parts else "-"
 
 
+def fmt_percent(val: float | None) -> str:
+    if val is None:
+        return "-"
+    return f"{val:.1f}%"
+
+
 async def present_auto_calc(msg: types.Message, state: FSMContext, vol: float) -> None:
     data = await state.get_data()
     entry = data["entry"]
@@ -1323,10 +1329,13 @@ def list_open_trades(uid: int) -> str:
         return ""
     lines = []
     for sym, t_type, entry, sl, tgt, pct in rows:
+        sl_str = fmt_price(float(sl)) if sl is not None else "-"
+        tgt_str = fmt_targets(tgt)
+        pct_str = fmt_percent(pct)
         if t_type and t_type.upper() == "SPOT":
-            lines.append(f"{sym} SPOT @ {fmt_price(entry)} — {pct}%")
+            lines.append(f"{sym} SPOT | Вход {fmt_price(entry)} {pct_str}")
         else:
-            lines.append(f"{sym} {t_type.upper()} вход {entry} стоп {sl} цели {tgt} {pct}%")
+            lines.append(f"{sym} {t_type.upper()} | Вход {fmt_price(entry)} Стоп {sl_str} Цели {tgt_str} {pct_str}")
     return "\n".join(lines)
 
 
@@ -1738,23 +1747,31 @@ def store_closed_trade(data: dict, reason: str | None) -> None:
 
 
 def format_trade(data: dict) -> str:
-    sl_val = data.get('stop_loss')
-    sl = fmt_price(float(sl_val)) if sl_val is not None else '-'
-    tgt = fmt_targets(data.get('targets'))
-    pct = data.get('percent')
-    pct_str = pct if pct is not None else '-'
-    risk = data.get('risk')
-    risk_str = f"{risk}%" if risk is not None else '-'
+    pct_str = fmt_percent(data.get("percent"))
     text = (
         f"Тип: {data['trade_type'].upper()}\n"
         f"Тикер: {data['symbol']}\n"
-        f"Вход: {data['entry_price']}\n"
-        f"Стоп: {sl}\n"
-        f"Цели: {tgt}\n"
+        f"Вход: {fmt_price(float(data['entry_price']))}\n"
         f"% от депо: {pct_str}\n"
-        f"Риск: {risk_str}\n"
         f"Дата: {data['entry_date']}"
     )
+    ttype = (data.get('trade_type') or '').upper()
+    if ttype != 'SPOT':
+        sl_val = data.get('stop_loss')
+        sl = fmt_price(float(sl_val)) if sl_val is not None else '-'
+        tgt = fmt_targets(data.get('targets'))
+        risk = data.get('risk')
+        risk_str = fmt_percent(risk)
+        text = (
+            f"Тип: {ttype}\n"
+            f"Тикер: {data['symbol']}\n"
+            f"Вход: {fmt_price(float(data['entry_price']))}\n"
+            f"Стоп: {sl}\n"
+            f"Цели: {tgt}\n"
+            f"% от депо: {pct_str}\n"
+            f"Риск: {risk_str}\n"
+            f"Дата: {data['entry_date']}"
+        )
     if data.get('comment'):
         text += f"\nКомментарий: {data['comment']}"
     sigs = data.get('signals')
@@ -2236,10 +2253,10 @@ async def show_active(cb: types.CallbackQuery):
         tid, sym, ttype, entry, sl, tgt, pct, date, comm, risk = r
         sl = fmt_price(float(sl)) if sl is not None else "-"
         tgt = fmt_targets(tgt)
-        pct_str = f"{pct}%" if pct is not None else "-"
-        risk_str = f"{risk}%" if risk is not None else "-"
+        pct_str = fmt_percent(pct)
+        risk_str = fmt_percent(risk)
         if ttype and ttype.upper() == "SPOT":
-            caption = f"{sym} SPOT @ {fmt_price(entry)} — {pct_str}"
+            caption = f"{sym} SPOT | Вход {fmt_price(entry)} {pct_str}"
             if comm:
                 caption += f"\n💬 {comm}"
         else:
@@ -2313,7 +2330,13 @@ async def show_history(cb: types.CallbackQuery):
         return
     lines = []
     for sym, t_type, entry, exit_price, pnl, exit_date, comm, risk in rows:
-        line = f"{sym} {t_type.upper()} | {entry} → {exit_price} | {pnl:+.2f}% | {exit_date} | Риск {risk}%"
+        entry_str = fmt_price(float(entry))
+        exit_str = fmt_price(float(exit_price)) if exit_price is not None else "-"
+        if t_type and t_type.upper() == "SPOT":
+            line = f"{sym} SPOT | {entry_str} → {exit_str} | {pnl:+.2f}% | {exit_date}"
+        else:
+            risk_str = fmt_percent(risk)
+            line = f"{sym} {t_type.upper()} | {entry_str} → {exit_str} | {pnl:+.2f}% | {exit_date} | Риск {risk_str}"
         if comm:
             line += f"\n💬 {comm}"
         lines.append(line)
@@ -2829,21 +2852,23 @@ async def notif_no(cb: types.CallbackQuery, state: FSMContext):
 async def close_trade_list(cb: types.CallbackQuery, state: FSMContext):
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute("""
-        SELECT id, trade_type, symbol, entry_price
-        FROM trades
-        WHERE user_id=? AND exit_price IS NULL AND COALESCE(is_deleted,0)=0
-""", (uid,)).fetchall()
+        rows = conn.execute(
+            "SELECT id, trade_type, symbol, entry_price, percent FROM trades "
+            "WHERE user_id=? AND exit_price IS NULL AND COALESCE(is_deleted,0)=0",
+            (uid,),
+        ).fetchall()
     if not rows:
         await cb.message.answer("Нет открытых сделок.")
         return
-    kb = with_back(
-        InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text=f"{sym.upper()} {t.upper()} @ {e}",
-                                                   callback_data=f"close_{tid}")]
-                             for tid, t, sym, e in rows]
-        )
-    )
+    ikb = []
+    for tid, t, sym, e, p in rows:
+        pct_str = fmt_percent(p)
+        if t and t.upper() == "SPOT":
+            text = f"{sym} SPOT | Вход {fmt_price(e)} {pct_str}"
+        else:
+            text = f"{sym.upper()} {t.upper()} @ {fmt_price(e)} {pct_str}"
+        ikb.append([InlineKeyboardButton(text=text, callback_data=f"close_{tid}")])
+    kb = with_back(InlineKeyboardMarkup(inline_keyboard=ikb))
     await cb.message.answer("Выберите сделку для закрытия:", reply_markup=kb)
     await state.set_state(CloseTradeState.choosing_trade)
 
@@ -2961,20 +2986,21 @@ async def save_custom_mistake(msg: types.Message, state: FSMContext):
 async def delete_trade_list(cb: types.CallbackQuery, state: FSMContext):
     uid = cb.from_user.id
     df = pd.read_sql_query(
-        "SELECT id, trade_type, symbol, entry_price FROM trades WHERE user_id=? AND COALESCE(is_deleted,0)=0",
+        "SELECT id, trade_type, symbol, entry_price, percent FROM trades WHERE user_id=? AND COALESCE(is_deleted,0)=0",
         sqlite3.connect(DB_PATH), params=(uid,)
     )
     if df.empty:
         await cb.message.answer("Нет сделок для удаления.")
         return
-    kb = with_back(
-        InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text=f"{row.id}: {row.trade_type.upper()} "
-                                                   f"{row.symbol} @ {row.entry_price}",
-                                                   callback_data=f"del_{row.id}")]
-                             for _, row in df.iterrows()]
-        )
-    )
+    ikb = []
+    for _, row in df.iterrows():
+        pct_str = fmt_percent(row.percent)
+        if row.trade_type and row.trade_type.upper() == "SPOT":
+            text = f"{row.id}: {row.symbol} SPOT | Вход {fmt_price(row.entry_price)} {pct_str}"
+        else:
+            text = f"{row.id}: {row.trade_type.upper()} {row.symbol} @ {fmt_price(row.entry_price)} {pct_str}"
+        ikb.append([InlineKeyboardButton(text=text, callback_data=f"del_{row.id}")])
+    kb = with_back(InlineKeyboardMarkup(inline_keyboard=ikb))
     await cb.message.answer("Выберите сделку для удаления:", reply_markup=kb)
     await state.set_state(DeleteTradeState.choosing_trade)
 
