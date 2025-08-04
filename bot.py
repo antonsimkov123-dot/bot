@@ -2028,12 +2028,27 @@ async def report_scheduler():
 async def notification_scheduler():
     while True:
         with sqlite3.connect(DB_PATH) as conn:
-            uids = [row[0] for row in conn.execute(
-                "SELECT DISTINCT user_id FROM trades WHERE exit_price IS NULL AND notifications_enabled=1 AND COALESCE(is_deleted,0)=0"
-            ).fetchall()]
+            uids = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT DISTINCT user_id FROM trades WHERE exit_price IS NULL AND notifications_enabled=1 AND COALESCE(is_deleted,0)=0"
+                ).fetchall()
+            }
+            uids.update(
+                row[0]
+                for row in conn.execute(
+                    "SELECT DISTINCT t.user_id FROM price_alerts pa JOIN trades t ON pa.trade_id=t.id WHERE pa.triggered=0 AND t.exit_price IS NULL AND COALESCE(t.is_deleted,0)=0"
+                ).fetchall()
+            )
+            uids.update(
+                row[0]
+                for row in conn.execute(
+                    "SELECT DISTINCT user_id FROM price_alerts WHERE manual=1 AND triggered=0"
+                ).fetchall()
+            )
         for uid in uids:
             await process_notifications(uid)
-        await asyncio.sleep(3600 * 24)
+        await asyncio.sleep(60)
 
 def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
     opt_text = (
