@@ -4562,27 +4562,37 @@ def build_setup_battle(uid: int) -> str:
     for st in combo_stats.values():
         st["avg"] = st["profit_sum"] / st["count"]
         st["wr"] = st["wins"] / st["count"] * 100
+
     best = [item for item in combo_stats.items() if item[1]["avg"] > 0]
     best = sorted(best, key=lambda kv: kv[1]["avg"], reverse=True)[:5]
     if best:
         lines.append("🏆 Топ-5 связок по прибыли:")
         for i, (name, st) in enumerate(best, 1):
-            lines.append(
-                f"№{i}: {name} — {st['count']} сделок / {st['avg']:+.1f}% / winrate {st['wr']:.0f}%"
+            lines.extend(
+                [
+                    f"{i}. 📍 {name}",
+                    f"   📊 {st['count']} | 📈 {st['avg']:+.1f}% | WR: {st['wr']:.0f}%",
+                    "",
+                ]
             )
     else:
-        lines.append("Нет прибыльных связок.")
+        lines.append("Нет прибыльных связок.\n")
+
     worst = [item for item in combo_stats.items() if item[1]["avg"] < 0]
     worst = sorted(worst, key=lambda kv: kv[1]["avg"])[:5]
     if worst:
-        lines.append("\n💀 Худшие связки:")
+        lines.append("💀 Худшие связки:")
         for i, (name, st) in enumerate(worst, 1):
-            lines.append(
-                f"№{i}: {name} — {st['count']} сделок / {st['avg']:+.1f}% / winrate {st['wr']:.0f}%"
+            lines.extend(
+                [
+                    f"{i}. 📍 {name}",
+                    f"   📊 {st['count']} | 📉 {st['avg']:+.1f}% | WR: {st['wr']:.0f}%",
+                    "",
+                ]
             )
     else:
-        lines.append("\nНет убыточных связок.")
-    return "\n".join(lines)
+        lines.append("Нет убыточных связок.")
+    return "\n".join(lines).rstrip()
 
 
 def build_setup_analysis(uid: int) -> str:
@@ -4598,13 +4608,17 @@ def build_setup_analysis(uid: int) -> str:
         rows = cur.fetchall()
     if not rows:
         return "Нет завершённых сделок с сигналами."
+
     stats: dict[str, dict[str, float]] = {}
     pair_stats = defaultdict(lambda: {"wins": 0, "losses": 0})
     for sig_str, pct in rows:
         sigs = [s for s in sig_str.split(";") if s]
         win = pct > 0
         for s in sigs:
-            st = stats.setdefault(s, {"count": 0, "wins": 0, "losses": 0, "profit_sum": 0.0, "loss_sum": 0.0})
+            st = stats.setdefault(
+                s,
+                {"count": 0, "wins": 0, "losses": 0, "profit_sum": 0.0, "loss_sum": 0.0},
+            )
             st["count"] += 1
             if win:
                 st["wins"] += 1
@@ -4619,43 +4633,66 @@ def build_setup_analysis(uid: int) -> str:
                     pair_stats[key]["wins"] += 1
                 else:
                     pair_stats[key]["losses"] += 1
-    lines = ["📊 Аналитика по сетапам:", ""]
+
+    lines = ["📊 Аналитика по сетапам", ""]
     for name, st in sorted(stats.items(), key=lambda kv: kv[1]["count"], reverse=True):
         avg_profit = st["profit_sum"] / st["wins"] if st["wins"] else 0
         avg_loss = st["loss_sum"] / st["losses"] if st["losses"] else 0
         winrate = st["wins"] / st["count"] * 100 if st["count"] else 0
-        lines.append(
-            f"• {name} — {st['count']} раз, побед {st['wins']}, убытков {st['losses']}, "
-            f"ср.прибыль {avg_profit:+.1f}%, ср.убыток {avg_loss:+.1f}%, WR {winrate:.1f}%"
+        lines.extend(
+            [
+                f"📍 {name}",
+                f"   ⭐️ {st['count']} | 📈 {st['wins']} | 📉 {st['losses']} | WR: {winrate:.1f}%",
+                f"   🎯 {avg_profit:+.1f}% | 📉 {avg_loss:+.1f}%",
+                "",
+            ]
         )
-    top_wr = sorted(stats.items(), key=lambda kv: kv[1]["wins"] / kv[1]["count"] if kv[1]["count"] else 0, reverse=True)[:5]
+
+    top_wr = sorted(
+        stats.items(),
+        key=lambda kv: kv[1]["wins"] / kv[1]["count"] if kv[1]["count"] else 0,
+        reverse=True,
+    )[:5]
     if top_wr:
-        lines.append("\nТОП-5 по винрейту:")
-        for name, st in top_wr:
+        lines.append("🏆 ТОП-5 по винрейту:")
+        for i, (name, st) in enumerate(top_wr, 1):
             wr = st["wins"] / st["count"] * 100 if st["count"] else 0
-            lines.append(f"{name} — {wr:.1f}% ({st['count']})")
+            lines.append(f"{i}. 📍 {name} — WR: {wr:.1f}% ({st['count']})")
+        lines.append("")
+
     top_profit = [item for item in stats.items() if item[1]["wins"]]
-    top_profit = sorted(top_profit, key=lambda kv: kv[1]["profit_sum"] / kv[1]["wins"], reverse=True)[:5]
+    top_profit = sorted(
+        top_profit,
+        key=lambda kv: kv[1]["profit_sum"] / kv[1]["wins"],
+        reverse=True,
+    )[:5]
     if top_profit:
-        lines.append("\nТОП-5 по среднему профиту:")
-        for name, st in top_profit:
-            lines.append(f"{name} — {st['profit_sum'] / st['wins']:.1f}%")
+        lines.append("📈 ТОП-5 по среднему профиту:")
+        for i, (name, st) in enumerate(top_profit, 1):
+            lines.append(f"{i}. 📍 {name} — {st['profit_sum'] / st['wins']:.1f}%")
+        lines.append("")
+
     top_losses = sorted(stats.items(), key=lambda kv: kv[1]["losses"], reverse=True)[:5]
     if top_losses:
-        lines.append("\nТОП-5 по частоте в убыточных:")
-        for name, st in top_losses:
-            lines.append(f"{name} — {st['losses']}")
+        lines.append("📉 ТОП-5 по частоте в убыточных:")
+        for i, (name, st) in enumerate(top_losses, 1):
+            lines.append(f"{i}. 📍 {name} — {st['losses']}")
+        lines.append("")
+
     profit_pairs = sorted(pair_stats.items(), key=lambda kv: kv[1]["wins"], reverse=True)[:5]
     if profit_pairs:
-        lines.append("\nСвязки в профитных:")
-        for pair, st in profit_pairs:
-            lines.append(f"{pair} — {st['wins']}")
+        lines.append("🤝 Связки в профитных сделках:")
+        for i, (pair, st) in enumerate(profit_pairs, 1):
+            lines.append(f"{i}. 📍 {pair} — {st['wins']}")
+        lines.append("")
+
     loss_pairs = sorted(pair_stats.items(), key=lambda kv: kv[1]["losses"], reverse=True)[:5]
     if loss_pairs:
-        lines.append("\nСвязки в убытках:")
-        for pair, st in loss_pairs:
-            lines.append(f"{pair} — {st['losses']}")
-    return "\n".join(lines)
+        lines.append("💔 Связки в убыточных:")
+        for i, (pair, st) in enumerate(loss_pairs, 1):
+            lines.append(f"{i}. 📍 {pair} — {st['losses']}")
+
+    return "\n".join(lines).rstrip()
 
 
 def build_top_trades(uid: int) -> str:
