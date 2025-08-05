@@ -509,7 +509,6 @@ class PriceAlertState(StatesGroup):
     enter_symbol = State()
     waiting_price = State()
     choose_mode = State()
-    choose_direction = State()
     choose_sensitivity = State()
     enter_custom = State()
 
@@ -579,10 +578,6 @@ def display_notify_mode(mode: str | None, pct: float | None) -> list[str]:
     return lines
 
 
-def display_direction(direction: str) -> str:
-    return {"up": "Вверх", "down": "Вниз", "both": "Оба"}.get(direction, "-")
-
-
 def display_pa_mode(mode: str, pct: float | None) -> str:
     if mode == "touch":
         return "При точном достижении"
@@ -598,7 +593,7 @@ async def save_price_alert(msg: types.Message, state: FSMContext) -> None:
     aid = data.get("pa_edit_id")
     price = data["pa_price"]
     mode = data["pa_mode"]
-    direction = data["pa_direction"]
+    direction = data.get("pa_direction", "both")
     near_pct = data.get("pa_near_pct")
     uid = msg.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
@@ -1691,37 +1686,27 @@ async def process_notifications(uid: int) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         pa_rows = conn.execute(
             """
-            SELECT pa.id, t.symbol, t.trade_type, pa.price, pa.direction, pa.mode, pa.near_pct
+            SELECT pa.id, t.symbol, t.trade_type, pa.price, pa.mode, pa.near_pct
             FROM price_alerts pa
             JOIN trades t ON pa.trade_id=t.id
             WHERE t.user_id=? AND t.exit_price IS NULL AND pa.triggered=0 AND COALESCE(t.is_deleted,0)=0
             """,
             (uid,),
         ).fetchall()
-    for aid, sym, t_type, target, direction, mode, npct in pa_rows:
+    for aid, sym, t_type, target, mode, npct in pa_rows:
         price = await fetch_price(sym)
         if price is None:
             continue
         triggered = False
-        touched = False
-        if direction in ("up", "both") and price >= target:
-            touched = True
+        pct = abs(price - target) / target * 100
+        touched = pct <= 0.02
+        if touched and mode in ("touch", "both"):
             triggered = True
-        if direction in ("down", "both") and price <= target:
-            touched = True
+        elif mode in ("near", "both") and pct <= (npct or 0.3):
             triggered = True
-        if not triggered or mode in ("near", "both"):
-            pct = npct or 0.3
-            if direction == "up" and price >= target * (1 - pct / 100):
-                triggered = True
-            elif direction == "down" and price <= target * (1 + pct / 100):
-                triggered = True
-            elif direction == "both" and abs(price - target) / target * 100 <= pct:
-                triggered = True
         if triggered:
             text = f"🔔 {sym} достиг {target}" if touched else f"🔔 {sym} приблизился к {target}"
             text += f"\nТип: {display_pa_mode(mode, npct)}"
-            text += f"\nНаправление: {display_direction(direction)}"
             try:
                 await bot.send_message(uid, text)
             except Exception:
@@ -1732,33 +1717,23 @@ async def process_notifications(uid: int) -> None:
 
     with sqlite3.connect(DB_PATH) as conn:
         man_rows = conn.execute(
-            "SELECT id, symbol, price, direction, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1 AND triggered=0",
+            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1 AND triggered=0",
             (uid,),
         ).fetchall()
-    for aid, sym, target, direction, mode, npct in man_rows:
+    for aid, sym, target, mode, npct in man_rows:
         price = await fetch_price(sym)
         if price is None:
             continue
+        pct = abs(price - target) / target * 100
+        touched = pct <= 0.02
         triggered = False
-        touched = False
-        if direction in ("up", "both") and price >= target:
-            touched = True
+        if touched and mode in ("touch", "both"):
             triggered = True
-        if direction in ("down", "both") and price <= target:
-            touched = True
+        elif mode in ("near", "both") and pct <= (npct or 0.3):
             triggered = True
-        if not triggered or mode in ("near", "both"):
-            pct = npct or 0.3
-            if direction == "up" and price >= target * (1 - pct / 100):
-                triggered = True
-            elif direction == "down" and price <= target * (1 + pct / 100):
-                triggered = True
-            elif direction == "both" and abs(price - target) / target * 100 <= pct:
-                triggered = True
         if triggered:
             text = f"🔔 {sym} достиг {target}" if touched else f"🔔 {sym} приблизился к {target}"
             text += f"\nТип: {display_pa_mode(mode, npct)}"
-            text += f"\nНаправление: {display_direction(direction)}"
             try:
                 await bot.send_message(uid, text)
             except Exception:
@@ -1856,15 +1831,14 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
 async def show_manual_alerts(uid: int, message: types.Message) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT id, symbol, price, direction, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1 AND triggered=0",
+            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1 AND triggered=0",
             (uid,),
         ).fetchall()
     lines = ["🔔 Вне-сделочные уведомления:"]
     buttons: list[list[InlineKeyboardButton]] = []
-    for i, (aid, sym, price, direction, mode, npct) in enumerate(rows, 1):
-        dir_txt = display_direction(direction)
+    for i, (aid, sym, price, mode, npct) in enumerate(rows, 1):
         mode_txt = display_pa_mode(mode, npct)
-        lines.append(f"{i}. {sym} {price} — {dir_txt}, {mode_txt}")
+        lines.append(f"{i}. {sym} {price} — {mode_txt}")
         buttons.append([
             InlineKeyboardButton(text=f"✏ {price}", callback_data=f"pa_edit_{aid}"),
             InlineKeyboardButton(text="🗑", callback_data=f"pa_del_{aid}"),
@@ -4139,7 +4113,7 @@ async def send_notif_config(message: types.Message, uid: int, tid: int) -> None:
             (tid, uid),
         ).fetchone()
         alerts = conn.execute(
-            "SELECT id, price, direction, mode, near_pct FROM price_alerts WHERE trade_id=?",
+            "SELECT id, price, mode, near_pct FROM price_alerts WHERE trade_id=?",
             (tid,),
         ).fetchall()
     if not row:
@@ -4154,10 +4128,9 @@ async def send_notif_config(message: types.Message, uid: int, tid: int) -> None:
         lines.append("Стоп/цель: выключены")
     if alerts:
         lines.append("Ценовые уведомления:")
-        for i, (_, price, direction, mode, apct) in enumerate(alerts, 1):
-            dir_txt = {"up": "Вверх", "down": "Вниз", "both": "Оба"}.get(direction, "-")
+        for i, (_, price, mode, apct) in enumerate(alerts, 1):
             mode_txt = display_pa_mode(mode, apct)
-            lines.append(f"{i}. {price} — {dir_txt}, {mode_txt}")
+            lines.append(f"{i}. {price} — {mode_txt}")
     else:
         lines.append("Ценовых уведомлений нет")
     buttons: list[list[InlineKeyboardButton]] = []
@@ -4165,7 +4138,7 @@ async def send_notif_config(message: types.Message, uid: int, tid: int) -> None:
         buttons.append([InlineKeyboardButton(text="🔕 Отключить стоп/цель", callback_data=f"notif_disable_{tid}")])
     else:
         buttons.append([InlineKeyboardButton(text="🔔 Включить стоп/цель", callback_data=f"notif_enable_{tid}")])
-    for aid, price, _, _, _ in alerts:
+    for aid, price, _, _ in alerts:
         buttons.append([
             InlineKeyboardButton(text=f"✏ {price}", callback_data=f"pa_edit_{aid}"),
             InlineKeyboardButton(text="🗑", callback_data=f"pa_del_{aid}"),
@@ -4335,24 +4308,7 @@ async def pa_mode_cb(cb: types.CallbackQuery, state: FSMContext):
     else:
         mode = "both"
     await state.update_data(pa_mode=mode)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="Цена выше или равна", callback_data="pa_dir_up")],
-            [InlineKeyboardButton(text="Цена ниже или равна", callback_data="pa_dir_down")],
-            [InlineKeyboardButton(text="Оба варианта", callback_data="pa_dir_both")],
-        ]
-    )
-    await cb.message.answer("Укажи направление:", reply_markup=with_back(kb))
-    await state.set_state(PriceAlertState.choose_direction)
-
-
-@dp.callback_query(PriceAlertState.choose_direction)
-async def pa_dir_cb(cb: types.CallbackQuery, state: FSMContext):
-    await cb.answer()
-    direction = cb.data.split("_")[2]
-    await state.update_data(pa_direction=direction)
-    data = await state.get_data()
-    if data["pa_mode"] in ("near", "both"):
+    if mode in ("near", "both"):
         kb = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text="±0.1%", callback_data="pa_near_0.1")],
