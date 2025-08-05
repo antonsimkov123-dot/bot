@@ -94,7 +94,9 @@ def init_db() -> None:
             notifications_enabled INTEGER DEFAULT 0,
             notify_type TEXT,
             notify_mode TEXT,
-            notify_near_pct REAL DEFAULT 0.3
+            notify_near_pct REAL DEFAULT 0.3,
+            notify_stop_sent INTEGER DEFAULT 0,
+            notify_target_sent INTEGER DEFAULT 0
         )
         """
     )
@@ -223,6 +225,12 @@ def add_missing_columns() -> None:
             conn.commit()
         if "notify_near_pct" not in columns:
             cur.execute("ALTER TABLE trades ADD COLUMN notify_near_pct REAL DEFAULT 0.3")
+            conn.commit()
+        if "notify_stop_sent" not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN notify_stop_sent INTEGER DEFAULT 0")
+            conn.commit()
+        if "notify_target_sent" not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN notify_target_sent INTEGER DEFAULT 0")
             conn.commit()
 
         cur.execute("PRAGMA table_info(user_settings)")
@@ -1614,37 +1622,71 @@ async def process_notifications(uid: int) -> None:
     now = datetime.now()
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT trade_type, symbol, entry_price, stop_loss, targets, entry_date, notify_type, notify_mode, notify_near_pct FROM trades WHERE user_id=? AND exit_price IS NULL AND notifications_enabled=1 AND COALESCE(is_deleted,0)=0",
+            "SELECT id, trade_type, symbol, entry_price, stop_loss, targets, entry_date, notify_type, notify_mode, notify_near_pct, notify_stop_sent, notify_target_sent FROM trades WHERE user_id=? AND exit_price IS NULL AND notifications_enabled=1 AND COALESCE(is_deleted,0)=0",
             (uid,),
         ).fetchall()
-    for t_type, sym, entry, sl, tgt_str, entry_date, ntype, nmode, npct in rows:
+    for tid, t_type, sym, entry, sl, tgt_str, entry_date, ntype, nmode, npct, stop_sent, target_sent in rows:
         price = await fetch_price(sym)
         if price is None:
             continue
-        alerts = []
         long_like = t_type.lower() in {"long", "spot"}
-        if ntype in ("stop", "both") and sl is not None:
+        updated = False
+        if ntype in ("stop", "both") and sl is not None and not stop_sent:
+            pct = npct or 0.3
             if nmode in ("touch", "both") and ((long_like and price <= sl) or (not long_like and price >= sl)):
-                alerts.append("🔴 Стоп достигнут")
-            if nmode in ("near", "both") and abs(price - sl) / sl * 100 <= (npct or 0.3):
-                alerts.append("⚠️ Цена близко к стопу")
-        if ntype in ("target", "both"):
+                try:
+                    await bot.send_message(uid, f"{sym} {t_type}: 🔴 Стоп достигнут")
+                except Exception:
+                    pass
+                stop_sent = 1
+                updated = True
+            elif nmode in ("near", "both") and abs(price - sl) / sl * 100 <= pct:
+                try:
+                    await bot.send_message(uid, f"{sym} {t_type}: ⚠️ Цена близко к стопу")
+                except Exception:
+                    pass
+                stop_sent = 1
+                updated = True
+        if ntype in ("target", "both") and not target_sent:
             targets = [float(t) for t in (tgt_str or "").split(",") if t]
+            pct = npct or 0.3
             for t in targets:
                 if nmode in ("touch", "both") and ((long_like and price >= t) or (not long_like and price <= t)):
-                    alerts.append("🎯 Цель достигнута")
+                    try:
+                        await bot.send_message(uid, f"{sym} {t_type}: 🎯 Цель достигнута")
+                    except Exception:
+                        pass
+                    target_sent = 1
+                    updated = True
                     break
-                if nmode in ("near", "both") and abs(price - t) / t * 100 <= (npct or 0.3):
-                    alerts.append("⚠️ Цена близко к цели")
+                elif nmode in ("near", "both") and abs(price - t) / t * 100 <= pct:
+                    try:
+                        await bot.send_message(uid, f"{sym} {t_type}: ⚠️ Цена близко к цели")
+                    except Exception:
+                        pass
+                    target_sent = 1
+                    updated = True
                     break
         entry_dt = datetime.fromisoformat(entry_date)
         if now - entry_dt >= timedelta(hours=48) and abs(price - entry) / entry * 100 < 1:
-            alerts.append("💤 Сделка в стагнации — подумай о действиях")
-        for msg in alerts:
             try:
-                await bot.send_message(uid, f"{sym} {t_type}: {msg}")
+                await bot.send_message(uid, f"{sym} {t_type}: 💤 Сделка в стагнации — подумай о действиях")
             except Exception:
                 pass
+        if updated:
+            disable = 0
+            if ntype == "stop" and stop_sent:
+                disable = 1
+            elif ntype == "target" and target_sent:
+                disable = 1
+            elif ntype == "both" and stop_sent and target_sent:
+                disable = 1
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "UPDATE trades SET notify_stop_sent=?, notify_target_sent=?, notifications_enabled=? WHERE id=?",
+                    (stop_sent, target_sent, 0 if disable else 1, tid),
+                )
+                conn.commit()
 
     with sqlite3.connect(DB_PATH) as conn:
         pa_rows = conn.execute(
@@ -3248,7 +3290,7 @@ async def ask_notifications(uid: int, trade_id: int, state: FSMContext) -> None:
     if is_automation_enabled(uid):
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
-                "UPDATE trades SET notifications_enabled=1, notify_type='both', notify_mode='near', notify_near_pct=0.3 WHERE id=?",
+                "UPDATE trades SET notifications_enabled=1, notify_type='both', notify_mode='near', notify_near_pct=0.3, notify_stop_sent=0, notify_target_sent=0 WHERE id=?",
                 (trade_id,),
             )
             conn.commit()
@@ -3462,7 +3504,7 @@ async def notif_enable(cb: types.CallbackQuery, state: FSMContext):
     near = data.get("near_pct", 0.3)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "UPDATE trades SET notifications_enabled=1, notify_type=?, notify_mode=?, notify_near_pct=? WHERE id=?",
+            "UPDATE trades SET notifications_enabled=1, notify_type=?, notify_mode=?, notify_near_pct=?, notify_stop_sent=0, notify_target_sent=0 WHERE id=?",
             (ntype, nmode, near, tid),
         )
         conn.commit()
@@ -4152,7 +4194,7 @@ async def notif_disable_all(cb: types.CallbackQuery):
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "UPDATE trades SET notifications_enabled=0, notify_type=NULL, notify_mode=NULL, notify_near_pct=NULL WHERE user_id=?",
+            "UPDATE trades SET notifications_enabled=0, notify_type=NULL, notify_mode=NULL, notify_near_pct=NULL, notify_stop_sent=0, notify_target_sent=0 WHERE user_id=?",
             (uid,),
         )
         conn.commit()
@@ -4169,7 +4211,7 @@ async def notif_disable(cb: types.CallbackQuery):
     tid = int(cb.data.split("_")[2])
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "UPDATE trades SET notifications_enabled=0, notify_type=NULL, notify_mode=NULL, notify_near_pct=NULL WHERE id=? AND user_id=?",
+            "UPDATE trades SET notifications_enabled=0, notify_type=NULL, notify_mode=NULL, notify_near_pct=NULL, notify_stop_sent=0, notify_target_sent=0 WHERE id=? AND user_id=?",
             (tid, uid),
         )
         conn.commit()
