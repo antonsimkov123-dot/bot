@@ -2234,7 +2234,7 @@ def leverage_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="1x", callback_data="lev_1"), InlineKeyboardButton(text="2x", callback_data="lev_2")],
         [InlineKeyboardButton(text="3x", callback_data="lev_3"), InlineKeyboardButton(text="5x", callback_data="lev_5")],
         [InlineKeyboardButton(text="10x", callback_data="lev_10"), InlineKeyboardButton(text="20x", callback_data="lev_20")],
-        [InlineKeyboardButton(text="50x", callback_data="lev_50"), InlineKeyboardButton(text="Ввести", callback_data="lev_manual")],
+        [InlineKeyboardButton(text="50x", callback_data="lev_50"), InlineKeyboardButton(text="Ввести вручную", callback_data="lev_manual")],
     ]
     return with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
 
@@ -3052,7 +3052,7 @@ async def edit_choose_leverage(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     val = cb.data.split("_")[1]
     if val == "manual":
-        await cb.message.answer("Введи плечо числом:")
+        await cb.message.answer("Введи плечо вручную (например, 7.5):")
         await state.set_state(EditState.entering_leverage_manual)
         return
     lev = float(val)
@@ -3259,7 +3259,7 @@ async def choose_leverage(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     val = cb.data.split("_")[1]
     if val == "manual":
-        await cb.message.answer("Введи плечо числом, например 7.5:")
+        await cb.message.answer("Введи плечо вручную (например, 7.5):")
         await state.set_state(TradeState.entering_leverage_manual)
         return
     lev = float(val)
