@@ -433,6 +433,8 @@ class TradeState(StatesGroup):
     choosing_date = State()
     entering_date_manual = State()
     entering_comment = State()
+    entering_leverage = State()
+    entering_leverage_manual = State()
     choosing_signals = State()
     confirming = State()
     
@@ -2227,6 +2229,16 @@ def signals_keyboard() -> InlineKeyboardMarkup:
     return with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
 
 
+def leverage_keyboard() -> InlineKeyboardMarkup:
+    buttons = [
+        [InlineKeyboardButton(text="1x", callback_data="lev_1"), InlineKeyboardButton(text="2x", callback_data="lev_2")],
+        [InlineKeyboardButton(text="3x", callback_data="lev_3"), InlineKeyboardButton(text="5x", callback_data="lev_5")],
+        [InlineKeyboardButton(text="10x", callback_data="lev_10"), InlineKeyboardButton(text="20x", callback_data="lev_20")],
+        [InlineKeyboardButton(text="50x", callback_data="lev_50"), InlineKeyboardButton(text="Ввести", callback_data="lev_manual")],
+    ]
+    return with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
 def mistake_keyboard() -> InlineKeyboardMarkup:
     buttons = [
         [InlineKeyboardButton(text=disp, callback_data=f"mist_{i}")]
@@ -2888,12 +2900,14 @@ class EditState(StatesGroup):
     choosing_field: State = State()
     entering_value: State = State()
     choosing_signals: State = State()
+    choosing_leverage: State = State()
+    entering_leverage_manual: State = State()
 
 async def open_edit_trade(cb: types.CallbackQuery, tid: int, state: FSMContext):
     await state.update_data(tid=tid)
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT trade_type, symbol, entry_price, stop_loss, targets, percent, risk_percent, entry_date, comment, signals "
+            "SELECT trade_type, symbol, entry_price, stop_loss, targets, percent, risk_percent, entry_date, comment, signals, leverage "
             "FROM trades WHERE id=?",
             (tid,),
         ).fetchone()
@@ -2909,6 +2923,7 @@ async def open_edit_trade(cb: types.CallbackQuery, tid: int, state: FSMContext):
             "entry_date": row[7],
             "comment": row[8],
             "signals": row[9],
+            "leverage": row[10],
         }
         text = "<b>Сводка сделки</b>\n\n" + format_trade(data)
         kb_sum = with_back(
@@ -2916,17 +2931,43 @@ async def open_edit_trade(cb: types.CallbackQuery, tid: int, state: FSMContext):
         )
         await cb.message.answer(text, reply_markup=kb_sum)
 
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="📡 Сигналы", callback_data="field_signals")],
-            [InlineKeyboardButton(text="🎯 Цели",   callback_data="field_targets")],
-            [InlineKeyboardButton(text="🛑 Стоп",   callback_data="field_sl")],
-            [InlineKeyboardButton(text="💼 %",      callback_data="field_pct")],
-            [InlineKeyboardButton(text="📆 Дата",   callback_data="field_date")],
-            [InlineKeyboardButton(text="💬 Коммент",callback_data="field_comment")],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="active")],
+    # warn about missing fields
+    miss = []
+    if not row[3]:
+        miss.append(("стоп", "field_sl"))
+    if not row[4]:
+        miss.append(("цели", "field_targets"))
+    sigs = [s for s in (row[9] or "").split(";") if s]
+    if not sigs:
+        miss.append(("сигналы", "field_signals"))
+    if (row[10] or 1) <= 1:
+        miss.append(("плечо", "field_leverage"))
+    if miss:
+        miss_text = "⚠️ У вас не указано: " + ", ".join(m for m, _ in miss) + ". Добавить их?"
+        miss_buttons = [
+            InlineKeyboardButton(text=f"Добавить {label}", callback_data=cb_data)
+            for label, cb_data in miss
         ]
-    )
+        rows = [miss_buttons[i:i+2] for i in range(0, len(miss_buttons), 2)]
+        kb_miss = InlineKeyboardMarkup(inline_keyboard=rows)
+        kb_miss = with_back(kb_miss)
+        await cb.message.answer(miss_text, reply_markup=kb_miss)
+
+    buttons = [
+        ("📡 Сигналы", "field_signals"),
+        ("🎯 Цели", "field_targets"),
+        ("🛑 Стоп", "field_sl"),
+        ("💼 %", "field_pct"),
+        ("⚖️ Плечо", "field_leverage"),
+        ("📆 Дата", "field_date"),
+        ("💬 Коммент", "field_comment"),
+    ]
+    rows = [
+        [InlineKeyboardButton(text=t, callback_data=d) for t, d in buttons[i:i+2]]
+        for i in range(0, len(buttons), 2)
+    ]
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="active")])
+    kb = InlineKeyboardMarkup(inline_keyboard=rows)
     kb = with_back(kb)
     await cb.message.answer("Что изменить?", reply_markup=kb)
     await state.set_state(EditState.choosing_field)
@@ -2940,9 +2981,12 @@ async def edit_choose_field(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(lambda c: c.data.startswith("field_"))
 async def edit_enter_value(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    field = cb.data.split("_")[1]   # targets / sl / pct / date / comment / signals
+    field = cb.data.split("_")[1]
     if field == "signals":
         await start_edit_signals(cb, state)
+        return
+    if field == "leverage":
+        await start_edit_leverage(cb, state)
         return
     await state.update_data(field=field)
     prompt = {
@@ -2996,6 +3040,59 @@ async def start_edit_signals(cb: types.CallbackQuery, state: FSMContext):
     await state.update_data(signals_total=total)
     await cb.message.answer(SIGNALS_TEXT, reply_markup=signals_keyboard())
     await state.set_state(EditState.choosing_signals)
+
+
+async def start_edit_leverage(cb: types.CallbackQuery, state: FSMContext):
+    await cb.message.answer("⚖️ Выбери новое плечо:", reply_markup=leverage_keyboard())
+    await state.set_state(EditState.choosing_leverage)
+
+
+@dp.callback_query(EditState.choosing_leverage, lambda c: c.data.startswith("lev_"))
+async def edit_choose_leverage(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    val = cb.data.split("_")[1]
+    if val == "manual":
+        await cb.message.answer("Введи плечо числом:")
+        await state.set_state(EditState.entering_leverage_manual)
+        return
+    lev = float(val)
+    data = await state.get_data()
+    tid = data.get("tid")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE trades SET leverage=? WHERE id=?", (lev, tid))
+        entry_price, stop_loss, percent, t_type = conn.execute(
+            "SELECT entry_price, stop_loss, percent, trade_type FROM trades WHERE id=?",
+            (tid,),
+        ).fetchone()
+        risk = calc_risk(entry_price, stop_loss, percent, t_type, lev) if stop_loss is not None else None
+        conn.execute("UPDATE trades SET risk_percent=? WHERE id=?", (risk, tid))
+        conn.commit()
+    await cb.message.answer("✅ Обновлено.")
+    await state.clear()
+    await go_home(cb.from_user.id, state)
+
+
+@dp.message(EditState.entering_leverage_manual)
+async def edit_leverage_manual(msg: types.Message, state: FSMContext):
+    try:
+        lev = float(msg.text.replace(",", "."))
+    except ValueError:
+        await msg.answer("Нужно число.")
+        return
+    data = await state.get_data()
+    tid = data.get("tid")
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("UPDATE trades SET leverage=? WHERE id=?", (lev, tid))
+        entry_price, stop_loss, percent, t_type = conn.execute(
+            "SELECT entry_price, stop_loss, percent, trade_type FROM trades WHERE id=?",
+            (tid,),
+        ).fetchone()
+        risk = calc_risk(entry_price, stop_loss, percent, t_type, lev) if stop_loss is not None else None
+        conn.execute("UPDATE trades SET risk_percent=? WHERE id=?", (risk, tid))
+        conn.commit()
+    await msg.answer("✅ Обновлено.")
+    await state.clear()
+    await go_home(msg.from_user.id, state)
 
 
 @dp.callback_query(EditState.choosing_signals, lambda c: c.data.startswith("sig_"))
@@ -3152,7 +3249,38 @@ async def add_trade_comment(msg: types.Message, state: FSMContext):
     comment = msg.text.strip()
     if comment == "-" or comment == "":
         comment = None
-    await state.update_data(comment=comment, signals=[])
+    await state.update_data(comment=comment)
+    await msg.answer("⚖️ Выбери плечо:", reply_markup=leverage_keyboard())
+    await state.set_state(TradeState.entering_leverage)
+
+
+@dp.callback_query(TradeState.entering_leverage, lambda c: c.data.startswith("lev_"))
+async def choose_leverage(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    val = cb.data.split("_")[1]
+    if val == "manual":
+        await cb.message.answer("Введи плечо числом, например 7.5:")
+        await state.set_state(TradeState.entering_leverage_manual)
+        return
+    lev = float(val)
+    data = await state.get_data()
+    entry, stop, pct, t_type = data["entry_price"], data.get("stop_loss"), data.get("percent"), data["trade_type"]
+    risk = calc_risk(entry, stop, pct, t_type, lev) if stop is not None else None
+    await state.update_data(leverage=lev, risk=risk, signals=[])
+    await start_signals_choice(cb.from_user.id, state, reset=True)
+
+
+@dp.message(TradeState.entering_leverage_manual)
+async def enter_leverage_manual(msg: types.Message, state: FSMContext):
+    try:
+        lev = float(msg.text.replace(",", "."))
+    except ValueError:
+        await msg.answer("Нужно число.")
+        return
+    data = await state.get_data()
+    entry, stop, pct, t_type = data["entry_price"], data.get("stop_loss"), data.get("percent"), data["trade_type"]
+    risk = calc_risk(entry, stop, pct, t_type, lev) if stop is not None else None
+    await state.update_data(leverage=lev, risk=risk, signals=[])
     await start_signals_choice(msg.from_user.id, state, reset=True)
 
 
@@ -3243,7 +3371,7 @@ async def save_trade(cb: types.CallbackQuery, state: FSMContext) -> int:
                 data['symbol'],
                 data['entry_price'],
                 None,
-                None,
+                data.get('leverage', 1),
                 data['stop_loss'],
                 data['targets'],
                 data['percent'],
