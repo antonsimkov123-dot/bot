@@ -27,6 +27,38 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
+plt.rcParams.update({
+    "font.family": "sans-serif",
+    "text.color": "white",
+    "axes.labelcolor": "white",
+    "axes.edgecolor": "white",
+})
+
+
+def make_fig() -> tuple[plt.Figure, plt.Axes]:
+    fig, ax = plt.subplots(figsize=(8, 6), facecolor="#1e1e1e")
+    ax.set_facecolor("#1e1e1e")
+    ax.grid(color="gray", linestyle="--", alpha=0.5)
+    ax.tick_params(colors="white")
+    for spine in ax.spines.values():
+        spine.set_color("white")
+    return fig, ax
+
+
+def add_labels(ax: plt.Axes, fmt: str = "{:.1f}") -> None:
+    for rect in ax.patches:
+        val = rect.get_height()
+        ax.text(
+            rect.get_x() + rect.get_width() / 2,
+            val,
+            fmt.format(val),
+            ha="center",
+            va="bottom" if val >= 0 else "top",
+            color="white",
+            fontsize=9,
+            fontweight="bold",
+        )
+
 # ---------- CONFIG ----------
 BOT_TOKEN = "8205192350:AAHUEmqDQK37-5D7dpcTUeMdpA6WpDACMkc"  # поменяй после теста!
 DB_PATH = "trades.db"
@@ -4991,45 +5023,41 @@ async def charts(cb: types.CallbackQuery):
 
     # PNL by week
     weekly = df.groupby("week")["pnl"].sum()
-    fig1, ax1 = plt.subplots()
-    weekly.plot(kind="bar", ax=ax1)
-    ax1.set_title("📊 PNL по неделям")
-    fig1.tight_layout()
+    fig1, ax1 = make_fig()
+    colors = ["green" if v >= 0 else "red" for v in weekly.values]
+    bars = ax1.bar(weekly.index.astype(str), weekly.values, color=colors)
+    ax1.set_title("📊 PNL по неделям", fontweight="bold")
+    ax1.set_xlabel("Неделя")
+    ax1.set_ylabel("%")
+    add_labels(ax1, fmt="{:+.1f}%")
     p1 = "pnl_week.png"
-    fig1.savefig(p1)
+    fig1.savefig(p1, bbox_inches="tight", dpi=150, facecolor=fig1.get_facecolor())
     plt.close(fig1)
 
     # Stop freq
-    # === График 2: Частота стопов ===
     df["is_loss"] = df["pnl"] < 0
-
-    # value_counts(sort=False) — если есть только True или только False,
-    # всё равно вернётся один столбец, и порядок индекса сохранится
     stop_freq = df["is_loss"].value_counts(sort=False)
-
-    fig2, ax2 = plt.subplots()
-    stop_freq.plot(kind="bar", ax=ax2)
-    ax2.set_title("⚠️ Частота стопов")
-
-    # подписи равны количеству столбцов
+    fig2, ax2 = make_fig()
     labels = ["Прибыль" if idx is False else "Убыток" for idx in stop_freq.index]
-    ax2.set_xticklabels(labels, rotation=0)
-
-    fig2.tight_layout()
+    colors = ["green" if idx is False else "red" for idx in stop_freq.index]
+    ax2.bar(labels, stop_freq.values, color=colors)
+    ax2.set_title("⚠️ Частота стопов", fontweight="bold")
+    add_labels(ax2, fmt="{:.0f}")
     p2 = "stop_freq.png"
-    fig2.savefig(p2)
+    fig2.savefig(p2, bbox_inches="tight", dpi=150, facecolor=fig2.get_facecolor())
     plt.close(fig2)
 
     # Winrate by type
-    winrate = (df[df["pnl"] > 0].groupby("trade_type").size()
-               / df.groupby("trade_type").size() * 100).fillna(0)
-    fig3, ax3 = plt.subplots()
-    winrate.plot(kind="bar", ax=ax3)
-    ax3.set_title("🏆 Винрейт по типу")
+    winrate = (df[df["pnl"] > 0].groupby("trade_type").size() / df.groupby("trade_type").size() * 100).fillna(0)
+    fig3, ax3 = make_fig()
+    labels = [lab.upper() for lab in winrate.index]
+    colors = ["green" if lab.lower() == "long" else "red" for lab in winrate.index]
+    ax3.bar(labels, winrate.values, color=colors)
+    ax3.set_title("🏆 Винрейт по типу", fontweight="bold")
     ax3.set_ylabel("%")
-    fig3.tight_layout()
+    add_labels(ax3, fmt="{:.0f}%")
     p3 = "winrate.png"
-    fig3.savefig(p3)
+    fig3.savefig(p3, bbox_inches="tight", dpi=150, facecolor=fig3.get_facecolor())
     plt.close(fig3)
 
     await bot.send_photo(uid, FSInputFile(p1), caption="📊 PNL по неделям")
