@@ -3651,68 +3651,116 @@ async def _fetch_kline(symbol: str, interval: str, limit: int = 7) -> list:
     return []
 
 
-async def _micro_trend_tf(symbol: str, interval: str) -> tuple[str, int, str]:
+async def _micro_trend_tf(symbol: str, interval: str) -> dict:
     candles = await _fetch_kline(symbol, interval, 60)
     used = min(len(candles), 50)
     if used < 50:
-        return "nodata", used, ""
+        return {"trend": "nodata", "used": used}
+
     closes = [float(c[4]) for c in candles][-used:]
     highs = [float(c[2]) for c in candles][-used:]
     lows = [float(c[3]) for c in candles][-used:]
     vols = [float(c[5]) for c in candles][-used:]
+    price = closes[-1]
 
-    slope = (closes[-1] - closes[0]) / closes[0]
+    slope_pct = (closes[-1] - closes[0]) / closes[0] * 100 if closes[0] else 0
     up_pairs = sum(
         h2 > h1 and l2 > l1 for h1, h2, l1, l2 in zip(highs, highs[1:], lows, lows[1:])
     )
     down_pairs = sum(
         h2 < h1 and l2 < l1 for h1, h2, l1, l2 in zip(highs, highs[1:], lows, lows[1:])
     )
-    range_ratio = (max(highs) - min(lows)) / closes[-1] if closes[-1] else 0
+    range_ratio = (max(highs) - min(lows)) / price if price else 0
 
     recent = sum(vols[-25:]) / 25
     prev = sum(vols[:25]) / 25 if len(vols) >= 50 else recent
-    vol_note = ""
-    vol_trend = True
     if recent > prev * 1.1:
-        vol_note = " — объёмы растут"
+        vol_dir = "up"
     elif recent < prev * 0.9:
-        vol_note = " — объёмы снижаются"
-        vol_trend = False
+        vol_dir = "down"
+    else:
+        vol_dir = "flat"
 
-    if slope > 0.02 and up_pairs > down_pairs and vol_trend:
+    slope_dir = "up" if slope_pct > 1 else "down" if slope_pct < -1 else "flat"
+    struct_dir = "up" if up_pairs >= down_pairs + 5 else "down" if down_pairs >= up_pairs + 5 else "mixed"
+
+    votes_up = (slope_dir == "up") + (struct_dir == "up") + (vol_dir == "up")
+    votes_down = (slope_dir == "down") + (struct_dir == "down") + (vol_dir == "down")
+    if votes_up >= 2 and votes_up > votes_down:
         trend = "up"
-    elif slope < -0.02 and down_pairs > up_pairs and vol_trend:
+    elif votes_down >= 2 and votes_down > votes_up:
         trend = "down"
-    elif abs(slope) < 0.01 and range_ratio < 0.03:
+    elif abs(slope_pct) < 1 and range_ratio < 0.03:
         trend = "flat"
     else:
         trend = "uncertain"
-    return trend, used, vol_note
+
+    return {
+        "trend": trend,
+        "used": used,
+        "price": price,
+        "slope": slope_pct,
+        "up": up_pairs,
+        "down": down_pairs,
+        "vol": vol_dir,
+        "struct": struct_dir,
+    }
 
 
-def _trend_text(label: str, trend: str, used: int, vol_note: str) -> str:
+def _trend_text(label: str, data: dict) -> str:
+    trend = data.get("trend")
+    used = data.get("used", 0)
     if trend == "nodata":
         return f"📊 Тренд по {label}: недостаточно данных ({used} свечей)"
+
+    price = data.get("price", 0)
+    slope = data.get("slope", 0)
+    up = data.get("up", 0)
+    down = data.get("down", 0)
+    vol = data.get("vol", "flat")
+    struct = data.get("struct", "mixed")
+    total_pairs = max(used - 1, 1)
+
+    vol_phrase = {
+        "up": "объёмы растут",
+        "down": "объёмы падают",
+        "flat": "объёмы без изменений",
+    }.get(vol, "объёмы без изменений")
+
+    if struct == "up":
+        struct_phrase = f"{up} из {total_pairs} HH/HL"
+    elif struct == "down":
+        struct_phrase = f"{down} из {total_pairs} LH/LL"
+    else:
+        struct_phrase = f"структура смешанная ({up}/{down})"
+
+    slope_str = f"наклон {slope:+.1f}%"
+    price_str = f"цена {price:.4f}"
+
     if trend == "up":
-        return f"📊 Тренд по {label}: Восходящий (анализ по {used} свечам){vol_note}"
-    if trend == "down":
-        return f"📊 Тренд по {label}: Нисходящий (анализ по {used} свечам){vol_note}"
-    if trend == "flat":
-        return f"📊 Тренд по {label}: Боковик (анализ по {used} свечам)"
-    return f"📊 Тренд по {label}: Неопределённый тренд. Есть сигналы как вверх, так и вниз (анализ по {used} свечам)"
+        label_text = "⬆️ Восходящий"
+    elif trend == "down":
+        label_text = "⬇️ Нисходящий"
+    elif trend == "flat":
+        label_text = "⏸️ Боковик"
+    else:
+        label_text = "❓ Неопределённый"
+
+    return (
+        f"📊 Тренд по {label}: {label_text} "
+        f"({price_str}, {slope_str}, {struct_phrase}, {vol_phrase}; анализ по {used} свечам)"
+    )
 
 
 async def _analyze_micro_trend(symbol: str, ttype: str) -> str:
-    d_trend, d_used, d_vol = await _micro_trend_tf(symbol, "D")
-    h_trend, h_used, h_vol = await _micro_trend_tf(symbol, "240")
-    daily = _trend_text("1D", d_trend, d_used, d_vol)
-    if d_trend == "down" and h_trend == "up":
-        h4 = f"📊 Тренд по 4H: Восходящий откат в нисходящем тренде (анализ по {h_used} свечам){h_vol}"
-    elif d_trend == "up" and h_trend == "down":
-        h4 = f"📊 Тренд по 4H: Нисходящий откат в восходящем тренде (анализ по {h_used} свечам){h_vol}"
-    else:
-        h4 = _trend_text("4H", h_trend, h_used, h_vol)
+    d_data = await _micro_trend_tf(symbol, "D")
+    h_data = await _micro_trend_tf(symbol, "240")
+    daily = _trend_text("1D", d_data)
+    h4 = _trend_text("4H", h_data)
+    if d_data.get("trend") == "down" and h_data.get("trend") == "up":
+        h4 = h4.replace("⬆️ Восходящий", "⬆️ Восходящий откат в нисходящем тренде")
+    elif d_data.get("trend") == "up" and h_data.get("trend") == "down":
+        h4 = h4.replace("⬇️ Нисходящий", "⬇️ Нисходящий откат в восходящем тренде")
     return f"{daily}\n{h4}"
 
 
