@@ -12,8 +12,7 @@ import calendar
 from dotenv import load_dotenv
 from collections import defaultdict
 from itertools import combinations
-load_dotenv()                    # ← Следите, чтобы ВЫШЕ этого не было кода,
-                                 #    использующего os.getenv("BOT_TOKEN")
+load_dotenv()
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile
@@ -372,7 +371,7 @@ def add_missing_columns() -> None:
         )
 
 init_db()
-add_missing_columns()      # ← вызов
+add_missing_columns()
 
 # ---------- BOT ----------
 bot = Bot(BOT_TOKEN, parse_mode="HTML")
