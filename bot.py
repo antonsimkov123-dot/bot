@@ -10,7 +10,7 @@ import aiohttp
 from datetime import datetime, timedelta
 import calendar
 from dotenv import load_dotenv
-from collections import defaultdict
+from collections import defaultdict, Counter
 from itertools import combinations
 load_dotenv()
 from aiogram import Bot, Dispatcher, types, F
@@ -3622,6 +3622,82 @@ def _recommend_setup(strong: int, risk: float) -> str:
     )
 
 
+def _similar_trades_summary(
+    uid: int,
+    symbol: str,
+    ttype: str,
+    lev: float | None,
+    stars: int,
+    cur_signals: list[str],
+    risk: float,
+) -> str:
+    lev_val = lev or 0
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT profit_percent, signals, risk_percent FROM trades "
+            "WHERE user_id=? AND symbol=? AND trade_type=? "
+            "AND ABS(COALESCE(leverage,0)-?)<=2 "
+            "AND ABS(COALESCE(signal_stars,0)-?)<=2 "
+            "AND exit_price IS NOT NULL AND COALESCE(is_deleted,0)=0",
+            (uid, symbol, ttype, lev_val, stars),
+        ).fetchall()
+    if not rows:
+        return "Недостаточно похожих сделок для анализа. Собираем статистику…"
+
+    wins: list[float] = []
+    losses: list[float] = []
+    win_sigs: Counter[str] = Counter()
+    miss_sigs: Counter[str] = Counter()
+    high_risk_losses = 0
+    for pct, sigs, r in rows:
+        sig_list = [s for s in (sigs or "").split(";") if s]
+        if pct and pct > 0:
+            wins.append(pct)
+            for s in sig_list:
+                win_sigs[s] += 1
+        else:
+            losses.append(pct or 0)
+            if r and r > 30:
+                high_risk_losses += 1
+            for s in cur_signals:
+                if s not in sig_list:
+                    miss_sigs[s] += 1
+
+    parts = ["📊 История похожих сделок:"]
+    lev_str = fmt_leverage(lev_val)
+    base = f"{symbol} / {ttype.capitalize()}"
+    if lev_str:
+        base += f" / {lev_str}"
+    base += f" / {stars}⭐"
+    if wins:
+        avg_profit = sum(wins) / len(wins)
+        parts.append(
+            f"✅ {len(wins)} похожие сделки с {base} дали профит в среднем {avg_profit:+.1f}%"
+        )
+        for sig, cnt in win_sigs.most_common(2):
+            parts.append(f"— {cnt} из них были с сигналом {sig}")
+    if losses:
+        parts.append(f"❌ {len(losses)} сделки дали убыток")
+        if high_risk_losses:
+            parts.append(f"— {high_risk_losses} из них были с риском > 30%")
+        if miss_sigs:
+            msig, cnt = max(miss_sigs.items(), key=lambda kv: kv[1])
+            parts.append(f"— {cnt} из них были без сигнала {msig}")
+
+    if win_sigs:
+        top_sig, _ = win_sigs.most_common(1)[0]
+        if top_sig not in cur_signals:
+            parts.append(
+                f"\n📌 Сейчас: не хватает сигнала {top_sig}, риск {risk:.1f}%. Подумай, стоит ли входить."
+            )
+            return "\n".join(parts)
+
+    parts.append(
+        f"\n📌 Сейчас: риск {risk:.1f}%. Подумай, стоит ли входить."
+    )
+    return "\n".join(parts)
+
+
 def build_habits_report(uid: int) -> str:
     now = datetime.now()
     start_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
@@ -4478,14 +4554,14 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT signals, signal_stars, risk_percent FROM trades "
+            "SELECT symbol, trade_type, leverage, signals, signal_stars, risk_percent FROM trades "
             "WHERE id=? AND user_id=? AND exit_price IS NULL AND COALESCE(is_deleted,0)=0",
             (tid, uid),
         ).fetchone()
     if not row:
         await cb.message.answer("Сделка не найдена.")
         return
-    signals, stars, risk = row
+    symbol, t_type, lev, signals, stars, risk = row
     sig_list = [s for s in (signals or "").split(";") if s]
     if not sig_list or not risk:
         await cb.message.answer(
@@ -4503,6 +4579,7 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
         f"🛑 Риск по стопу: {risk:.1f}%",
     ]
     text = "\n".join(parts) + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
+    text += "\n\n" + _similar_trades_summary(uid, symbol, t_type, lev, total, sig_list, risk)
     kb = with_back(
         InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="ai_trades")]]
