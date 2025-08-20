@@ -96,7 +96,8 @@ def init_db() -> None:
             notify_mode TEXT,
             notify_near_pct REAL DEFAULT 0.3,
             notify_stop_sent INTEGER DEFAULT 0,
-            notify_target_sent INTEGER DEFAULT 0
+            notify_target_sent INTEGER DEFAULT 0,
+            notify_stagnation_sent INTEGER DEFAULT 0
         )
         """
     )
@@ -231,6 +232,9 @@ def add_missing_columns() -> None:
             conn.commit()
         if "notify_target_sent" not in columns:
             cur.execute("ALTER TABLE trades ADD COLUMN notify_target_sent INTEGER DEFAULT 0")
+            conn.commit()
+        if "notify_stagnation_sent" not in columns:
+            cur.execute("ALTER TABLE trades ADD COLUMN notify_stagnation_sent INTEGER DEFAULT 0")
             conn.commit()
 
         cur.execute("PRAGMA table_info(user_settings)")
@@ -1619,10 +1623,10 @@ async def process_notifications(uid: int) -> None:
     now = datetime.now()
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT id, trade_type, symbol, entry_price, stop_loss, targets, entry_date, notify_type, notify_mode, notify_near_pct, notify_stop_sent, notify_target_sent FROM trades WHERE user_id=? AND exit_price IS NULL AND notifications_enabled=1 AND COALESCE(is_deleted,0)=0",
+            "SELECT id, trade_type, symbol, entry_price, stop_loss, targets, entry_date, notify_type, notify_mode, notify_near_pct, notify_stop_sent, notify_target_sent, notify_stagnation_sent FROM trades WHERE user_id=? AND exit_price IS NULL AND notifications_enabled=1 AND COALESCE(is_deleted,0)=0",
             (uid,),
         ).fetchall()
-    for tid, t_type, sym, entry, sl, tgt_str, entry_date, ntype, nmode, npct, stop_sent, target_sent in rows:
+    for tid, t_type, sym, entry, sl, tgt_str, entry_date, ntype, nmode, npct, stop_sent, target_sent, stag_sent in rows:
         price = await fetch_price(sym)
         if price is None:
             continue
@@ -1665,11 +1669,17 @@ async def process_notifications(uid: int) -> None:
                     updated = True
                     break
         entry_dt = datetime.fromisoformat(entry_date)
-        if now - entry_dt >= timedelta(hours=48) and abs(price - entry) / entry * 100 < 1:
+        if (
+            now - entry_dt >= timedelta(hours=48)
+            and abs(price - entry) / entry * 100 < 1
+            and not stag_sent
+        ):
             try:
                 await bot.send_message(uid, f"{sym} {t_type}: 💤 Сделка в стагнации — подумай о действиях")
             except Exception:
                 pass
+            stag_sent = 1
+            updated = True
         if updated:
             disable = 0
             if ntype == "stop" and stop_sent:
@@ -1680,8 +1690,8 @@ async def process_notifications(uid: int) -> None:
                 disable = 1
             with sqlite3.connect(DB_PATH) as conn:
                 conn.execute(
-                    "UPDATE trades SET notify_stop_sent=?, notify_target_sent=?, notifications_enabled=? WHERE id=?",
-                    (stop_sent, target_sent, 0 if disable else 1, tid),
+                    "UPDATE trades SET notify_stop_sent=?, notify_target_sent=?, notify_stagnation_sent=?, notifications_enabled=? WHERE id=?",
+                    (stop_sent, target_sent, stag_sent, 0 if disable else 1, tid),
                 )
                 conn.commit()
 
@@ -3392,7 +3402,7 @@ async def ask_notifications(uid: int, trade_id: int, state: FSMContext) -> None:
     if is_automation_enabled(uid):
         with sqlite3.connect(DB_PATH) as conn:
             conn.execute(
-                "UPDATE trades SET notifications_enabled=1, notify_type='both', notify_mode='near', notify_near_pct=0.3, notify_stop_sent=0, notify_target_sent=0 WHERE id=?",
+                "UPDATE trades SET notifications_enabled=1, notify_type='both', notify_mode='near', notify_near_pct=0.3, notify_stop_sent=0, notify_target_sent=0, notify_stagnation_sent=0 WHERE id=?",
                 (trade_id,),
             )
             conn.commit()
@@ -3606,7 +3616,7 @@ async def notif_enable(cb: types.CallbackQuery, state: FSMContext):
     near = data.get("near_pct", 0.3)
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "UPDATE trades SET notifications_enabled=1, notify_type=?, notify_mode=?, notify_near_pct=?, notify_stop_sent=0, notify_target_sent=0 WHERE id=?",
+            "UPDATE trades SET notifications_enabled=1, notify_type=?, notify_mode=?, notify_near_pct=?, notify_stop_sent=0, notify_target_sent=0, notify_stagnation_sent=0 WHERE id=?",
             (ntype, nmode, near, tid),
         )
         conn.commit()
@@ -4295,7 +4305,7 @@ async def notif_disable_all(cb: types.CallbackQuery):
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "UPDATE trades SET notifications_enabled=0, notify_type=NULL, notify_mode=NULL, notify_near_pct=NULL, notify_stop_sent=0, notify_target_sent=0 WHERE user_id=?",
+            "UPDATE trades SET notifications_enabled=0, notify_type=NULL, notify_mode=NULL, notify_near_pct=NULL, notify_stop_sent=0, notify_target_sent=0, notify_stagnation_sent=0 WHERE user_id=?",
             (uid,),
         )
         conn.commit()
@@ -4312,7 +4322,7 @@ async def notif_disable(cb: types.CallbackQuery):
     tid = int(cb.data.split("_")[2])
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "UPDATE trades SET notifications_enabled=0, notify_type=NULL, notify_mode=NULL, notify_near_pct=NULL, notify_stop_sent=0, notify_target_sent=0 WHERE id=? AND user_id=?",
+            "UPDATE trades SET notifications_enabled=0, notify_type=NULL, notify_mode=NULL, notify_near_pct=NULL, notify_stop_sent=0, notify_target_sent=0, notify_stagnation_sent=0 WHERE id=? AND user_id=?",
             (tid, uid),
         )
         conn.commit()
