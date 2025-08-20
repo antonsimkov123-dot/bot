@@ -3493,7 +3493,15 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
     ]
     if risk is not None:
         parts.append(f"🛑 Риск по стопу: {risk:.1f}%")
-    text = "\n".join(parts) + "\n\n" + _build_ai_advice(cb.from_user.id, signals, strong, total, float(risk or 0))
+    symbol = data.get("symbol")
+    ttype = data.get("trade_type")
+    trend_text = ""
+    if symbol and ttype:
+        trend_text = await _analyze_micro_trend(symbol, ttype)
+    text = "\n".join(parts)
+    if trend_text:
+        text += "\n\n" + trend_text
+    text += "\n\n" + _build_ai_advice(cb.from_user.id, signals, strong, total, float(risk or 0))
     await cb.message.answer(text)
 
 
@@ -3619,6 +3627,70 @@ def _recommend_setup(strong: int, risk: float) -> str:
     return (
         "📊 Можно рассмотреть вход, но усили его объёмом или ретестом. "
         "Стоп под локальным минимумом, тейк на 2 уровня выше."
+    )
+
+
+async def _fetch_kline(symbol: str, interval: str, limit: int = 7) -> list:
+    url = "https://api.bybit.com/v5/market/kline"
+    for category in ("linear", "spot"):
+        params = {
+            "category": category,
+            "symbol": f"{symbol}USDT",
+            "interval": interval,
+            "limit": limit,
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, params=params) as resp:
+                    data = await resp.json()
+        except Exception:
+            continue
+        res = data.get("result", {}).get("list")
+        if res:
+            return res
+    return []
+
+
+async def _analyze_micro_trend(symbol: str, ttype: str) -> str:
+    candles = await _fetch_kline(symbol, "D", 7)
+    if len(candles) < 5:
+        candles = await _fetch_kline(symbol, "240", 7)
+    if len(candles) < 5:
+        return (
+            "🔁 Тренд не определён: нет данных. Будь осторожен — рынок не выбрал направление."
+        )
+    highs = [float(c[2]) for c in candles][-7:]
+    lows = [float(c[3]) for c in candles][-7:]
+    vols = [float(c[5]) for c in candles][-7:]
+    up = all(h2 > h1 and l2 > l1 for h1, h2, l1, l2 in zip(highs, highs[1:], lows, lows[1:]))
+    down = all(h2 < h1 and l2 < l1 for h1, h2, l1, l2 in zip(highs, highs[1:], lows, lows[1:]))
+    vol_note = "Объёмы нестабильны."
+    if len(vols) >= 6:
+        recent = sum(vols[-3:]) / 3
+        prev = sum(vols[:3]) / 3
+        if recent > prev * 1.1:
+            vol_note = "Объёмы растут, тренд усиливается."
+        elif recent < prev * 0.9:
+            vol_note = "Объёмы снижаются."
+    if up:
+        base = "📈 Тренд: растущий."
+        direction = (
+            "Сделка по направлению тренда, можно искать подтверждение для входа."
+            if ttype.lower() == "long"
+            else "Сделка против тренда — повышенный риск."
+        )
+        return f"{base}\n{vol_note}\n{direction}"
+    if down:
+        base = "📉 Текущий тренд: падающий."
+        direction = (
+            "Сделка по направлению тренда, можно искать подтверждение для входа."
+            if ttype.lower() == "short"
+            else "Сделка против тренда — повышенный риск."
+        )
+        return f"{base}\n{vol_note}\n{direction}"
+    return (
+        "🔁 Тренд не определён: цена колеблется в диапазоне.\n"
+        "Будь осторожен — рынок не выбрал направление."
     )
 
 
@@ -4573,12 +4645,13 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
     risk = float(risk)
     parts = [
         f"⭐️ Звёзд: {total}",
-        f"🔥 Сильных сигналов: {strong}",
-        f"🟡 Средние: {medium}",
-        f"⚪️ Слабые: {weak}",
-        f"🛑 Риск по стопу: {risk:.1f}%",
+       f"🔥 Сильных сигналов: {strong}",
+       f"🟡 Средние: {medium}",
+       f"⚪️ Слабые: {weak}",
+       f"🛑 Риск по стопу: {risk:.1f}%",
     ]
-    text = "\n".join(parts) + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
+    trend_text = await _analyze_micro_trend(symbol, t_type)
+    text = "\n".join(parts) + "\n\n" + trend_text + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
     text += "\n\n" + _similar_trades_summary(uid, symbol, t_type, lev, total, sig_list, risk)
     kb = with_back(
         InlineKeyboardMarkup(
