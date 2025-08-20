@@ -5,6 +5,7 @@ from aiogram import F, Router
 from aiogram.types import Message
 
 router = Router()
+print("[handlers.reports] module loaded")
 
 
 @router.message(F.text == "\U0001F4CA Отчёты")

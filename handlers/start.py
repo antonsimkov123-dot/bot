@@ -8,6 +8,7 @@ from aiogram.types import Message
 from keyboards.keyboards import main_menu
 
 router = Router()
+print("[handlers.start] module loaded")
 
 
 @router.message(CommandStart())

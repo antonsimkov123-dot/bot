@@ -5,6 +5,7 @@ from aiogram import Router
 from aiogram.types import Message
 
 router = Router()
+print("[handlers.other] module loaded")
 
 
 @router.message()
