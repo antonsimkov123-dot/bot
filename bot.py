@@ -3653,14 +3653,18 @@ async def _fetch_kline(symbol: str, interval: str, limit: int = 7) -> list:
 
 async def _micro_trend_tf(symbol: str, interval: str) -> dict:
     candles = await _fetch_kline(symbol, interval, 60)
-    used = min(len(candles), 50)
+    if not candles:
+        return {"trend": "nodata", "used": 0}
+    # ensure chronological order and keep latest 50
+    candles = sorted(candles, key=lambda c: int(c[0]))[-50:]
+    used = len(candles)
     if used < 50:
         return {"trend": "nodata", "used": used}
 
-    closes = [float(c[4]) for c in candles][-used:]
-    highs = [float(c[2]) for c in candles][-used:]
-    lows = [float(c[3]) for c in candles][-used:]
-    vols = [float(c[5]) for c in candles][-used:]
+    closes = [float(c[4]) for c in candles]
+    highs = [float(c[2]) for c in candles]
+    lows = [float(c[3]) for c in candles]
+    vols = [float(c[5]) for c in candles]
     price = closes[-1]
 
     # EMA-based slope to smooth noise
@@ -3673,13 +3677,22 @@ async def _micro_trend_tf(symbol: str, interval: str) -> dict:
         ema_vals.append(ema)
     slope_pct = (ema_vals[-1] - ema_vals[0]) / ema_vals[0] * 100 if ema_vals[0] else 0
 
-    up_pairs = sum(
-        h2 > h1 and l2 > l1 for h1, h2, l1, l2 in zip(highs, highs[1:], lows, lows[1:])
-    )
-    down_pairs = sum(
-        h2 < h1 and l2 < l1 for h1, h2, l1, l2 in zip(highs, highs[1:], lows, lows[1:])
-    )
-    total_pairs = max(used - 1, 1)
+    struct_thr = 0.003  # 0.3% difference threshold to filter noise
+    up_pairs = down_pairs = 0
+    for h1, h2, l1, l2 in zip(highs, highs[1:], lows, lows[1:]):
+        diff = max(
+            abs(h2 - h1) / h1 if h1 else 0,
+            abs(l2 - l1) / l1 if l1 else 0,
+        )
+        if diff < struct_thr:
+            continue
+        if h2 > h1 and l2 > l1:
+            up_pairs += 1
+        elif h2 < h1 and l2 < l1:
+            down_pairs += 1
+    total_pairs = up_pairs + down_pairs
+    if total_pairs == 0:
+        total_pairs = 1
     range_ratio = (max(highs) - min(lows)) / price if price else 0
 
     recent = sum(vols[-25:]) / 25
@@ -3698,6 +3711,14 @@ async def _micro_trend_tf(symbol: str, interval: str) -> dict:
     up_ratio = up_pairs / total_pairs
     down_ratio = down_pairs / total_pairs
     struct_major = "up" if up_ratio >= 0.6 else "down" if down_ratio >= 0.6 else "mixed"
+    # if structure and volume agree but slope contradicts slightly, align with trend
+    if struct_major in {"up", "down"} and vol_dir == struct_major:
+        if struct_major == "up" and slope_pct < 0:
+            slope_pct = abs(slope_pct)
+            slope_dir = "up" if slope_pct > 1 else "flat"
+        elif struct_major == "down" and slope_pct > 0:
+            slope_pct = -abs(slope_pct)
+            slope_dir = "down" if slope_pct < -1 else "flat"
 
     if struct_major in {"up", "down"}:
         trend = struct_major
@@ -3720,6 +3741,7 @@ async def _micro_trend_tf(symbol: str, interval: str) -> dict:
         "slope": slope_pct,
         "up": up_pairs,
         "down": down_pairs,
+        "pairs": total_pairs,
         "vol": vol_dir,
         "struct": struct_raw,
         "struct_major": struct_major,
@@ -3741,7 +3763,7 @@ def _trend_text(label: str, data: dict) -> str:
     struct = data.get("struct", "mixed")
     struct_major = data.get("struct_major", "mixed")
     slope_dir = data.get("slope_dir", "flat")
-    total_pairs = max(used - 1, 1)
+    total_pairs = data.get("pairs", max(used - 1, 1))
 
     vol_phrase = {
         "up": "объёмы растут",
