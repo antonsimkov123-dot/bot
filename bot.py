@@ -1512,24 +1512,24 @@ SIGNAL_STARS = {name: stars for name, stars in SIGNAL_OPTIONS}
 SIGNALS_TEXT = (
     "📍 Укажи сигналы, по которым ты входишь в сделку.\n"
     "🔻 Нажимай по одному, сколько нужно.\n\n"
-    "🔥 Очень важные (★★★★★ и ★★★★):\n"
-    "• Закреп 2–3 свечей — ★★★★★★\n"
-    "• Дивергенция RSI или MACD на дневке — ★★★★★★\n"
-    "• Поглощение на дневке — ★★★★★\n"
-    "• 0.618 FIBO (пробой/отработка) — ★★★★★\n"
-    "• Пробой канала или трендовой — ★★★★★\n"
-    "• Ретест пробитого уровня на объёмах — ★★★★★\n\n"
-    "🟡 Средние (★★★ и ★★):\n"
-    "• MACD пересекает сигнальную / 0 — ★★★\n"
-    "• Рост объёмов — ★★★\n"
-    "• Поддержка от мувингов (50/200) — ★★\n"
-    "• Боллинджер: выход за границу — ★★\n"
-    "• Формация ГиП / инверсная — ★★\n\n"
-    "⚪️ Слабые (★):\n"
-    "• Сигналы только на 1H — ★\n"
-    "• Мелкая дивергенция RSI на 1H — ★\n"
-    "• Стагнация объёмов — ★\n"
-    "• Локальные уровни без объёма — ★"
+    "🔥 Очень важные (⭐️⭐️⭐️⭐️⭐️ и ⭐️⭐️⭐️⭐️):\n"
+    "• Закреп 2–3 свечей — ⭐️⭐️⭐️⭐️⭐️⭐️\n"
+    "• Дивергенция RSI или MACD на дневке — ⭐️⭐️⭐️⭐️⭐️⭐️\n"
+    "• Поглощение на дневке — ⭐️⭐️⭐️⭐️⭐️\n"
+    "• 0.618 FIBO (пробой/отработка) — ⭐️⭐️⭐️⭐️⭐️\n"
+    "• Пробой канала или трендовой — ⭐️⭐️⭐️⭐️⭐️\n"
+    "• Ретест пробитого уровня на объёмах — ⭐️⭐️⭐️⭐️⭐️\n\n"
+    "🟡 Средние (⭐️⭐️⭐️ и ⭐️⭐️):\n"
+    "• MACD пересекает сигнальную / 0 — ⭐️⭐️⭐️\n"
+    "• Рост объёмов — ⭐️⭐️⭐️\n"
+    "• Поддержка от мувингов (50/200) — ⭐️⭐️\n"
+    "• Боллинджер: выход за границу — ⭐️⭐️\n"
+    "• Формация ГиП / инверсная — ⭐️⭐️\n\n"
+    "⚪️ Слабые (⭐️):\n"
+    "• Сигналы только на 1H — ⭐️\n"
+    "• Мелкая дивергенция RSI на 1H — ⭐️\n"
+    "• Стагнация объёмов — ⭐️\n"
+    "• Локальные уровни без объёма — ⭐️"
     "\nШкала силы: ≤4 слабая • 5–7 умеренная • 8–11 сильная • 12+ очень сильная"
 )
 
@@ -2232,7 +2232,7 @@ def with_back(kb: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
 
 def signals_keyboard() -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(text=f"{name} — {'★'*stars}", callback_data=f"sig_{idx}")]
+        [InlineKeyboardButton(text=f"{name} — {'⭐️'*stars}", callback_data=f"sig_{idx}")]
         for idx, (name, stars) in enumerate(SIGNAL_OPTIONS)
     ]
     buttons.append([InlineKeyboardButton(text="🛑 Завершить выбор", callback_data="signals_done")])
@@ -2334,9 +2334,9 @@ def format_trade(data: dict) -> str:
     if isinstance(sigs, str):
         sigs = [s for s in sigs.split(';') if s]
     sigs = sigs or []
-    lines = [f"• {s} — {'★'*SIGNAL_STARS.get(s, 0)}" for s in sigs] or ["—"]
+    lines = [f"• {s} — {'⭐️'*SIGNAL_STARS.get(s, 0)}" for s in sigs] or ["—"]
     total, strong, medium, weak = signal_stats(sigs)
-    lines.append(f"Всего звёзд: {total}")
+    lines.append(f"Всего звёзд: {total}⭐️")
     lines.append(f"Сильные: {strong}, Средние: {medium}, Слабые: {weak}")
     lines.append(f"Сила сделки: {strength_label(total)}")
     lines.append("Шкала: ≤4 Слабая, 5–7 Умеренная, 8–11 Сильная, 12+ Очень сильная")
@@ -3118,8 +3118,8 @@ async def edit_add_signal(cb: types.CallbackQuery, state: FSMContext):
         total, strong, medium, weak = signal_stats(signals)
         await state.update_data(signals_total=total)
         summary = (
-            f"✅ Сигнал добавлен: \"{name}\" ({'★'*stars})\n\n"
-            f"Всего: ★{total}\n"
+            f"✅ Сигнал добавлен: \"{name}\" ({'⭐️'*stars})\n\n"
+            f"Всего: ⭐️{total}\n"
             f"Сильные: {strong}, Средние: {medium}, Слабые: {weak}\n"
             f"Сила сделки: {strength_label(total)}\n"
             "Шкала: ≤4 Слабая, 5–7 Умеренная, 8–11 Сильная, 12+ Очень сильная"
@@ -3307,8 +3307,8 @@ async def add_signal(cb: types.CallbackQuery, state: FSMContext):
         total, strong, medium, weak = signal_stats(signals)
         await state.update_data(signals_total=total)
         summary = (
-            f"✅ Сигнал добавлен: \"{name}\" ({'★'*stars})\n\n"
-            f"Всего: ★{total}\n"
+            f"✅ Сигнал добавлен: \"{name}\" ({'⭐️'*stars})\n\n"
+            f"Всего: ⭐️{total}\n"
             f"Сильные: {strong}, Средние: {medium}, Слабые: {weak}\n"
             f"Сила сделки: {strength_label(total)}\n"
             "Шкала: ≤4 Слабая, 5–7 Умеренная, 8–11 Сильная, 12+ Очень сильная"
@@ -3443,7 +3443,7 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
     if strong >= 2 and risk <= 10:
         text = (
             "💡 Сетап оценён!\n\n"
-            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}★\n"
+            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
             f"— Риск: {risk:.1f}%\n\n"
             "📊 Анализ:\n"
             "✅ Отличное соотношение сигналов и риска.\n"
@@ -3452,7 +3452,7 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
     else:
         text = (
             "⚠️ Осторожно: слабый сетап\n\n"
-            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}★\n"
+            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
             f"— Риск: {risk:.1f}%\n\n"
             "📊 Анализ:\n"
             "❌ Недостаточно подтверждающих сигналов.\n"
@@ -4135,7 +4135,7 @@ async def ai_advisor_list(cb: types.CallbackQuery, state: FSMContext):
         label = f"{i}. {sym} / {t_type.capitalize()}"
         if lev_str:
             label += f" / {lev_str}"
-        label += f" / +{total}★"
+        label += f" / +{total}⭐️"
         buttons.append([
             InlineKeyboardButton(text=label, callback_data=f"ai_{tid}")
         ])
@@ -4173,7 +4173,7 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
     if strong >= 2 and risk <= 10:
         text = (
             "💡 Сетап оценён!\n\n"
-            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}★\n"
+            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
             f"— Риск: {risk:.1f}%\n\n"
             "📊 Анализ:\n"
             "✅ Отличное соотношение сигналов и риска.\n"
@@ -4182,7 +4182,7 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
     else:
         text = (
             "⚠️ Осторожно: слабый сетап\n\n"
-            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}★\n"
+            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
             f"— Риск: {risk:.1f}%\n\n"
             "📊 Анализ:\n"
             "❌ Недостаточно подтверждающих сигналов.\n"
@@ -4866,7 +4866,7 @@ def build_top_trades(uid: int) -> str:
         if sig_str:
             for s in sig_str.split(";"):
                 if s:
-                    sigs.append(f"{s} — {'★'*SIGNAL_STARS.get(s, 0)}")
+                    sigs.append(f"{s} — {'⭐️'*SIGNAL_STARS.get(s, 0)}")
         sig_text = "; ".join(sigs) if sigs else "—"
         lines.append(
             f"{i}. 📍 {sym}\n   🎯 {pnl:+.2f}%\n   🧠 {sig_text}\n   🕓 {entry_date} — {exit_date}"
@@ -4874,7 +4874,7 @@ def build_top_trades(uid: int) -> str:
     if best:
         lines.append(
             "\n⭐️ Самый высокозвёздочный сетап месяца:\n"
-            f"📍 {best[0]} — {best[1]}★"
+            f"📍 {best[0]} — {best[1]}⭐️"
         )
     return "\n".join(lines)
 
