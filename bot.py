@@ -3506,8 +3506,8 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
     reco_block = ""
     if symbol and ttype:
         trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype)
-        rec_lines, verdict_line = _trend_recommendations(ttype, d_res, h_res)
-        reco_block = f"\n\n🧠 Рекомендации:\n{rec_lines}\n{verdict_line}"
+        rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
+        reco_block = f"\n\n{rec_block}\n{verdict_line}"
     text = "\n".join(parts)
     if trend_text:
         text += "\n\n" + trend_text + reco_block
@@ -3826,65 +3826,60 @@ async def _analyze_micro_trend(symbol: str, ttype: str) -> tuple[str, dict, dict
     return text, d_res, h_res
 
 
-def _trend_recommendations(ttype: str, d_res: dict, h_res: dict) -> tuple[str, str]:
-    d = d_res.get("global", {})
-    h = h_res.get("global", {})
-    d_tr = d.get("trend", "uncertain")
-    h_tr = h.get("trend", "uncertain")
-    if d_tr == "nodata":
-        d_tr = "uncertain"
-    if h_tr == "nodata":
-        h_tr = "uncertain"
+def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str]:
+    LEVEL_EMOJI = {"global": "🔵", "local": "🟢", "scalp": "🟣"}
+    LEVEL_NAME = {
+        "global": "Глобальный тренд",
+        "local": "Локальный тренд",
+        "scalp": "Скальп",
+    }
+    DIR_TEXT = {
+        "up": "↗ Восходящий",
+        "down": "↘ Нисходящий",
+        "flat": "⏸ Боковик",
+        "uncertain": "🔄 Неопределённый",
+    }
 
-    lines: list[str] = []
-    verdict = "wait"
-    if d_tr in {"up", "down"} and h_tr in {"up", "down"} and d_tr != h_tr:
-        lines.append("Тренды 1D и 4H противоречат — возможен откат.")
-        if ttype.lower() == "long":
-            if d_tr == "up":
-                lines.append("Жди, пока 4H развернётся вверх перед входом в лонг.")
-            else:
-                lines.append("Лонг против дневного тренда — рискованно.")
+    def rec_line(tf: str, lvl: str, data: dict) -> str:
+        trend = data.get("trend", "uncertain")
+        vol = data.get("vol", "flat")
+        struct = data.get("struct_major", "mixed")
+        arrow = DIR_TEXT.get(trend, "🔄 Неопределённый")
+        if tf == "4H" and lvl == "global":
+            d_gl = d_res.get("global", {}).get("trend")
+            if trend in {"up", "down"} and d_gl in {"up", "down"} and trend != d_gl:
+                arrow = "↗ Откат" if trend == "up" else "↘ Откат"
+                action = "следи за разворотом вниз" if trend == "up" else "следи за разворотом вверх"
+                return f"{LEVEL_EMOJI[lvl]} {LEVEL_NAME[lvl]} ({tf}): {arrow} — {action}"
+        if trend not in {"up", "down"} or struct == "mixed":
+            action = "Неопределённый — наблюдай"
+        elif vol == trend:
+            action = "Ищи вход"
         else:
-            if d_tr == "down":
-                lines.append("Жди, пока 4H развернётся вниз перед входом в шорт.")
-            else:
-                lines.append("Шорт против дневного тренда — рискованно.")
-    elif d_tr in {"up", "down"} and d_tr == h_tr:
-        lines.append(
-            f"Тренды согласованы — {'рост' if d_tr=='up' else 'падение'} на 1D и 4H."
-        )
-        if (ttype.lower() == "long" and d_tr == "up") or (
-            ttype.lower() == "short" and d_tr == "down"
-        ):
-            verdict = "ok"
-        else:
-            verdict = "no"
+            action = "Жди подтверждения"
+        return f"{LEVEL_EMOJI[lvl]} {LEVEL_NAME[lvl]} ({tf}): {arrow} — {action}"
+
+    lines = ["📊 Рекомендации по трендам:"]
+    for tf, res in [("1D", d_res), ("4H", h_res)]:
+        for lvl in ("global", "local", "scalp"):
+            lines.append(rec_line(tf, lvl, res.get(lvl, {})))
+
+    dirs = []
+    for res in (d_res, h_res):
+        for lvl in ("global", "local", "scalp"):
+            tr = res.get(lvl, {}).get("trend")
+            if tr in {"up", "down"}:
+                dirs.append(tr)
+    if "up" in dirs and "down" in dirs:
+        verdict = "⚠️ Вердикт: Тренды противоречат — жди подтверждения"
+    elif dirs and (set(dirs) == {"up"} or set(dirs) == {"down"}):
+        verdict = "✅ Вердикт: Тренды совпадают — возможен уверенный вход"
     else:
-        lines.append("Направление тренда неясно.")
+        verdict = "⚠️ Вердикт: Тренды неопределены — наблюдай"
 
-    for name, res in [("1D", d), ("4H", h)]:
-        vol = res.get("vol")
-        if vol == "down":
-            lines.append(f"{name}: объёмы падают — риски высоки.")
-        elif vol == "up":
-            lines.append(f"{name}: объёмы растут — тренд поддержан.")
-        slope = res.get("slope", 0)
-        if abs(slope) < 1 and res.get("trend") in {"up", "down"}:
-            lines.append(f"{name}: наклон слабеет — возможно замедление тренда.")
+    return "\n".join(lines), verdict
 
-    if ttype.lower() == "long" and verdict != "no":
-        lines.append("Жди закрепа выше уровня перед входом в лонг.")
-    elif ttype.lower() == "short" and verdict != "no":
-        lines.append("Жди закрепа ниже уровня перед входом в шорт.")
 
-    verdict_line = {
-        "ok": "✅ Вердикт: Вход возможен",
-        "wait": "⚠️ Вердикт: Ждать подтверждения",
-        "no": "❌ Вердикт: Сделка не рекомендуется",
-    }.get(verdict, "⚠️ Вердикт: Ждать подтверждения")
-
-    return "\n".join(f"– {l}" for l in lines), verdict_line
 
 
 def _similar_trades_summary(
@@ -4105,8 +4100,8 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
     total, strong, _, _ = signal_stats(sig_list)
     risk = float(risk)
     trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype)
-    rec_lines, verdict_line = _trend_recommendations(ttype, d_res, h_res)
-    trend_block = trend_text + f"\n\n🧠 Рекомендации:\n{rec_lines}\n{verdict_line}"
+    rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
+    trend_block = trend_text + f"\n\n{rec_block}\n{verdict_line}"
     text = (
         "💡 Сетап оценён!\n\n" + trend_block + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
     )
@@ -4849,8 +4844,8 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
        f"🛑 Риск по стопу: {risk:.1f}%",
     ]
     trend_text, d_res, h_res = await _analyze_micro_trend(symbol, t_type)
-    rec_lines, verdict_line = _trend_recommendations(t_type, d_res, h_res)
-    trend_block = trend_text + f"\n\n🧠 Рекомендации:\n{rec_lines}\n{verdict_line}"
+    rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
+    trend_block = trend_text + f"\n\n{rec_block}\n{verdict_line}"
     text = "\n".join(parts) + "\n\n" + trend_block + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
     text += "\n\n" + _similar_trades_summary(uid, symbol, t_type, lev, total, sig_list, risk)
     kb = with_back(
