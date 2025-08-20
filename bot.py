@@ -192,7 +192,10 @@ def init_db() -> None:
             subscription TEXT DEFAULT 'none',
             notify_stagnation INTEGER DEFAULT 1,
             notify_targets INTEGER DEFAULT 1,
-            notify_risk INTEGER DEFAULT 1
+            notify_risk INTEGER DEFAULT 1,
+            habit_report_enabled INTEGER DEFAULT 0,
+            habit_report_time TEXT DEFAULT '21:00',
+            habit_comment_enabled INTEGER DEFAULT 0
         )
         """
     )
@@ -289,6 +292,15 @@ def add_missing_columns() -> None:
             conn.commit()
         if "notify_risk" not in us_cols:
             cur.execute("ALTER TABLE user_settings ADD COLUMN notify_risk INTEGER DEFAULT 1")
+            conn.commit()
+        if "habit_report_enabled" not in us_cols:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN habit_report_enabled INTEGER DEFAULT 0")
+            conn.commit()
+        if "habit_report_time" not in us_cols:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN habit_report_time TEXT DEFAULT '21:00'")
+            conn.commit()
+        if "habit_comment_enabled" not in us_cols:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN habit_comment_enabled INTEGER DEFAULT 0")
             conn.commit()
 
         cur.execute("PRAGMA table_info(price_alerts)")
@@ -548,6 +560,10 @@ class NotifyState(StatesGroup):
     choose_near = State()
     enter_near = State()
     confirm = State()
+
+
+class HabitNotifyState(StatesGroup):
+    time = State()
 
 
 class PriceAlertState(StatesGroup):
@@ -2161,6 +2177,29 @@ async def notification_scheduler():
             await process_notifications(uid)
         await asyncio.sleep(60)
 
+
+async def habit_scheduler():
+    while True:
+        now = datetime.now()
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT user_id, habit_report_time FROM user_settings WHERE habit_report_enabled=1",
+            ).fetchall()
+        for uid, t in rows:
+            try:
+                h, m = map(int, (t or "21:00").split(":"))
+            except Exception:
+                h, m = 21, 0
+            if now.hour == h and now.minute == m:
+                if get_subscription(uid) not in {"basic", "pro"}:
+                    continue
+                text = build_habits_report(uid)
+                try:
+                    await bot.send_message(uid, text)
+                except Exception:
+                    pass
+        await asyncio.sleep(60)
+
 def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
     opt_text = (
         "🔧 Оптимизация 🟢" if is_automation_enabled(uid) else "🔧 Оптимизация 🔴"
@@ -3581,6 +3620,70 @@ def _recommend_setup(strong: int, risk: float) -> str:
     )
 
 
+def build_habits_report(uid: int) -> str:
+    now = datetime.now()
+    start_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_week = now - timedelta(days=7)
+    with sqlite3.connect(DB_PATH) as conn:
+        today_rows = conn.execute(
+            "SELECT signal_stars, risk_percent FROM trades WHERE user_id=? AND entry_date>=? AND COALESCE(is_deleted,0)=0",
+            (uid, start_today.isoformat()),
+        ).fetchall()
+        week_rows = conn.execute(
+            "SELECT signal_stars, risk_percent, mistake_reason FROM trades WHERE user_id=? AND entry_date>=? AND COALESCE(is_deleted,0)=0",
+            (uid, start_week.isoformat()),
+        ).fetchall()
+        combo_rows = conn.execute(
+            "SELECT signals, profit_percent FROM trades WHERE user_id=? AND exit_price IS NOT NULL AND COALESCE(is_deleted,0)=0",
+            (uid,),
+        ).fetchall()
+    today_no_conf = sum(1 for s, r in today_rows if (s or 0) < 6)
+    today_high_risk = sum(1 for s, r in today_rows if (r or 0) > 25)
+    week_no_conf = sum(1 for s, r, _ in week_rows if (s or 0) < 6)
+    week_high_risk = sum(1 for s, r, _ in week_rows if (r or 0) > 25)
+    mistakes = defaultdict(int)
+    for _, _, m in week_rows:
+        if m:
+            mistakes[m] += 1
+    combo_stats: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
+    for sigs, prof in combo_rows:
+        if not sigs:
+            continue
+        sig_list = [s for s in sigs.split(";") if s]
+        for combo in combinations(sorted(sig_list), 2):
+            if prof and prof > 0:
+                combo_stats[combo][0] += 1
+            else:
+                combo_stats[combo][1] += 1
+    worst_combo = None
+    worst_diff = 0
+    for combo, (w, l) in combo_stats.items():
+        if w + l >= 3 and l > w and (l - w) > worst_diff:
+            worst_diff = l - w
+            worst_combo = (combo, l)
+    lines = [
+        f"📊 За сегодня: без подтверждений — {today_no_conf}, риск>25% — {today_high_risk}",
+        f"📉 За 7 дней: без подтверждений — {week_no_conf}, риск>25% — {week_high_risk}",
+    ]
+    if today_no_conf >= 2:
+        lines.append(
+            f"⚠️ Ты часто входишь без подтверждений — сегодня уже {today_no_conf} раза. Подумай, не повторяешь ли одну и ту же ошибку?"
+        )
+    if week_high_risk >= 3:
+        lines.append(
+            f"📉 Сделки с риском выше 25% — {week_high_risk} раза за неделю. Пересмотри управление рисками."
+        )
+    for m, c in sorted(mistakes.items(), key=lambda x: x[1], reverse=True):
+        if c >= 2:
+            lines.append(f"🔁 Повторяешь ошибку: '{m}' — {c} раза.")
+    if worst_combo:
+        combo, losses = worst_combo
+        lines.append(
+            f"🔁 Повторяешь неудачную связку: '{combo[0]} + {combo[1]}' — уже {losses} убытков подряд."
+        )
+    return "\n".join(lines)
+
+
 def _build_ai_advice(uid: int, signals: list[str], strong: int, total: int, risk: float) -> str:
     header = (
         f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
@@ -3617,7 +3720,15 @@ def _build_ai_advice(uid: int, signals: list[str], strong: int, total: int, risk
 async def maybe_send_ai_advice(uid: int, tid: int) -> None:
     if not is_automation_enabled(uid):
         return
+    if get_subscription(uid) not in {"basic", "pro"}:
+        return
     with sqlite3.connect(DB_PATH) as conn:
+        pref = conn.execute(
+            "SELECT habit_comment_enabled FROM user_settings WHERE user_id=?",
+            (uid,),
+        ).fetchone()
+        if not pref or not pref[0]:
+            return
         row = conn.execute(
             "SELECT signals, signal_stars, risk_percent FROM trades WHERE id=? AND user_id=?",
             (tid, uid),
@@ -4285,6 +4396,22 @@ async def auto_stop_save(cb: types.CallbackQuery, state: FSMContext):
 
 
 @dp.callback_query(F.data == "opt_ai")
+async def ai_menu(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🧠 AI-Советник", callback_data="ai_trades")],
+            [InlineKeyboardButton(text="📊 Мои привычки", callback_data="ai_habits")],
+            [InlineKeyboardButton(text="🔔 Уведомления", callback_data="ai_notif")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")],
+        ]
+    )
+    await cb.message.answer("Что тебя интересует?", reply_markup=with_back(kb))
+
+
+@dp.callback_query(F.data == "ai_trades")
 async def ai_advisor_list(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     if not await require_basic(cb.message, cb.from_user.id):
@@ -4297,26 +4424,30 @@ async def ai_advisor_list(cb: types.CallbackQuery, state: FSMContext):
             (uid,),
         ).fetchall()
     if not rows:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")]])
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
+        )
         await cb.message.answer("У тебя нет активных сделок.", reply_markup=with_back(kb))
         return
     buttons = []
     for i, (tid, sym, t_type, sigs, stars, lev) in enumerate(rows, 1):
-        total = stars if stars is not None else sum(SIGNAL_STARS.get(s, 0) for s in (sigs or "").split(";") if s)
+        total = stars if stars is not None else sum(
+            SIGNAL_STARS.get(s, 0) for s in (sigs or "").split(";") if s
+        )
         lev_str = fmt_leverage(lev) if t_type.lower() != "spot" else ""
         label = f"{i}. {sym} / {t_type.capitalize()}"
         if lev_str:
             label += f" / {lev_str}"
         label += f" / +{total}⭐️"
         buttons.append([
-            InlineKeyboardButton(text=label, callback_data=f"ai_{tid}")
+            InlineKeyboardButton(text=label, callback_data=f"aix_{tid}")
         ])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")])
     kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
     await cb.message.answer("Выбери сделку для анализа:", reply_markup=kb)
 
 
-@dp.callback_query(lambda c: c.data.startswith("ai_"))
+@dp.callback_query(lambda c: c.data.startswith("aix_"))
 async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     if not await require_basic(cb.message, cb.from_user.id):
@@ -4352,10 +4483,135 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
     text = "\n".join(parts) + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
     kb = with_back(
         InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
+            inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="ai_trades")]]
         )
     )
     await cb.message.answer(text, reply_markup=kb)
+
+
+@dp.callback_query(F.data == "ai_habits")
+async def ai_habits(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    uid = cb.from_user.id
+    text = build_habits_report(uid)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
+    )
+    await cb.message.answer(text, reply_markup=with_back(kb))
+
+
+@dp.callback_query(F.data == "ai_notif")
+async def ai_notif_menu(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    await _show_ai_notif(cb)
+
+
+async def _show_ai_notif(cb: types.CallbackQuery) -> None:
+    uid = cb.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT habit_report_enabled, habit_report_time, habit_comment_enabled FROM user_settings WHERE user_id=?",
+            (uid,),
+        ).fetchone()
+    rep, time_str, comm = row if row else (0, "21:00", 0)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=("⏰ Автоотчёт о привычках: вкл" if rep else "⏰ Автоотчёт о привычках: выкл"),
+                    callback_data="ai_notif_toggle",
+                )
+            ],
+            [InlineKeyboardButton(text=f"⏱ Время отправки: {time_str}", callback_data="ai_notif_time")],
+            [
+                InlineKeyboardButton(
+                    text=("💬 Комментарии: вкл" if comm else "💬 Комментарии: выкл"),
+                    callback_data="ai_notif_comments",
+                )
+            ],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")],
+        ]
+    )
+    await cb.message.answer("Настройки уведомлений:", reply_markup=with_back(kb))
+
+
+@dp.callback_query(F.data == "ai_notif_toggle")
+async def ai_notif_toggle(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    uid = cb.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)", (uid,))
+        row = conn.execute(
+            "SELECT habit_report_enabled FROM user_settings WHERE user_id=?", (uid,)
+        ).fetchone()
+        enabled = row[0] if row else 0
+        conn.execute(
+            "UPDATE user_settings SET habit_report_enabled=? WHERE user_id=?",
+            (0 if enabled else 1, uid),
+        )
+        conn.commit()
+    await _show_ai_notif(cb)
+
+
+@dp.callback_query(F.data == "ai_notif_comments")
+async def ai_notif_comments(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    uid = cb.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)", (uid,))
+        row = conn.execute(
+            "SELECT habit_comment_enabled FROM user_settings WHERE user_id=?", (uid,)
+        ).fetchone()
+        enabled = row[0] if row else 0
+        conn.execute(
+            "UPDATE user_settings SET habit_comment_enabled=? WHERE user_id=?",
+            (0 if enabled else 1, uid),
+        )
+        conn.commit()
+    await _show_ai_notif(cb)
+
+
+@dp.callback_query(F.data == "ai_notif_time")
+async def ai_notif_time(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    await state.set_state(HabitNotifyState.time)
+    await cb.message.answer("Отправь время в формате ЧЧ:ММ")
+
+
+@dp.message(HabitNotifyState.time)
+async def ai_notif_set_time(msg: types.Message, state: FSMContext):
+    if not await require_basic(msg, msg.from_user.id):
+        await state.clear()
+        return
+    text = msg.text.strip()
+    try:
+        datetime.strptime(text, "%H:%M")
+    except ValueError:
+        await msg.answer("Введи время в формате ЧЧ:ММ.")
+        return
+    uid = msg.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)", (uid,))
+        conn.execute(
+            "UPDATE user_settings SET habit_report_time=? WHERE user_id=?",
+            (text, uid),
+        )
+        conn.commit()
+    await state.clear()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="ai_notif")]]
+    )
+    await msg.answer("Время автоотчёта обновлено.", reply_markup=with_back(kb))
 
 
 @dp.message(BybitKeyState.api_key)
@@ -5159,6 +5415,7 @@ async def main():
     asyncio.create_task(report_scheduler())
     asyncio.create_task(notification_scheduler())
     asyncio.create_task(auto_update_scheduler())
+    asyncio.create_task(habit_scheduler())
     await dp.start_polling(bot)
 
 
