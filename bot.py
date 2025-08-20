@@ -3685,9 +3685,11 @@ def build_habits_report(uid: int) -> str:
 
 
 def _build_ai_advice(uid: int, signals: list[str], strong: int, total: int, risk: float) -> str:
+    sig_names = ", ".join(signals) if signals else "—"
     header = (
         f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
-        f"— Риск: {risk:.1f}%\n\n"
+        f"— Риск: {risk:.1f}%\n"
+        f"📍 Сигналы в сделке: {sig_names}\n\n"
         "📊 Анализ:\n"
     )
     if risk > 60 and strong < 2:
