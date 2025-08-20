@@ -3486,8 +3486,7 @@ async def show_trade_summary(uid: int, state: FSMContext):
 @dp.callback_query(TradeState.confirming, F.data == "signals_eval")
 async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
-        return
+    uid = cb.from_user.id
     data = await state.get_data()
     signals = data.get("signals", [])
     total, strong, medium, weak = signal_stats(signals)
@@ -3500,18 +3499,22 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
     ]
     if risk is not None:
         parts.append(f"🛑 Риск по стопу: {risk:.1f}%")
-    symbol = data.get("symbol")
-    ttype = data.get("trade_type")
-    trend_text = ""
-    reco_block = ""
-    if symbol and ttype:
-        trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype)
-        rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
-        reco_block = f"\n\n{rec_block}\n{verdict_line}"
     text = "\n".join(parts)
-    if trend_text:
-        text += "\n\n" + trend_text + reco_block
-    text += "\n\n" + _build_ai_advice(cb.from_user.id, signals, strong, total, float(risk or 0))
+    sub = get_subscription(uid)
+    if sub in {"basic", "pro"}:
+        symbol = data.get("symbol")
+        ttype = data.get("trade_type")
+        trend_text = ""
+        reco_block = ""
+        if symbol and ttype:
+            trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype)
+            rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
+            reco_block = f"\n\n{rec_block}\n{verdict_line}"
+        if trend_text:
+            text += "\n\n" + trend_text + reco_block
+        text += "\n\n" + _build_ai_advice(uid, signals, strong, total, float(risk or 0))
+    else:
+        text += "\n\n🔐 Расширенный анализ доступен только с подпиской Basic. Сейчас отображён упрощённый анализ."
     await cb.message.answer(text)
 
 
