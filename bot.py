@@ -4260,27 +4260,16 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
         )
         await open_edit_trade(cb, tid, state)
         return
-    total, strong, _, _ = signal_stats(sig_list)
+    total, strong, medium, weak = signal_stats(sig_list)
     risk = float(risk)
-    if strong >= 2 and risk <= 10:
-        text = (
-            "💡 Сетап оценён!\n\n"
-            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
-            f"— Риск: {risk:.1f}%\n\n"
-            "📊 Анализ:\n"
-            "✅ Отличное соотношение сигналов и риска.\n"
-            "💬 Совет: проверь объёмы на 4H, возможен откат."
-        )
-    else:
-        text = (
-            "⚠️ Осторожно: слабый сетап\n\n"
-            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
-            f"— Риск: {risk:.1f}%\n\n"
-            "📊 Анализ:\n"
-            "❌ Недостаточно подтверждающих сигналов.\n"
-            "🔺 Повышенный риск.\n"
-            "💬 Совет: дождись ретеста или усиливающего сигнала."
-        )
+    parts = [
+        f"⭐️ Звёзд: {total}",
+        f"🔥 Сильных сигналов: {strong}",
+        f"🟡 Средние: {medium}",
+        f"⚪️ Слабые: {weak}",
+        f"🛑 Риск по стопу: {risk:.1f}%",
+    ]
+    text = "\n".join(parts) + "\n\n" + _build_ai_advice(strong, total, risk)
     kb = with_back(
         InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
