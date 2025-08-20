@@ -3226,32 +3226,22 @@ async def edit_leverage_manual(msg: types.Message, state: FSMContext):
 
 @dp.callback_query(EditState.choosing_signals, lambda c: c.data.startswith("sig_"))
 async def edit_add_signal(cb: types.CallbackQuery, state: FSMContext):
-    await cb.answer()
     idx = int(cb.data.split("_")[1])
-    name, stars = SIGNAL_OPTIONS[idx]
+    name, _ = SIGNAL_OPTIONS[idx]
     data = await state.get_data()
     signals = data.get("signals", [])
     if name not in signals:
         signals.append(name)
         await state.update_data(signals=signals)
-        total, strong, medium, weak = signal_stats(signals)
+        total, _, _, _ = signal_stats(signals)
         await state.update_data(signals_total=total)
-        summary = (
-            f"✅ Сигнал добавлен: \"{name}\" ({'⭐️'*stars})\n\n"
-            f"Всего: ⭐️{total}\n"
-            f"Сильные: {strong}, Средние: {medium}, Слабые: {weak}\n"
-            f"Сила сделки: {strength_label(total)}\n"
-            "Шкала: ≤4 Слабая, 5–7 Умеренная, 8–11 Сильная, 12+ Очень сильная"
-        )
-        await cb.message.answer(summary)
+        await cb.answer("✅ Сигнал добавлен")
     else:
-        await cb.message.answer(f"⚠️ Сигнал уже выбран: \"{name}\"")
-    await cb.message.answer("Выбирай дальше:", reply_markup=signals_keyboard())
+        await cb.answer("⚠️ Уже выбран")
 
 
 @dp.callback_query(EditState.choosing_signals, F.data == "signals_done")
 async def edit_signals_done(cb: types.CallbackQuery, state: FSMContext):
-    await cb.answer()
     data = await state.get_data()
     tid = data.get("tid")
     signals = data.get("signals", [])
@@ -3262,7 +3252,8 @@ async def edit_signals_done(cb: types.CallbackQuery, state: FSMContext):
             (";".join(signals), total, tid),
         )
         conn.commit()
-    await cb.message.answer("Сигналы обновлены.")
+    await cb.answer("Сигналы обновлены")
+    await state.update_data(signals=[])
     await open_edit_trade(cb, tid, state)
 
 # ---------- ADD TRADE ----------
@@ -3415,27 +3406,18 @@ async def enter_leverage_manual(msg: types.Message, state: FSMContext):
 
 @dp.callback_query(TradeState.choosing_signals, lambda c: c.data.startswith("sig_"))
 async def add_signal(cb: types.CallbackQuery, state: FSMContext):
-    await cb.answer()
     idx = int(cb.data.split("_")[1])
-    name, stars = SIGNAL_OPTIONS[idx]
+    name, _ = SIGNAL_OPTIONS[idx]
     data = await state.get_data()
     signals = data.get("signals", [])
     if name not in signals:
         signals.append(name)
         await state.update_data(signals=signals)
-        total, strong, medium, weak = signal_stats(signals)
+        total, _, _, _ = signal_stats(signals)
         await state.update_data(signals_total=total)
-        summary = (
-            f"✅ Сигнал добавлен: \"{name}\" ({'⭐️'*stars})\n\n"
-            f"Всего: ⭐️{total}\n"
-            f"Сильные: {strong}, Средние: {medium}, Слабые: {weak}\n"
-            f"Сила сделки: {strength_label(total)}\n"
-            "Шкала: ≤4 Слабая, 5–7 Умеренная, 8–11 Сильная, 12+ Очень сильная"
-        )
-        await cb.message.answer(summary)
+        await cb.answer("✅ Сигнал добавлен")
     else:
-        await cb.message.answer(f"⚠️ Сигнал уже выбран: \"{name}\"")
-    await cb.message.answer("Выбирай дальше:", reply_markup=signals_keyboard())
+        await cb.answer("⚠️ Уже выбран")
 
 
 @dp.callback_query(TradeState.choosing_signals, F.data == "signals_done")
