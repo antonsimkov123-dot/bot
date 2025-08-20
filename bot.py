@@ -3452,7 +3452,7 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
     ]
     if risk is not None:
         parts.append(f"🛑 Риск по стопу: {risk:.1f}%")
-    text = "\n".join(parts) + "\n\n" + _build_ai_advice(strong, total, float(risk or 0))
+    text = "\n".join(parts) + "\n\n" + _build_ai_advice(cb.from_user.id, signals, strong, total, float(risk or 0))
     await cb.message.answer(text)
 
 
@@ -3508,7 +3508,80 @@ async def ask_notifications(uid: int, trade_id: int, state: FSMContext) -> None:
     await state.set_state(NotifyState.ask)
 
 
-def _build_ai_advice(strong: int, total: int, risk: float) -> str:
+def _analyze_trader_style(uid: int, risk: float, strong: int) -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT risk_percent, signal_stars FROM trades WHERE user_id=? AND COALESCE(is_deleted,0)=0",
+            (uid,),
+        ).fetchall()
+    if not rows:
+        return ""
+    total = len(rows)
+    high_risk = sum(1 for r, _ in rows if (r or 0) > 60)
+    weak_conf = sum(1 for r, s in rows if (s or 0) < 6)
+    parts = []
+    if total and high_risk / total > 0.4:
+        parts.append("высоким риском")
+    if total and weak_conf / total > 0.4:
+        parts.append("без подтверждений")
+    if parts and (risk > 60 or strong < 2):
+        joined = " и ".join(parts)
+        return (
+            "⚠️ Ты часто входишь с "
+            f"{joined}. Текущий сетап тоже рискованный — подумай, не повторяешь ли ты ту же ошибку?"
+        )
+    return ""
+
+
+def _analyze_signal_combos(uid: int, signals: list[str]) -> str:
+    if len(signals) < 2:
+        return ""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT signals, profit_percent FROM trades "
+            "WHERE user_id=? AND signals!='' AND profit_percent IS NOT NULL",
+            (uid,),
+        ).fetchall()
+    stats: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
+    for sigs, prof in rows:
+        sig_list = [s for s in sigs.split(";") if s]
+        for combo in combinations(sorted(sig_list), 2):
+            if prof and prof > 0:
+                stats[combo][0] += 1
+            else:
+                stats[combo][1] += 1
+    messages = []
+    for combo in combinations(sorted(signals), 2):
+        wins, loses = stats.get(combo, (0, 0))
+        if wins >= 3 and wins > loses:
+            messages.append(
+                f"✅ Связка '{combo[0]} + {combo[1]}' у тебя {wins} раз отрабатывала на профит — это хороший знак."
+            )
+        elif loses >= 3 and loses >= wins:
+            messages.append(
+                f"❌ А вот '{combo[0]} + {combo[1]}' в {loses} сделках подряд дала минус. Будь осторожен."
+            )
+    return "\n".join(messages)
+
+
+def _recommend_setup(strong: int, risk: float) -> str:
+    if strong >= 3 and risk < 30:
+        return (
+            "📊 Сетап близок к сильному. Следи за объёмами, "
+            "стоп под локальным минимумом, тейк на 2 уровня выше."
+        )
+    if risk > 60 or strong < 2:
+        return (
+            "📊 Сетап пока сырой. Я бы дождался объёма или повторного теста. "
+            "Стоп держи коротким."
+        )
+    return (
+        "📊 Можно рассмотреть вход, но усили его объёмом или ретестом. "
+        "Стоп под локальным минимумом, тейк на 2 уровня выше."
+    )
+
+
+def _build_ai_advice(uid: int, signals: list[str], strong: int, total: int, risk: float) -> str:
     header = (
         f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
         f"— Риск: {risk:.1f}%\n\n"
@@ -3531,7 +3604,14 @@ def _build_ai_advice(strong: int, total: int, risk: float) -> str:
             "🤔 Пока выглядит слабо. Я бы подождал более "
             "чётких сигналов."
         )
-    return header + body
+    parts = [header + body]
+    style = _analyze_trader_style(uid, risk, strong)
+    combos = _analyze_signal_combos(uid, signals)
+    rec = _recommend_setup(strong, risk)
+    for extra in (style, combos, rec):
+        if extra:
+            parts.append(extra)
+    return "\n\n".join(parts)
 
 
 async def maybe_send_ai_advice(uid: int, tid: int) -> None:
@@ -3550,7 +3630,7 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
         return
     total, strong, _, _ = signal_stats(sig_list)
     risk = float(risk)
-    text = "💡 Сетап оценён!\n\n" + _build_ai_advice(strong, total, risk)
+    text = "💡 Сетап оценён!\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
     await bot.send_message(uid, text)
 
 
@@ -4269,7 +4349,7 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
         f"⚪️ Слабые: {weak}",
         f"🛑 Риск по стопу: {risk:.1f}%",
     ]
-    text = "\n".join(parts) + "\n\n" + _build_ai_advice(strong, total, risk)
+    text = "\n".join(parts) + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
     kb = with_back(
         InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
