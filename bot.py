@@ -3506,10 +3506,14 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
         ttype = data.get("trade_type")
         trend_text = ""
         reco_block = ""
+        levels_block = ""
         if symbol and ttype:
             trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype)
             rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
+            levels_block = await _entry_exit_levels(symbol)
             reco_block = f"\n\n{rec_block}\n{verdict_line}"
+            if levels_block:
+                reco_block += f"\n\n{levels_block}"
         if trend_text:
             text += "\n\n" + trend_text + reco_block
         text += "\n\n" + _build_ai_advice(uid, signals, strong, total, float(risk or 0))
@@ -3883,6 +3887,49 @@ def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str]:
     return "\n".join(lines), verdict
 
 
+async def _entry_exit_levels(symbol: str) -> str:
+    candles = await _fetch_kline(symbol, "240", 30)
+    if not candles or len(candles) < 20:
+        return ""
+    candles = sorted(candles, key=lambda c: int(c[0]))[-30:]
+    highs = [float(c[2]) for c in candles]
+    lows = [float(c[3]) for c in candles]
+    vols = [float(c[5]) for c in candles]
+    avg_vol = sum(vols) / len(vols) if vols else 0
+
+    def last_swing(vals, cmp):
+        for i in range(len(vals) - 2, 0, -1):
+            if cmp(vals[i], vals[i - 1]) and cmp(vals[i], vals[i + 1]):
+                touches = sum(1 for v in vals if abs(v - vals[i]) / vals[i] < 0.002)
+                return vals[i], vols[i], touches
+        return None, None, None
+
+    high_val, high_vol, high_touch = last_swing(highs, lambda a, b: a > b)
+    low_val, low_vol, low_touch = last_swing(lows, lambda a, b: a < b)
+    if not high_val or not low_val:
+        return ""
+    step = 10 if max(high_val, low_val) >= 1000 else 5
+    hi_lvl = int(round(high_val / step) * step)
+    lo_lvl = int(round(low_val / step) * step)
+    if hi_lvl <= lo_lvl:
+        return ""
+    lines = []
+    desc = f"Следи за зоной {lo_lvl}–{hi_lvl}. Пробой вверх — можно входить."
+    notes = []
+    if high_vol and high_vol >= avg_vol * 1.5:
+        notes.append("сопротивление усилено объёмом")
+    if low_vol and low_vol >= avg_vol * 1.5:
+        notes.append("поддержка подтверждена объёмом")
+    if high_touch and high_touch > 1:
+        notes.append(f"верх тестировался {high_touch} раза")
+    if low_touch and low_touch > 1:
+        notes.append(f"низ тестировался {low_touch} раза")
+    if notes:
+        desc += " " + ", ".join(notes) + "."
+    lines.append("— " + desc)
+    lines.append(f"— Жди закрепа выше {hi_lvl} — для уверенного входа.")
+    lines.append(f"— Пробой вниз ниже {lo_lvl} — лучше не входить (риск усилится).")
+    return "📊 Уровни входа/выхода:\n" + "\n".join(lines)
 
 
 def _similar_trades_summary(
@@ -4104,10 +4151,11 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
     risk = float(risk)
     trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype)
     rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
+    levels_block = await _entry_exit_levels(symbol)
     trend_block = trend_text + f"\n\n{rec_block}\n{verdict_line}"
-    text = (
-        "💡 Сетап оценён!\n\n" + trend_block + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
-    )
+    if levels_block:
+        trend_block += f"\n\n{levels_block}"
+    text = "💡 Сетап оценён!\n\n" + trend_block + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
     await bot.send_message(uid, text)
 
 
@@ -4848,7 +4896,10 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
     ]
     trend_text, d_res, h_res = await _analyze_micro_trend(symbol, t_type)
     rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
+    levels_block = await _entry_exit_levels(symbol)
     trend_block = trend_text + f"\n\n{rec_block}\n{verdict_line}"
+    if levels_block:
+        trend_block += f"\n\n{levels_block}"
     text = "\n".join(parts) + "\n\n" + trend_block + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
     text += "\n\n" + _similar_trades_summary(uid, symbol, t_type, lev, total, sig_list, risk)
     kb = with_back(
