@@ -1841,27 +1841,17 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
             (uid,),
         ).fetchone()
         prefs = conn.execute(
-            "SELECT notify_stagnation, notify_targets, notify_risk FROM user_settings WHERE user_id=?",
+            "SELECT notify_stagnation FROM user_settings WHERE user_id=?",
             (uid,),
         ).fetchone()
-    ns, nt, nr = (prefs if prefs else (1, 1, 1))
+    ns = prefs[0] if prefs else 1
     buttons: list[list[InlineKeyboardButton]] = [
         [
             InlineKeyboardButton(
-                text=("✅ Стагнация" if ns else "❌ Стагнация"),
+                text=("💤 Стагнация" if ns else "❌ Стагнация"),
                 callback_data="notif_pref_stag",
-            ),
-            InlineKeyboardButton(
-                text=("✅ Цели" if nt else "❌ Цели"),
-                callback_data="notif_pref_tgt",
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                text=("✅ Риск" if nr else "❌ Риск"),
-                callback_data="notif_pref_risk",
             )
-        ],
+        ]
     ]
     for tid, sym, t_type, lev, enabled, pa_cnt in rows:
         lev_str = fmt_leverage(lev)
@@ -1904,46 +1894,6 @@ async def notif_pref_stag(cb: types.CallbackQuery):
         ).fetchone()[0]
         conn.execute(
             "UPDATE user_settings SET notify_stagnation=? WHERE user_id=?",
-            (0 if val else 1, uid),
-        )
-        conn.commit()
-    await show_notifications_menu(uid, cb.message)
-
-
-@dp.callback_query(F.data == "notif_pref_tgt")
-async def notif_pref_tgt(cb: types.CallbackQuery):
-    await cb.answer()
-    if not await require_basic(cb.message, cb.from_user.id):
-        return
-    uid = cb.from_user.id
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)", (uid,))
-        val = conn.execute(
-            "SELECT notify_targets FROM user_settings WHERE user_id=?",
-            (uid,),
-        ).fetchone()[0]
-        conn.execute(
-            "UPDATE user_settings SET notify_targets=? WHERE user_id=?",
-            (0 if val else 1, uid),
-        )
-        conn.commit()
-    await show_notifications_menu(uid, cb.message)
-
-
-@dp.callback_query(F.data == "notif_pref_risk")
-async def notif_pref_risk(cb: types.CallbackQuery):
-    await cb.answer()
-    if not await require_basic(cb.message, cb.from_user.id):
-        return
-    uid = cb.from_user.id
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)", (uid,))
-        val = conn.execute(
-            "SELECT notify_risk FROM user_settings WHERE user_id=?",
-            (uid,),
-        ).fetchone()[0]
-        conn.execute(
-            "UPDATE user_settings SET notify_risk=? WHERE user_id=?",
             (0 if val else 1, uid),
         )
         conn.commit()
