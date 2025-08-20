@@ -6,7 +6,6 @@ import time
 import hmac
 import hashlib
 from urllib.parse import urlencode
-from aiogram import F
 import aiohttp
 from datetime import datetime, timedelta
 import calendar
@@ -466,13 +465,6 @@ def set_automation(uid: int, enabled: bool) -> None:
             (uid, int(enabled)),
         )
         conn.commit()
-# -------- RESTART
-@dp.callback_query(F.data == "restart")
-async def cb_restart(cb: types.CallbackQuery, state: FSMContext):
-    await cb.answer()                       # закрыли «часики»
-    await state.clear()                     # сбросили FSM
-    # вызываем вашу функцию главного меню
-    await go_home(cb.from_user.id, state)   # или отправь /start-меню вручную
 
 # ---------- STATES ----------
 class TradeState(StatesGroup):
