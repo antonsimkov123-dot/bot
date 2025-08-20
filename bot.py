@@ -3347,10 +3347,14 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
         return
     data = await state.get_data()
     signals = data.get("signals", [])
-    total = sum(SIGNAL_STARS.get(n, 0) for n in signals)
-    strong = sum(1 for n in signals if SIGNAL_STARS.get(n, 0) >= 3)
+    total, strong, medium, weak = signal_stats(signals)
     risk = data.get("risk")
-    parts = [f"⭐️ Звёзд: {total}", f"🔥 Сильных сигналов: {strong}"]
+    parts = [
+        f"⭐️ Звёзд: {total}",
+        f"🔥 Сильных сигналов: {strong}",
+        f"🟡 Средние: {medium}",
+        f"⚪️ Слабые: {weak}",
+    ]
     if risk is not None:
         parts.append(f"🛑 Риск по стопу: {risk:.1f}%")
     text = "\n".join(parts) + "\n\n"
