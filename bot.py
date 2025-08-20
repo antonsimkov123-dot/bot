@@ -3663,13 +3663,23 @@ async def _micro_trend_tf(symbol: str, interval: str) -> dict:
     vols = [float(c[5]) for c in candles][-used:]
     price = closes[-1]
 
-    slope_pct = (closes[-1] - closes[0]) / closes[0] * 100 if closes[0] else 0
+    # EMA-based slope to smooth noise
+    k = 2 / (50 + 1)
+    ema_vals: list[float] = []
+    ema = closes[0]
+    ema_vals.append(ema)
+    for c in closes[1:]:
+        ema = c * k + ema * (1 - k)
+        ema_vals.append(ema)
+    slope_pct = (ema_vals[-1] - ema_vals[0]) / ema_vals[0] * 100 if ema_vals[0] else 0
+
     up_pairs = sum(
         h2 > h1 and l2 > l1 for h1, h2, l1, l2 in zip(highs, highs[1:], lows, lows[1:])
     )
     down_pairs = sum(
         h2 < h1 and l2 < l1 for h1, h2, l1, l2 in zip(highs, highs[1:], lows, lows[1:])
     )
+    total_pairs = max(used - 1, 1)
     range_ratio = (max(highs) - min(lows)) / price if price else 0
 
     recent = sum(vols[-25:]) / 25
@@ -3682,18 +3692,26 @@ async def _micro_trend_tf(symbol: str, interval: str) -> dict:
         vol_dir = "flat"
 
     slope_dir = "up" if slope_pct > 1 else "down" if slope_pct < -1 else "flat"
-    struct_dir = "up" if up_pairs >= down_pairs + 5 else "down" if down_pairs >= up_pairs + 5 else "mixed"
+    struct_raw = (
+        "up" if up_pairs > down_pairs else "down" if down_pairs > up_pairs else "mixed"
+    )
+    up_ratio = up_pairs / total_pairs
+    down_ratio = down_pairs / total_pairs
+    struct_major = "up" if up_ratio >= 0.6 else "down" if down_ratio >= 0.6 else "mixed"
 
-    votes_up = (slope_dir == "up") + (struct_dir == "up") + (vol_dir == "up")
-    votes_down = (slope_dir == "down") + (struct_dir == "down") + (vol_dir == "down")
-    if votes_up >= 2 and votes_up > votes_down:
-        trend = "up"
-    elif votes_down >= 2 and votes_down > votes_up:
-        trend = "down"
-    elif abs(slope_pct) < 1 and range_ratio < 0.03:
-        trend = "flat"
+    if struct_major in {"up", "down"}:
+        trend = struct_major
     else:
-        trend = "uncertain"
+        votes_up = (slope_dir == "up") + (struct_raw == "up") + (vol_dir == "up")
+        votes_down = (slope_dir == "down") + (struct_raw == "down") + (vol_dir == "down")
+        if votes_up >= 2 and votes_up > votes_down:
+            trend = "up"
+        elif votes_down >= 2 and votes_down > votes_up:
+            trend = "down"
+        elif abs(slope_pct) < 1 and range_ratio < 0.03:
+            trend = "flat"
+        else:
+            trend = "uncertain"
 
     return {
         "trend": trend,
@@ -3703,7 +3721,9 @@ async def _micro_trend_tf(symbol: str, interval: str) -> dict:
         "up": up_pairs,
         "down": down_pairs,
         "vol": vol_dir,
-        "struct": struct_dir,
+        "struct": struct_raw,
+        "struct_major": struct_major,
+        "slope_dir": slope_dir,
     }
 
 
@@ -3717,38 +3737,72 @@ def _trend_text(label: str, data: dict) -> str:
     slope = data.get("slope", 0)
     up = data.get("up", 0)
     down = data.get("down", 0)
-    vol = data.get("vol", "flat")
+    vol_dir = data.get("vol", "flat")
     struct = data.get("struct", "mixed")
+    struct_major = data.get("struct_major", "mixed")
+    slope_dir = data.get("slope_dir", "flat")
     total_pairs = max(used - 1, 1)
 
     vol_phrase = {
         "up": "объёмы растут",
         "down": "объёмы падают",
         "flat": "объёмы без изменений",
-    }.get(vol, "объёмы без изменений")
+    }.get(vol_dir, "объёмы без изменений")
 
     if struct == "up":
         struct_phrase = f"{up} из {total_pairs} HH/HL"
     elif struct == "down":
         struct_phrase = f"{down} из {total_pairs} LH/LL"
     else:
-        struct_phrase = f"структура смешанная ({up}/{down})"
+        struct_phrase = f"{up} HH/HL / {down} LH/LL"
 
-    slope_str = f"наклон {slope:+.1f}%"
-    price_str = f"цена {price:.4f}"
+    slope_str = f"наклон: {slope:+.1f}%"
+    price_str = f"цена: {price:.4f}"
+    struct_str = f"структура: {struct_phrase}"
 
-    if trend == "up":
-        label_text = "⬆️ Восходящий"
-    elif trend == "down":
-        label_text = "⬇️ Нисходящий"
+    if trend in {"up", "down"}:
+        arrow = "⬆️" if trend == "up" else "⬇️"
+        base = "Восходящий" if trend == "up" else "Нисходящий"
+        if struct_major == trend and (
+            slope_dir != trend or vol_dir != trend
+        ):
+            label_text = f"{arrow} {base} (по структуре)"
+        else:
+            label_text = f"{arrow} {base}"
+        support: list[str] = []
+        if struct == trend:
+            support.append("структура")
+        if slope_dir == trend:
+            support.append("наклон")
+        if vol_dir == trend:
+            support.append("объёмы")
+        if struct_major != trend and support:
+            label_text += " (" + " и ".join(support) + ")"
+        weak: list[str] = []
+        if struct != "mixed" and struct != trend:
+            weak.append("структура противоречит")
+        if slope_dir != trend:
+            weak.append("наклон слабый" if slope_dir == "flat" else "наклон против")
+        if vol_dir != trend:
+            if vol_dir == "flat":
+                weak.append("объёмы не поддерживают")
+            elif trend == "up":
+                weak.append("объёмы падают")
+            else:
+                weak.append("объёмы растут — возможен отскок")
+        if weak:
+            label_text += ", но " + " и ".join(weak)
     elif trend == "flat":
         label_text = "⏸️ Боковик"
     else:
-        label_text = "❓ Неопределённый"
+        extra = "структура смешанная"
+        if abs(slope) < 1:
+            extra += ", наклон близок к 0%"
+        label_text = f"❓ Неопределённый — {extra}, {vol_phrase}"
 
     return (
-        f"📊 Тренд по {label}: {label_text} "
-        f"({price_str}, {slope_str}, {struct_phrase}, {vol_phrase}; анализ по {used} свечам)"
+        f"📊 Тренд по {label}: {label_text}\n"
+        f"({price_str}, {slope_str}, {struct_str}, {vol_phrase}; анализ по {used} свечам)"
     )
 
 
