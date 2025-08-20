@@ -2169,6 +2169,10 @@ def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📈 Профиль", callback_data="profile")],
         [InlineKeyboardButton(text="🏆 Рейтинг трейдеров", callback_data="rating")],
         [
+            InlineKeyboardButton(text="📚 Codex", callback_data="codex"),
+            InlineKeyboardButton(text="❓ Помощь", callback_data="help"),
+        ],
+        [
             InlineKeyboardButton(text="📦 Сделки", callback_data="trades_menu"),
             InlineKeyboardButton(text="📊 Отчёты", callback_data="reports"),
         ],
@@ -2610,6 +2614,32 @@ async def rating_detail(cb: types.CallbackQuery):
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="rating")]]
     )
     await cb.message.answer(text, reply_markup=with_back(kb))
+
+
+def dev_placeholder_kb(back_cb: str) -> InlineKeyboardMarkup:
+    return with_back(
+        InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)]]
+        )
+    )
+
+
+async def send_dev_placeholder(message: types.Message, back_cb: str) -> None:
+    await message.answer(
+        "🚧 Функция в разработке.", reply_markup=dev_placeholder_kb(back_cb)
+    )
+
+
+@dp.callback_query(F.data == "codex")
+async def show_codex(cb: types.CallbackQuery):
+    await cb.answer()
+    await send_dev_placeholder(cb.message, "main_menu")
+
+
+@dp.callback_query(F.data == "help")
+async def show_help(cb: types.CallbackQuery):
+    await cb.answer()
+    await send_dev_placeholder(cb.message, "main_menu")
 
 
 @dp.callback_query(F.data == "trades_menu")
@@ -3422,18 +3452,7 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
     ]
     if risk is not None:
         parts.append(f"🛑 Риск по стопу: {risk:.1f}%")
-    text = "\n".join(parts) + "\n\n"
-    if strong < 2 or total < 6:
-        text += (
-            f"⚠️ Внимание: Мало сильных сигналов ({strong} из 3).\n"
-            f"Всего {total} звёзд — сделка выглядит слабой.\n"
-            "Уверен, что хочешь продолжать?"
-        )
-    else:
-        text += (
-            "💡 Отличная сделка: сильные сигналы + адекватный риск.\n"
-            "Совет: убедись, что нет сопротивления выше цели."
-        )
+    text = "\n".join(parts) + "\n\n" + _build_ai_advice(strong, total, float(risk or 0))
     await cb.message.answer(text)
 
 
@@ -3489,6 +3508,32 @@ async def ask_notifications(uid: int, trade_id: int, state: FSMContext) -> None:
     await state.set_state(NotifyState.ask)
 
 
+def _build_ai_advice(strong: int, total: int, risk: float) -> str:
+    header = (
+        f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
+        f"— Риск: {risk:.1f}%\n\n"
+        "📊 Анализ:\n"
+    )
+    if risk > 60 and strong < 2:
+        body = "❌ Сетап опасный. Я бы не входил. Подожди подтверждений."
+    elif 30 <= risk <= 50 and strong >= 2:
+        body = (
+            "⚠️ Сетап нестабильный, но может выстрелить. "
+            "Входи только частично и со стопом."
+        )
+    elif risk < 30 and strong >= 3:
+        body = (
+            "✅ Сетап сильный. Хороший шанс на профит. "
+            "Следи за объёмами."
+        )
+    else:
+        body = (
+            "🤔 Пока выглядит слабо. Я бы подождал более "
+            "чётких сигналов."
+        )
+    return header + body
+
+
 async def maybe_send_ai_advice(uid: int, tid: int) -> None:
     if not is_automation_enabled(uid):
         return
@@ -3505,25 +3550,7 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
         return
     total, strong, _, _ = signal_stats(sig_list)
     risk = float(risk)
-    if strong >= 2 and risk <= 10:
-        text = (
-            "💡 Сетап оценён!\n\n"
-            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
-            f"— Риск: {risk:.1f}%\n\n"
-            "📊 Анализ:\n"
-            "✅ Отличное соотношение сигналов и риска.\n"
-            "💬 Совет: проверь объёмы на 4H, возможен откат."
-        )
-    else:
-        text = (
-            "⚠️ Осторожно: слабый сетап\n\n"
-            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
-            f"— Риск: {risk:.1f}%\n\n"
-            "📊 Анализ:\n"
-            "❌ Недостаточно подтверждающих сигналов.\n"
-            "🔺 Повышенный риск.\n"
-            "💬 Совет: дождись ретеста или усиливающего сигнала."
-        )
+    text = "💡 Сетап оценён!\n\n" + _build_ai_advice(strong, total, risk)
     await bot.send_message(uid, text)
 
 
