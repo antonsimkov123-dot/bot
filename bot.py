@@ -3651,14 +3651,14 @@ async def _fetch_kline(symbol: str, interval: str, limit: int = 7) -> list:
     return []
 
 
-async def _micro_trend_tf(symbol: str, interval: str) -> dict:
-    candles = await _fetch_kline(symbol, interval, 60)
+async def _micro_trend_tf(symbol: str, interval: str, limit: int = 50) -> dict:
+    candles = await _fetch_kline(symbol, interval, limit + 10)
     if not candles:
         return {"trend": "nodata", "used": 0}
-    # ensure chronological order and keep latest 50
-    candles = sorted(candles, key=lambda c: int(c[0]))[-50:]
+    # ensure chronological order and keep latest `limit` candles
+    candles = sorted(candles, key=lambda c: int(c[0]))[-limit:]
     used = len(candles)
-    if used < 50:
+    if used < limit:
         return {"trend": "nodata", "used": used}
 
     closes = [float(c[4]) for c in candles]
@@ -3668,7 +3668,7 @@ async def _micro_trend_tf(symbol: str, interval: str) -> dict:
     price = closes[-1]
 
     # EMA-based slope to smooth noise
-    k = 2 / (50 + 1)
+    k = 2 / (limit + 1)
     ema_vals: list[float] = []
     ema = closes[0]
     ema_vals.append(ema)
@@ -3695,8 +3695,9 @@ async def _micro_trend_tf(symbol: str, interval: str) -> dict:
         total_pairs = 1
     range_ratio = (max(highs) - min(lows)) / price if price else 0
 
-    recent = sum(vols[-25:]) / 25
-    prev = sum(vols[:25]) / 25 if len(vols) >= 50 else recent
+    half = used // 2 or 1
+    recent = sum(vols[-half:]) / half
+    prev = sum(vols[:half]) / half
     if recent > prev * 1.1:
         vol_dir = "up"
     elif recent < prev * 0.9:
@@ -3829,8 +3830,8 @@ def _trend_text(label: str, data: dict) -> str:
 
 
 async def _analyze_micro_trend(symbol: str, ttype: str) -> str:
-    d_data = await _micro_trend_tf(symbol, "D")
-    h_data = await _micro_trend_tf(symbol, "240")
+    d_data = await _micro_trend_tf(symbol, "D", 50)
+    h_data = await _micro_trend_tf(symbol, "240", 20)
     daily = _trend_text("1D", d_data)
     h4 = _trend_text("4H", h_data)
     if d_data.get("trend") == "down" and h_data.get("trend") == "up":
