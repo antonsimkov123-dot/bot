@@ -3503,11 +3503,14 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
     symbol = data.get("symbol")
     ttype = data.get("trade_type")
     trend_text = ""
+    reco_block = ""
     if symbol and ttype:
-        trend_text = await _analyze_micro_trend(symbol, ttype)
+        trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype)
+        rec_lines, verdict_line = _trend_recommendations(ttype, d_res, h_res)
+        reco_block = f"\n\n🧠 Рекомендации:\n{rec_lines}\n{verdict_line}"
     text = "\n".join(parts)
     if trend_text:
-        text += "\n\n" + trend_text
+        text += "\n\n" + trend_text + reco_block
     text += "\n\n" + _build_ai_advice(cb.from_user.id, signals, strong, total, float(risk or 0))
     await cb.message.answer(text)
 
@@ -3798,7 +3801,7 @@ def _trend_line(name: str, limit: int, data: dict) -> str:
     return f"🔵 {name} ({limit} свечей): {arrow} ({price_str}, {slope_str}, {struct_phrase}, {vol_phrase})"
 
 
-async def _analyze_micro_trend(symbol: str, ttype: str) -> str:
+async def _analyze_micro_trend(symbol: str, ttype: str) -> tuple[str, dict, dict]:
     d_res: dict[str, dict] = {}
     for lvl, lim in TREND_WINDOWS["D"].items():
         d_res[lvl] = await _micro_trend_tf(symbol, "D", lim)
@@ -3819,7 +3822,69 @@ async def _analyze_micro_trend(symbol: str, ttype: str) -> str:
     elif d_res["global"].get("trend") == "up" and h_res["global"].get("trend") == "down":
         h_lines[1] = h_lines[1].replace("⬇️ Нисходящий", "⬇️ Нисходящий откат в восходящем тренде")
 
-    return "\n".join(d_lines) + "\n\n" + "\n".join(h_lines)
+    text = "\n".join(d_lines) + "\n\n" + "\n".join(h_lines)
+    return text, d_res, h_res
+
+
+def _trend_recommendations(ttype: str, d_res: dict, h_res: dict) -> tuple[str, str]:
+    d = d_res.get("global", {})
+    h = h_res.get("global", {})
+    d_tr = d.get("trend", "uncertain")
+    h_tr = h.get("trend", "uncertain")
+    if d_tr == "nodata":
+        d_tr = "uncertain"
+    if h_tr == "nodata":
+        h_tr = "uncertain"
+
+    lines: list[str] = []
+    verdict = "wait"
+    if d_tr in {"up", "down"} and h_tr in {"up", "down"} and d_tr != h_tr:
+        lines.append("Тренды 1D и 4H противоречат — возможен откат.")
+        if ttype.lower() == "long":
+            if d_tr == "up":
+                lines.append("Жди, пока 4H развернётся вверх перед входом в лонг.")
+            else:
+                lines.append("Лонг против дневного тренда — рискованно.")
+        else:
+            if d_tr == "down":
+                lines.append("Жди, пока 4H развернётся вниз перед входом в шорт.")
+            else:
+                lines.append("Шорт против дневного тренда — рискованно.")
+    elif d_tr in {"up", "down"} and d_tr == h_tr:
+        lines.append(
+            f"Тренды согласованы — {'рост' if d_tr=='up' else 'падение'} на 1D и 4H."
+        )
+        if (ttype.lower() == "long" and d_tr == "up") or (
+            ttype.lower() == "short" and d_tr == "down"
+        ):
+            verdict = "ok"
+        else:
+            verdict = "no"
+    else:
+        lines.append("Направление тренда неясно.")
+
+    for name, res in [("1D", d), ("4H", h)]:
+        vol = res.get("vol")
+        if vol == "down":
+            lines.append(f"{name}: объёмы падают — риски высоки.")
+        elif vol == "up":
+            lines.append(f"{name}: объёмы растут — тренд поддержан.")
+        slope = res.get("slope", 0)
+        if abs(slope) < 1 and res.get("trend") in {"up", "down"}:
+            lines.append(f"{name}: наклон слабеет — возможно замедление тренда.")
+
+    if ttype.lower() == "long" and verdict != "no":
+        lines.append("Жди закрепа выше уровня перед входом в лонг.")
+    elif ttype.lower() == "short" and verdict != "no":
+        lines.append("Жди закрепа ниже уровня перед входом в шорт.")
+
+    verdict_line = {
+        "ok": "✅ Вердикт: Вход возможен",
+        "wait": "⚠️ Вердикт: Ждать подтверждения",
+        "no": "❌ Вердикт: Сделка не рекомендуется",
+    }.get(verdict, "⚠️ Вердикт: Ждать подтверждения")
+
+    return "\n".join(f"– {l}" for l in lines), verdict_line
 
 
 def _similar_trades_summary(
@@ -4028,18 +4093,23 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
         if not pref or not pref[0]:
             return
         row = conn.execute(
-            "SELECT signals, signal_stars, risk_percent FROM trades WHERE id=? AND user_id=?",
+            "SELECT signals, signal_stars, risk_percent, symbol, trade_type FROM trades WHERE id=? AND user_id=?",
             (tid, uid),
         ).fetchone()
     if not row:
         return
-    signals, stars, risk = row
+    signals, stars, risk, symbol, ttype = row
     sig_list = [s for s in (signals or "").split(";") if s]
-    if not sig_list or not risk:
+    if not sig_list or not risk or not symbol or not ttype:
         return
     total, strong, _, _ = signal_stats(sig_list)
     risk = float(risk)
-    text = "💡 Сетап оценён!\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
+    trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype)
+    rec_lines, verdict_line = _trend_recommendations(ttype, d_res, h_res)
+    trend_block = trend_text + f"\n\n🧠 Рекомендации:\n{rec_lines}\n{verdict_line}"
+    text = (
+        "💡 Сетап оценён!\n\n" + trend_block + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
+    )
     await bot.send_message(uid, text)
 
 
@@ -4778,8 +4848,10 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
        f"⚪️ Слабые: {weak}",
        f"🛑 Риск по стопу: {risk:.1f}%",
     ]
-    trend_text = await _analyze_micro_trend(symbol, t_type)
-    text = "\n".join(parts) + "\n\n" + trend_text + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
+    trend_text, d_res, h_res = await _analyze_micro_trend(symbol, t_type)
+    rec_lines, verdict_line = _trend_recommendations(t_type, d_res, h_res)
+    trend_block = trend_text + f"\n\n🧠 Рекомендации:\n{rec_lines}\n{verdict_line}"
+    text = "\n".join(parts) + "\n\n" + trend_block + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
     text += "\n\n" + _similar_trades_summary(uid, symbol, t_type, lev, total, sig_list, risk)
     kb = with_back(
         InlineKeyboardMarkup(
