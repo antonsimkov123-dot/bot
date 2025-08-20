@@ -375,15 +375,6 @@ def set_subscription(uid: int, sub: str) -> None:
             (uid, sub),
         )
         conn.commit()
-        if "notify_stagnation" not in us_cols:
-            cur.execute("ALTER TABLE user_settings ADD COLUMN notify_stagnation INTEGER DEFAULT 1")
-            conn.commit()
-        if "notify_targets" not in us_cols:
-            cur.execute("ALTER TABLE user_settings ADD COLUMN notify_targets INTEGER DEFAULT 1")
-            conn.commit()
-        if "notify_risk" not in us_cols:
-            cur.execute("ALTER TABLE user_settings ADD COLUMN notify_risk INTEGER DEFAULT 1")
-            conn.commit()
 
 
 async def require_subscription(message: types.Message, uid: int) -> bool:
