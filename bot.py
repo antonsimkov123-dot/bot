@@ -5005,7 +5005,7 @@ async def reset_setup_analysis(cb: types.CallbackQuery):
 
 # ---------- CHARTS ----------
 @dp.callback_query(lambda c: c.data == "charts")
-async def charts(cb: types.CallbackQuery):
+async def charts(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     if not await require_subscription(cb.message, cb.from_user.id):
         return
@@ -5063,14 +5063,8 @@ async def charts(cb: types.CallbackQuery):
     await bot.send_photo(uid, FSInputFile(p1), caption="📊 PNL по неделям")
     await bot.send_photo(uid, FSInputFile(p2), caption="⚠️ Частота стопов")
     await bot.send_photo(uid, FSInputFile(p3), caption="🏆 Винрейт по типу")
-    # -------- кнопка «Перезапустить» --------
-    kb_restart = InlineKeyboardMarkup(
-    inline_keyboard=[
-        [InlineKeyboardButton(text="🔄 Перезапустить бота", callback_data="restart")]
-    ]
-    
-)
-    await bot.send_message(cb.from_user.id, "Готово! 😊", reply_markup=kb_restart)
+    await cb.message.answer("✅ Готово!")
+    await go_home(uid, state)
 
 # ---------- RUN ----------
 async def main():
