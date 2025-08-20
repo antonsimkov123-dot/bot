@@ -3651,42 +3651,68 @@ async def _fetch_kline(symbol: str, interval: str, limit: int = 7) -> list:
     return []
 
 
-async def _micro_trend_tf(symbol: str, interval: str, label: str, limit: int) -> str:
-    candles = await _fetch_kline(symbol, interval, limit)
-    used = min(len(candles), limit)
-    if used < 5:
-        return f"📊 Тренд по {label}: недостаточно данных ({used} свечей)"
+async def _micro_trend_tf(symbol: str, interval: str) -> tuple[str, int, str]:
+    candles = await _fetch_kline(symbol, interval, 60)
+    used = min(len(candles), 50)
+    if used < 50:
+        return "nodata", used, ""
+    closes = [float(c[4]) for c in candles][-used:]
     highs = [float(c[2]) for c in candles][-used:]
     lows = [float(c[3]) for c in candles][-used:]
     vols = [float(c[5]) for c in candles][-used:]
-    up = all(
+
+    slope = (closes[-1] - closes[0]) / closes[0]
+    up_pairs = sum(
         h2 > h1 and l2 > l1 for h1, h2, l1, l2 in zip(highs, highs[1:], lows, lows[1:])
     )
-    down = all(
+    down_pairs = sum(
         h2 < h1 and l2 < l1 for h1, h2, l1, l2 in zip(highs, highs[1:], lows, lows[1:])
     )
+    range_ratio = (max(highs) - min(lows)) / closes[-1] if closes[-1] else 0
+
+    recent = sum(vols[-25:]) / 25
+    prev = sum(vols[:25]) / 25 if len(vols) >= 50 else recent
     vol_note = ""
-    vol_ok = True
-    if len(vols) >= 6:
-        recent = sum(vols[-3:]) / 3
-        prev = sum(vols[:3]) / 3
-        if recent > prev * 1.1:
-            vol_note = " — объёмы растут"
-        elif recent < prev * 0.9:
-            vol_note = " — объёмы снижаются"
-            vol_ok = False
-    if up and vol_ok:
-        return f"📊 Тренд по {label}: Растущий (анализ за {used} свечей){vol_note}"
-    if down and vol_ok:
-        return f"📊 Тренд по {label}: Нисходящий (анализ за {used} свечей){vol_note}"
-    if label == "1D":
-        return f"📊 Тренд по 1D: цена в диапазоне (анализ за {used} свечей)"
-    return f"📊 Тренд по 4H: недостаточно тренда за последние {used} свечей"
+    vol_trend = True
+    if recent > prev * 1.1:
+        vol_note = " — объёмы растут"
+    elif recent < prev * 0.9:
+        vol_note = " — объёмы снижаются"
+        vol_trend = False
+
+    if slope > 0.02 and up_pairs > down_pairs and vol_trend:
+        trend = "up"
+    elif slope < -0.02 and down_pairs > up_pairs and vol_trend:
+        trend = "down"
+    elif abs(slope) < 0.01 and range_ratio < 0.03:
+        trend = "flat"
+    else:
+        trend = "uncertain"
+    return trend, used, vol_note
+
+
+def _trend_text(label: str, trend: str, used: int, vol_note: str) -> str:
+    if trend == "nodata":
+        return f"📊 Тренд по {label}: недостаточно данных ({used} свечей)"
+    if trend == "up":
+        return f"📊 Тренд по {label}: Восходящий (анализ по {used} свечам){vol_note}"
+    if trend == "down":
+        return f"📊 Тренд по {label}: Нисходящий (анализ по {used} свечам){vol_note}"
+    if trend == "flat":
+        return f"📊 Тренд по {label}: Боковик (анализ по {used} свечам)"
+    return f"📊 Тренд по {label}: Неопределённый тренд. Есть сигналы как вверх, так и вниз (анализ по {used} свечам)"
 
 
 async def _analyze_micro_trend(symbol: str, ttype: str) -> str:
-    daily = await _micro_trend_tf(symbol, "D", "1D", 14)
-    h4 = await _micro_trend_tf(symbol, "240", "4H", 20)
+    d_trend, d_used, d_vol = await _micro_trend_tf(symbol, "D")
+    h_trend, h_used, h_vol = await _micro_trend_tf(symbol, "240")
+    daily = _trend_text("1D", d_trend, d_used, d_vol)
+    if d_trend == "down" and h_trend == "up":
+        h4 = f"📊 Тренд по 4H: Восходящий откат в нисходящем тренде (анализ по {h_used} свечам){h_vol}"
+    elif d_trend == "up" and h_trend == "down":
+        h4 = f"📊 Тренд по 4H: Нисходящий откат в восходящем тренде (анализ по {h_used} свечам){h_vol}"
+    else:
+        h4 = _trend_text("4H", h_trend, h_used, h_vol)
     return f"{daily}\n{h4}"
 
 
