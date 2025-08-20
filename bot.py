@@ -1595,6 +1595,8 @@ MISTAKE_OPTIONS = [
     ("🤯 Эмоциональный вход", "Эмоциональный вход"),
     ("🔁 Перезаход", "Перезаход"),
     ("📉 Против тренда", "Против тренда"),
+    ("📊 Игнор объёма", "Игнор объёма"),
+    ("📈 Вход на хаях", "Вход на хаях"),
     ("🧠 Не по системе", "Не по системе"),
     ("🕒 Передержал", "Передержал"),
 ]
@@ -3630,7 +3632,7 @@ def build_habits_report(uid: int) -> str:
             (uid, start_today.isoformat()),
         ).fetchall()
         week_rows = conn.execute(
-            "SELECT signal_stars, risk_percent, mistake_reason FROM trades WHERE user_id=? AND entry_date>=? AND COALESCE(is_deleted,0)=0",
+            "SELECT signal_stars, risk_percent, mistake_reason, targets FROM trades WHERE user_id=? AND entry_date>=? AND COALESCE(is_deleted,0)=0",
             (uid, start_week.isoformat()),
         ).fetchall()
         combo_rows = conn.execute(
@@ -3639,12 +3641,27 @@ def build_habits_report(uid: int) -> str:
         ).fetchall()
     today_no_conf = sum(1 for s, r in today_rows if (s or 0) < 6)
     today_high_risk = sum(1 for s, r in today_rows if (r or 0) > 25)
-    week_no_conf = sum(1 for s, r, _ in week_rows if (s or 0) < 6)
-    week_high_risk = sum(1 for s, r, _ in week_rows if (r or 0) > 25)
-    mistakes = defaultdict(int)
-    for _, _, m in week_rows:
-        if m:
-            mistakes[m] += 1
+    week_no_conf = sum(1 for s, r, _, _ in week_rows if (s or 0) < 6)
+    week_high_risk = sum(1 for s, r, _, _ in week_rows if (r or 0) > 25)
+    err_counts = defaultdict(int)
+    for s, r, m, t in week_rows:
+        errs = set()
+        if (s or 0) < 6:
+            errs.add("Слабые сигналы")
+        if r and r > 50:
+            errs.add("Риск выше 50%")
+        if not t:
+            errs.add("Отсутствует тейк")
+        if m == "Не дождался ретеста":
+            errs.add("Вход без ретеста")
+        elif m == "Против тренда":
+            errs.add("Игнор тренда")
+        elif m == "Вход на хаях":
+            errs.add("Вход на хаях")
+        elif m == "Игнор объёма":
+            errs.add("Игнор объёма")
+        for e in errs:
+            err_counts[e] += 1
     combo_stats: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
     for sigs, prof in combo_rows:
         if not sigs:
@@ -3673,14 +3690,17 @@ def build_habits_report(uid: int) -> str:
         lines.append(
             f"📉 Сделки с риском выше 25% — {week_high_risk} раза за неделю. Пересмотри управление рисками."
         )
-    for m, c in sorted(mistakes.items(), key=lambda x: x[1], reverse=True):
-        if c >= 2:
-            lines.append(f"🔁 Повторяешь ошибку: '{m}' — {c} раза.")
     if worst_combo:
         combo, losses = worst_combo
         lines.append(
             f"🔁 Повторяешь неудачную связку: '{combo[0]} + {combo[1]}' — уже {losses} убытков подряд."
         )
+    if err_counts:
+        lines.append("❌ Повторяешь ошибки:")
+        for name, cnt in sorted(err_counts.items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"– «{name}» — {cnt} раз{'' if cnt==1 else 'а'}")
+    else:
+        lines.append("✅ Ошибок не найдено — продолжаем в том же духе.")
     return "\n".join(lines)
 
 
