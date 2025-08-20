@@ -93,6 +93,13 @@ MONTHS_RU_GEN = [
     "декабря",
 ]
 
+TREND_WINDOWS = {
+    "D": {"global": 50, "local": 20, "scalp": 10},
+    "240": {"global": 50, "local": 20, "scalp": 10},
+}
+
+TREND_LEVELS = {"global": "Глобальный", "local": "Локальный", "scalp": "Скальп"}
+
 # ---------- DATABASE ----------
 def init_db() -> None:
     conn = sqlite3.connect(DB_PATH)
@@ -3750,11 +3757,11 @@ async def _micro_trend_tf(symbol: str, interval: str, limit: int = 50) -> dict:
     }
 
 
-def _trend_text(label: str, data: dict) -> str:
+def _trend_line(name: str, limit: int, data: dict) -> str:
     trend = data.get("trend")
     used = data.get("used", 0)
     if trend == "nodata":
-        return f"📊 Тренд по {label}: недостаточно данных ({used} свечей)"
+        return f"🔵 {name} ({used}/{limit} свечей): ❓ Недостаточно данных"
 
     price = data.get("price", 0)
     slope = data.get("slope", 0)
@@ -3762,83 +3769,57 @@ def _trend_text(label: str, data: dict) -> str:
     down = data.get("down", 0)
     vol_dir = data.get("vol", "flat")
     struct = data.get("struct", "mixed")
-    struct_major = data.get("struct_major", "mixed")
-    slope_dir = data.get("slope_dir", "flat")
     total_pairs = data.get("pairs", max(used - 1, 1))
+
+    struct_phrase = (
+        f"структура: {up}/{total_pairs} HH/HL"
+        if struct == "up"
+        else f"структура: {down}/{total_pairs} LH/LL"
+        if struct == "down"
+        else f"структура: {up} HH/HL / {down} LH/LL"
+    )
 
     vol_phrase = {
         "up": "объёмы растут",
         "down": "объёмы падают",
-        "flat": "объёмы без изменений",
+        "flat": "объёмы стабильны",
     }.get(vol_dir, "объёмы без изменений")
 
-    if struct == "up":
-        struct_phrase = f"{up} из {total_pairs} HH/HL"
-    elif struct == "down":
-        struct_phrase = f"{down} из {total_pairs} LH/LL"
-    else:
-        struct_phrase = f"{up} HH/HL / {down} LH/LL"
+    arrow = {
+        "up": "⬆️ Восходящий",
+        "down": "⬇️ Нисходящий",
+        "flat": "⏸️ Боковик",
+        "uncertain": "❓ Неопределённый",
+    }.get(trend, "❓ Неопределённый")
 
-    slope_str = f"наклон: {slope:+.1f}%"
     price_str = f"цена: {price:.4f}"
-    struct_str = f"структура: {struct_phrase}"
+    slope_str = f"наклон: {slope:+.1f}%"
 
-    if trend in {"up", "down"}:
-        arrow = "⬆️" if trend == "up" else "⬇️"
-        base = "Восходящий" if trend == "up" else "Нисходящий"
-        if struct_major == trend and (
-            slope_dir != trend or vol_dir != trend
-        ):
-            label_text = f"{arrow} {base} (по структуре)"
-        else:
-            label_text = f"{arrow} {base}"
-        support: list[str] = []
-        if struct == trend:
-            support.append("структура")
-        if slope_dir == trend:
-            support.append("наклон")
-        if vol_dir == trend:
-            support.append("объёмы")
-        if struct_major != trend and support:
-            label_text += " (" + " и ".join(support) + ")"
-        weak: list[str] = []
-        if struct != "mixed" and struct != trend:
-            weak.append("структура противоречит")
-        if slope_dir != trend:
-            weak.append("наклон слабый" if slope_dir == "flat" else "наклон против")
-        if vol_dir != trend:
-            if vol_dir == "flat":
-                weak.append("объёмы не поддерживают")
-            elif trend == "up":
-                weak.append("объёмы падают")
-            else:
-                weak.append("объёмы растут — возможен отскок")
-        if weak:
-            label_text += ", но " + " и ".join(weak)
-    elif trend == "flat":
-        label_text = "⏸️ Боковик"
-    else:
-        extra = "структура смешанная"
-        if abs(slope) < 1:
-            extra += ", наклон близок к 0%"
-        label_text = f"❓ Неопределённый — {extra}, {vol_phrase}"
-
-    return (
-        f"📊 Тренд по {label}: {label_text}\n"
-        f"({price_str}, {slope_str}, {struct_str}, {vol_phrase}; анализ по {used} свечам)"
-    )
+    return f"🔵 {name} ({limit} свечей): {arrow} ({price_str}, {slope_str}, {struct_phrase}, {vol_phrase})"
 
 
 async def _analyze_micro_trend(symbol: str, ttype: str) -> str:
-    d_data = await _micro_trend_tf(symbol, "D", 50)
-    h_data = await _micro_trend_tf(symbol, "240", 20)
-    daily = _trend_text("1D", d_data)
-    h4 = _trend_text("4H", h_data)
-    if d_data.get("trend") == "down" and h_data.get("trend") == "up":
-        h4 = h4.replace("⬆️ Восходящий", "⬆️ Восходящий откат в нисходящем тренде")
-    elif d_data.get("trend") == "up" and h_data.get("trend") == "down":
-        h4 = h4.replace("⬇️ Нисходящий", "⬇️ Нисходящий откат в восходящем тренде")
-    return f"{daily}\n{h4}"
+    d_res: dict[str, dict] = {}
+    for lvl, lim in TREND_WINDOWS["D"].items():
+        d_res[lvl] = await _micro_trend_tf(symbol, "D", lim)
+    h_res: dict[str, dict] = {}
+    for lvl, lim in TREND_WINDOWS["240"].items():
+        h_res[lvl] = await _micro_trend_tf(symbol, "240", lim)
+
+    d_lines = ["📈 Тренд по 1D:"]
+    for lvl, lim in TREND_WINDOWS["D"].items():
+        d_lines.append(_trend_line(TREND_LEVELS[lvl], lim, d_res[lvl]))
+
+    h_lines = ["📉 Тренд по 4H:"]
+    for lvl, lim in TREND_WINDOWS["240"].items():
+        h_lines.append(_trend_line(TREND_LEVELS[lvl], lim, h_res[lvl]))
+
+    if d_res["global"].get("trend") == "down" and h_res["global"].get("trend") == "up":
+        h_lines[1] = h_lines[1].replace("⬆️ Восходящий", "⬆️ Восходящий откат в нисходящем тренде")
+    elif d_res["global"].get("trend") == "up" and h_res["global"].get("trend") == "down":
+        h_lines[1] = h_lines[1].replace("⬇️ Нисходящий", "⬇️ Нисходящий откат в восходящем тренде")
+
+    return "\n".join(d_lines) + "\n\n" + "\n".join(h_lines)
 
 
 def _similar_trades_summary(
