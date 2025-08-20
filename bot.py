@@ -3651,47 +3651,43 @@ async def _fetch_kline(symbol: str, interval: str, limit: int = 7) -> list:
     return []
 
 
-async def _analyze_micro_trend(symbol: str, ttype: str) -> str:
-    candles = await _fetch_kline(symbol, "D", 7)
-    if len(candles) < 5:
-        candles = await _fetch_kline(symbol, "240", 7)
-    if len(candles) < 5:
-        return (
-            "🔁 Тренд не определён: нет данных. Будь осторожен — рынок не выбрал направление."
-        )
-    highs = [float(c[2]) for c in candles][-7:]
-    lows = [float(c[3]) for c in candles][-7:]
-    vols = [float(c[5]) for c in candles][-7:]
-    up = all(h2 > h1 and l2 > l1 for h1, h2, l1, l2 in zip(highs, highs[1:], lows, lows[1:]))
-    down = all(h2 < h1 and l2 < l1 for h1, h2, l1, l2 in zip(highs, highs[1:], lows, lows[1:]))
-    vol_note = "Объёмы нестабильны."
+async def _micro_trend_tf(symbol: str, interval: str, label: str, limit: int) -> str:
+    candles = await _fetch_kline(symbol, interval, limit)
+    used = min(len(candles), limit)
+    if used < 5:
+        return f"📊 Тренд по {label}: недостаточно данных ({used} свечей)"
+    highs = [float(c[2]) for c in candles][-used:]
+    lows = [float(c[3]) for c in candles][-used:]
+    vols = [float(c[5]) for c in candles][-used:]
+    up = all(
+        h2 > h1 and l2 > l1 for h1, h2, l1, l2 in zip(highs, highs[1:], lows, lows[1:])
+    )
+    down = all(
+        h2 < h1 and l2 < l1 for h1, h2, l1, l2 in zip(highs, highs[1:], lows, lows[1:])
+    )
+    vol_note = ""
+    vol_ok = True
     if len(vols) >= 6:
         recent = sum(vols[-3:]) / 3
         prev = sum(vols[:3]) / 3
         if recent > prev * 1.1:
-            vol_note = "Объёмы растут, тренд усиливается."
+            vol_note = " — объёмы растут"
         elif recent < prev * 0.9:
-            vol_note = "Объёмы снижаются."
-    if up:
-        base = "📈 Тренд: растущий."
-        direction = (
-            "Сделка по направлению тренда, можно искать подтверждение для входа."
-            if ttype.lower() == "long"
-            else "Сделка против тренда — повышенный риск."
-        )
-        return f"{base}\n{vol_note}\n{direction}"
-    if down:
-        base = "📉 Текущий тренд: падающий."
-        direction = (
-            "Сделка по направлению тренда, можно искать подтверждение для входа."
-            if ttype.lower() == "short"
-            else "Сделка против тренда — повышенный риск."
-        )
-        return f"{base}\n{vol_note}\n{direction}"
-    return (
-        "🔁 Тренд не определён: цена колеблется в диапазоне.\n"
-        "Будь осторожен — рынок не выбрал направление."
-    )
+            vol_note = " — объёмы снижаются"
+            vol_ok = False
+    if up and vol_ok:
+        return f"📊 Тренд по {label}: Растущий (анализ за {used} свечей){vol_note}"
+    if down and vol_ok:
+        return f"📊 Тренд по {label}: Нисходящий (анализ за {used} свечей){vol_note}"
+    if label == "1D":
+        return f"📊 Тренд по 1D: цена в диапазоне (анализ за {used} свечей)"
+    return f"📊 Тренд по 4H: недостаточно тренда за последние {used} свечей"
+
+
+async def _analyze_micro_trend(symbol: str, ttype: str) -> str:
+    daily = await _micro_trend_tf(symbol, "D", "1D", 14)
+    h4 = await _micro_trend_tf(symbol, "240", "4H", 20)
+    return f"{daily}\n{h4}"
 
 
 def _similar_trades_summary(
