@@ -4941,6 +4941,7 @@ async def ai_coin_prompt(cb: types.CallbackQuery, state: FSMContext):
 @dp.message(AICoinState.enter_symbol)
 async def ai_coin_analyze(msg: types.Message, state: FSMContext):
     sym = (msg.text or "").strip().upper()
+    await msg.answer("💬 Идёт анализ…")
     async with ChatActionSender.typing(bot, msg.chat.id):
         base = sym
         symbol = f"{base}USDT"
@@ -5035,6 +5036,7 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
         )
         await open_edit_trade(cb, tid, state)
         return
+    await cb.message.answer("💬 Идёт анализ…")
     async with ChatActionSender.typing(bot, cb.message.chat.id):
         total, strong, medium, weak = signal_stats(sig_list)
         risk = float(risk)
