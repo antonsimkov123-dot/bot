@@ -4170,6 +4170,7 @@ async def _entry_exit_levels(
                         break
             return kept
 
+        all_ress = list(ress)
         sups = _filter(sups)
         ress = _filter(ress)
 
@@ -4185,6 +4186,26 @@ async def _entry_exit_levels(
 
         sups = near_sups[:2] + far_sups
         ress = near_ress[:2] + far_ress
+
+        # ensure the very top swing-high survives filtering when strong enough
+        if all_ress:
+            top = max(all_ress, key=lambda x: x["level"])
+            if top not in ress and (top["touches"] >= 2 or top["vol"] >= 1.5):
+                band = top["level"] * 0.004
+                lo = top["level"] - band
+                hi = top["level"] + band
+                overlap = False
+                for r in ress:
+                    k_band = r["level"] * 0.004
+                    k_lo = r["level"] - k_band
+                    k_hi = r["level"] + k_band
+                    inter = min(hi, k_hi) - max(lo, k_lo)
+                    if inter > 0 and inter >= 0.5 * min(hi - lo, k_hi - k_lo):
+                        overlap = True
+                        break
+                if not overlap:
+                    ress.append(top)
+                    ress.sort(key=prio, reverse=True)
 
         return sups, ress
 
