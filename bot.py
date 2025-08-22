@@ -4452,7 +4452,8 @@ async def _send_sr_charts(
     ):
         if not sup_list or not res_list:
             continue
-        file = await _generate_price_chart(symbol, interval, sup_list, res_list, label, 120)
+        limit = 300 if interval == "60" else 120
+        file = await _generate_price_chart(symbol, interval, sup_list, res_list, label, limit)
         if not file:
             continue
         sup = sup_list[0]["level"]
