@@ -1016,8 +1016,7 @@ async def get_usd_rub_rate() -> float:
 def save_imported_trade(uid: int, pos: dict) -> int:
     t_type = "Long" if pos.get("side") in {"Buy", "Long"} else "Short"
     sym = pos.get("symbol", "")
-    if sym.endswith("USDT"):
-        sym = sym[:-4]
+    sym = _base_from_symbol(sym)
     entry = float(pos.get("entryPrice") or pos.get("avgPrice") or 0)
     size = float(pos.get("size") or 0)
     lev = float(pos.get("leverage") or 0)
@@ -1072,11 +1071,8 @@ def process_spot_history(uid: int, orders: list[dict]) -> None:
     orders = sorted(orders, key=lambda o: int(o.get("execTime", 0)))
     for o in orders:
         sym = o.get("symbol", "")
-        if sym.endswith("USDT"):
-            base = sym[:-4]
-        elif sym.endswith("USDC"):
-            base = sym[:-4]
-        else:
+        base = _base_from_symbol(sym)
+        if not (sym.endswith("USDT") or sym.endswith("USDC")):
             continue
         if base in stable:
             continue
@@ -1197,9 +1193,15 @@ def process_spot_history(uid: int, orders: list[dict]) -> None:
 
 async def get_spot_entry_price(api_key: str, api_secret: str, coin: str) -> float | None:
     """Calculate average entry price for a spot coin based on trade history."""
+    resolved = await _resolve_symbol(coin, prefer="spot")
+    if not resolved:
+        return None
+    symbol, category = resolved
+    if category != "spot":
+        return None
     ts = str(int(time.time() * 1000))
     recv = "5000"
-    params = {"category": "spot", "symbol": f"{coin}USDT", "limit": "50"}
+    params = {"category": "spot", "symbol": symbol, "limit": "50"}
     query = urlencode(params)
     sign_payload = ts + api_key + recv + query
     sign = hmac.new(api_secret.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
@@ -1399,9 +1401,7 @@ async def sync_futures_positions(uid: int, positions: list[dict]) -> list[dict]:
     seen: set[tuple[str, str]] = set()
     new_positions: list[dict] = []
     for pos in positions:
-        sym = pos.get("symbol", "")
-        if sym.endswith("USDT"):
-            sym = sym[:-4]
+        sym = _base_from_symbol(pos.get("symbol", ""))
         side = "Long" if pos.get("side") in {"Buy", "Long"} else "Short"
         size = float(pos.get("size") or 0)
         entry = float(pos.get("entryPrice") or pos.get("avgPrice") or 0)
@@ -1523,22 +1523,61 @@ async def sync_futures_positions(uid: int, positions: list[dict]) -> list[dict]:
     return new_positions
 
 
-async def fetch_price(symbol: str) -> float | None:
-    url = "https://api.bybit.com/v5/market/tickers"
-    for category in ("linear", "spot"):
-        params = {"category": category, "symbol": f"{symbol}USDT"}
+_symbol_cache: dict[str, tuple[str, str]] = {}
+
+
+def _base_from_symbol(sym: str) -> str:
+    if sym.endswith("USDT") or sym.endswith("USDC"):
+        sym = sym[:-4]
+    return sym.lstrip("0123456789")
+
+
+async def _resolve_symbol(base: str, prefer: str | None = None) -> tuple[str, str] | None:
+    base = base.upper()
+    if base in _symbol_cache:
+        return _symbol_cache[base]
+    categories = ["linear", "spot"]
+    if prefer and prefer in categories:
+        categories.remove(prefer)
+        categories.insert(0, prefer)
+    url = "https://api.bybit.com/v5/market/instruments-info"
+    for category in categories:
+        params = {"category": category, "baseCoin": base}
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, params=params) as resp:
                     data = await resp.json()
         except Exception:
-            return None
-        try:
-            price = float(data.get("result", {}).get("list", [{}])[0].get("lastPrice"))
-            if price:
-                return price
-        except Exception:
             continue
+        items = data.get("result", {}).get("list") or []
+        for item in items:
+            if item.get("quoteCoin") == "USDT":
+                symbol = item.get("symbol")
+                if symbol:
+                    _symbol_cache[base] = (symbol, category)
+                    return symbol, category
+    return None
+
+
+async def fetch_price(symbol: str) -> float | None:
+    resolved = await _resolve_symbol(symbol)
+    if not resolved:
+        return None
+    real, category = resolved
+    url = "https://api.bybit.com/v5/market/tickers"
+    params = {"category": category, "symbol": real}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as resp:
+                data = await resp.json()
+    except Exception:
+        return None
+    try:
+        price = float(data.get("result", {}).get("list", [{}])[0].get("lastPrice"))
+        if price:
+            return price
+    except Exception:
+        return None
     return None
 
 
@@ -3663,24 +3702,25 @@ def _recommend_setup(strong: int, risk: float) -> str:
 
 
 async def _fetch_kline(symbol: str, interval: str, limit: int = 7) -> list:
+    resolved = await _resolve_symbol(symbol)
+    if not resolved:
+        return []
+    real, category = resolved
     url = "https://api.bybit.com/v5/market/kline"
-    for category in ("linear", "spot"):
-        params = {
-            "category": category,
-            "symbol": f"{symbol}USDT",
-            "interval": interval,
-            "limit": limit,
-        }
-        try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, params=params) as resp:
-                    data = await resp.json()
-        except Exception:
-            continue
-        res = data.get("result", {}).get("list")
-        if res:
-            return res
-    return []
+    params = {
+        "category": category,
+        "symbol": real,
+        "interval": interval,
+        "limit": limit,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as resp:
+                data = await resp.json()
+    except Exception:
+        return []
+    res = data.get("result", {}).get("list")
+    return res or []
 
 
 async def _volume_24h(symbol: str) -> tuple[str, str, str]:
@@ -4639,7 +4679,7 @@ async def _market_signal_balance() -> str:
         sym = t.get("symbol", "")
         if not sym.endswith("USDT"):
             continue
-        base = sym[:-4]  # strip USDT
+        base = _base_from_symbol(sym)
         res = await _micro_trend_tf(base, "D", 50)
         if res.get("trend") not in {"up", "down"}:
             res = await _micro_trend_tf(base, "240", 50)
@@ -5258,9 +5298,7 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
     buttons = []
     for idx, p in enumerate(positions):
         side = "LONG" if p.get("side") == "Buy" else "SHORT"
-        sym = p.get("symbol", "")
-        if sym.endswith("USDT"):
-            sym = sym[:-4]
+        sym = _base_from_symbol(p.get("symbol", ""))
         lev = p.get("leverage")
         entry = p.get("entryPrice") or p.get("avgPrice")
         text = f"{side} {sym}"
