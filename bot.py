@@ -4050,6 +4050,17 @@ async def _entry_exit_levels(
             and (entry is None or l <= entry)
         ):
             swing_lows.append((l, vols[i]))
+    top_idx = max(range(len(highs)), key=lambda i: highs[i])
+    top_high = highs[top_idx]
+    top_vol = vols[top_idx]
+    top_close = closes[top_idx]
+    future_slice = lows[top_idx + 1 : min(len(lows), top_idx + 3)]
+    future_low = min(future_slice) if future_slice else lows[top_idx]
+    wick_ratio = (top_high - top_close) / top_high
+    drop_ratio = (top_high - future_low) / top_high
+    top_reject = wick_ratio >= 0.006 or drop_ratio >= 0.01
+    if top_reject or top_vol >= avg_vol * 1.5:
+        swing_highs.append((top_high, top_vol))
     if not swing_highs and entry is not None:
         swing_highs = [(highs[i], vols[i]) for i in range(len(highs))]
     if not swing_lows and entry is not None:
@@ -4060,6 +4071,7 @@ async def _entry_exit_levels(
 
     basis = entry if entry is not None else cur_price
     step = 10 if basis >= 1000 else 5
+    top_lvl = int(round(top_high / step) * step)
 
     def _prepare_levels(swings: list[tuple[float, float]], arr: list[float]) -> list[dict]:
         levels: dict[int, dict] = {}
@@ -4112,6 +4124,12 @@ async def _entry_exit_levels(
     if not res_levels or not sup_levels:
         msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
         return msg, [], []
+    for lvl in res_levels:
+        if lvl["level"] == top_lvl:
+            lvl["top"] = True
+            if top_reject or lvl["vol"] >= 1.5:
+                lvl["reject"] = True
+            break
 
     def _select_zones(
         sups: list[dict], ress: list[dict]
@@ -4173,10 +4191,12 @@ async def _entry_exit_levels(
         sups = all_sups
         ress = all_ress
 
-        # ensure the very top swing-high survives filtering when strong enough
+        # ensure the very top swing-high survives filtering when rejected strongly
         if raw_ress:
             top = max(raw_ress, key=lambda x: x["level"])
-            if top not in ress and (top["touches"] >= 2 or top["vol"] >= 1.5):
+            if top not in ress and (
+                top["touches"] >= 2 or top["vol"] >= 1.5 or top.get("reject")
+            ):
                 band = min(top["level"] * 0.004, cur_price * 0.015)
                 lo = top["level"] - band
                 hi = top["level"] + band
@@ -4247,6 +4267,8 @@ async def _entry_exit_levels(
         notes.append("поддержка подтверждена объёмом")
     if res_levels[0]["touches"] > 1:
         notes.append(f"верх тестировался {res_levels[0]['touches']} раза")
+    if res_levels[0].get("top"):
+        notes.append("верхний экстремум")
     if sup_levels[0]["touches"] > 1:
         notes.append(f"низ тестировался {sup_levels[0]['touches']} раза")
     if notes:
@@ -4271,7 +4293,10 @@ async def _entry_exit_levels(
                 vol_txt = (
                     f", объём {r['vol']:.1f}×" if r["vol"] >= 1.5 else ", слабый объём"
                 )
-                tbl.append(f"— {r['level']:.2f} ({r['touches']} касания{vol_txt})")
+                extra = ", верхний экстремум" if r.get("top") else ""
+                tbl.append(
+                    f"— {r['level']:.2f} ({r['touches']} касания{vol_txt}{extra})"
+                )
         if tbl:
             msg += "\n\n" + "\n".join(tbl)
 
@@ -4372,6 +4397,8 @@ async def _generate_price_chart(
                 info.append(f"{lvl['touches']} касания")
             if lvl["vol"] >= 1.5:
                 info.append(f"объём {lvl['vol']:.1f}×")
+            if lvl.get("top"):
+                info.append("верхний экстремум")
             importance_words = {
                 "strong": "сильная",
                 "medium": "средняя",
