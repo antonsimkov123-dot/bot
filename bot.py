@@ -19,6 +19,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, FSInputFil
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
+from aiogram.utils.chat_action import ChatActionSender
 
 import pandas as pd
 import matplotlib
@@ -4936,27 +4937,31 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
     sym = (msg.text or "").strip().upper()
     base = sym
     symbol = f"{base}USDT"
-    price = await fetch_price(base)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
     )
-    if price is None:
-        await msg.answer(f"❌ Монета {symbol} не найдена. Проверь тикер.", reply_markup=with_back(kb))
-        await state.clear()
-        return
-    vol_line, vol_note, vol_short = await _volume_24h(base)
-    trend_text, d_res, h_res = await _analyze_micro_trend(base, "LONG", vol_short)
-    rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
-    levels_block = await _entry_exit_levels(base)
-    vol_block = "\n".join(filter(None, [vol_line, vol_note]))
-    trend_block = trend_text
-    if vol_block:
-        trend_block += f"\n\n{vol_block}"
-    trend_block += f"\n\n{rec_block}\n{verdict_line}"
-    if levels_block:
-        trend_block += f"\n\n{levels_block}"
-    advice = await _build_ai_advice(msg.from_user.id, [], 0, 0, 0, base)
-    await msg.answer(trend_block + "\n\n" + advice, reply_markup=with_back(kb))
+    async with ChatActionSender.typing(bot, msg.chat.id):
+        price = await fetch_price(base)
+        if price is None:
+            await msg.answer(
+                f"❌ Монета {symbol} не найдена. Проверь тикер.",
+                reply_markup=with_back(kb),
+            )
+            await state.clear()
+            return
+        vol_line, vol_note, vol_short = await _volume_24h(base)
+        trend_text, d_res, h_res = await _analyze_micro_trend(base, "LONG", vol_short)
+        rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
+        levels_block = await _entry_exit_levels(base)
+        vol_block = "\n".join(filter(None, [vol_line, vol_note]))
+        trend_block = trend_text
+        if vol_block:
+            trend_block += f"\n\n{vol_block}"
+        trend_block += f"\n\n{rec_block}\n{verdict_line}"
+        if levels_block:
+            trend_block += f"\n\n{levels_block}"
+        advice = await _build_ai_advice(msg.from_user.id, [], 0, 0, 0, base)
+        await msg.answer(trend_block + "\n\n" + advice, reply_markup=with_back(kb))
     await state.clear()
 
 
@@ -5024,34 +5029,43 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
         )
         await open_edit_trade(cb, tid, state)
         return
-    total, strong, medium, weak = signal_stats(sig_list)
-    risk = float(risk)
-    parts = [
-        f"⭐️ Звёзд: {total}",
-       f"🔥 Сильных сигналов: {strong}",
-       f"🟡 Средние: {medium}",
-       f"⚪️ Слабые: {weak}",
-       f"🛑 Риск по стопу: {risk:.1f}%",
-    ]
-    vol_line, vol_note, vol_short = await _volume_24h(symbol)
-    trend_text, d_res, h_res = await _analyze_micro_trend(symbol, t_type, vol_short)
-    rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
-    levels_block = await _entry_exit_levels(symbol)
-    vol_block = "\n".join(filter(None, [vol_line, vol_note]))
-    trend_block = trend_text
-    if vol_block:
-        trend_block += f"\n\n{vol_block}"
-    trend_block += f"\n\n{rec_block}\n{verdict_line}"
-    if levels_block:
-        trend_block += f"\n\n{levels_block}"
-    text = "\n".join(parts) + "\n\n" + trend_block + "\n\n" + await _build_ai_advice(uid, sig_list, strong, total, risk, symbol)
-    text += "\n\n" + _similar_trades_summary(uid, symbol, t_type, lev, total, sig_list, risk)
-    kb = with_back(
-        InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="ai_trades")]]
+    async with ChatActionSender.typing(bot, cb.message.chat.id):
+        total, strong, medium, weak = signal_stats(sig_list)
+        risk = float(risk)
+        parts = [
+            f"⭐️ Звёзд: {total}",
+            f"🔥 Сильных сигналов: {strong}",
+            f"🟡 Средние: {medium}",
+            f"⚪️ Слабые: {weak}",
+            f"🛑 Риск по стопу: {risk:.1f}%",
+        ]
+        vol_line, vol_note, vol_short = await _volume_24h(symbol)
+        trend_text, d_res, h_res = await _analyze_micro_trend(symbol, t_type, vol_short)
+        rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
+        levels_block = await _entry_exit_levels(symbol)
+        vol_block = "\n".join(filter(None, [vol_line, vol_note]))
+        trend_block = trend_text
+        if vol_block:
+            trend_block += f"\n\n{vol_block}"
+        trend_block += f"\n\n{rec_block}\n{verdict_line}"
+        if levels_block:
+            trend_block += f"\n\n{levels_block}"
+        text = (
+            "\n".join(parts)
+            + "\n\n"
+            + trend_block
+            + "\n\n"
+            + await _build_ai_advice(uid, sig_list, strong, total, risk, symbol)
         )
-    )
-    await cb.message.answer(text, reply_markup=kb)
+        text += "\n\n" + _similar_trades_summary(
+            uid, symbol, t_type, lev, total, sig_list, risk
+        )
+        kb = with_back(
+            InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="ai_trades")]]
+            )
+        )
+        await cb.message.answer(text, reply_markup=kb)
 
 
 @dp.callback_query(F.data == "ai_habits")
