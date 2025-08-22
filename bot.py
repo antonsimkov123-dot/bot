@@ -4437,19 +4437,14 @@ async def _generate_price_chart(
 async def _send_sr_charts(
     chat_id: int,
     symbol: str,
-    supports_4h: list[dict] | None,
-    resistances_4h: list[dict] | None,
     entry: float | None = None,
 ) -> None:
-    if not supports_4h or not resistances_4h:
-        _, supports_4h, resistances_4h = await _entry_exit_levels(symbol, entry)
-    if not supports_4h or not resistances_4h:
-        return
     _, sup_1d, res_1d = await _entry_exit_levels(symbol, entry, interval="D")
+    _, sup_4h, res_4h = await _entry_exit_levels(symbol, entry, interval="240")
     _, sup_1h, res_1h = await _entry_exit_levels(symbol, entry, interval="60")
     for label, interval, sup_list, res_list in (
         ("1D", "D", sup_1d, res_1d),
-        ("4H", "240", supports_4h, resistances_4h),
+        ("4H", "240", sup_4h, res_4h),
         ("1H", "60", sup_1h, res_1h),
     ):
         if not sup_list or not res_list:
@@ -4744,7 +4739,7 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
     text = "💡 Сетап оценён!\n\n" + trend_block + "\n\n" + await _build_ai_advice(uid, sig_list, strong, total, risk, symbol)
     await bot.send_message(uid, text)
     if supports and resistances:
-        await _send_sr_charts(uid, symbol, supports, resistances)
+        await _send_sr_charts(uid, symbol)
 
 
 @dp.callback_query(TradeState.confirming, lambda c: c.data == "confirm_add")
@@ -5454,7 +5449,7 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
         advice = await _build_ai_advice(msg.from_user.id, [], 0, 0, 0, base)
         await msg.answer(trend_block + "\n\n" + advice, reply_markup=with_back(kb))
         if supports and resistances:
-            await _send_sr_charts(msg.chat.id, base, supports, resistances, price)
+            await _send_sr_charts(msg.chat.id, base, entry=price)
     await state.clear()
 
 
@@ -5561,7 +5556,7 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
         )
         await cb.message.answer(text, reply_markup=kb)
         if supports and resistances:
-            await _send_sr_charts(cb.message.chat.id, symbol, supports, resistances)
+            await _send_sr_charts(cb.message.chat.id, symbol)
 
 
 @dp.callback_query(F.data == "ai_habits")
