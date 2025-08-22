@@ -5457,22 +5457,21 @@ async def ai_coin_prompt(cb: types.CallbackQuery, state: FSMContext):
 
 @dp.message(AICoinState.enter_symbol)
 async def ai_coin_analyze(msg: types.Message, state: FSMContext):
-    sym = (msg.text or "").strip().upper()
+    raw = (msg.text or "").strip().upper()
+    base = _base_from_symbol(raw)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
+    )
+    price = await fetch_price(base)
+    if price is None:
+        await msg.answer(
+            f"❌ Монета {base} не найдена. Убедитесь, что она торгуется на Bybit и введите корректный тикер.",
+            reply_markup=with_back(kb),
+        )
+        await state.clear()
+        return
     await msg.answer("💬 Идёт анализ…")
     async with ChatActionSender.typing(bot, msg.chat.id):
-        base = sym
-        symbol = f"{base}USDT"
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
-        )
-        price = await fetch_price(base)
-        if price is None:
-            await msg.answer(
-                f"❌ Монета {symbol} не найдена. Проверь тикер.",
-                reply_markup=with_back(kb),
-            )
-            await state.clear()
-            return
         vol_line, vol_note, vol_short = await _volume_24h(base)
         trend_text, d_res, h_res = await _analyze_micro_trend(base, "LONG", vol_short)
         rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
@@ -5882,15 +5881,18 @@ async def pa_manual_add(cb: types.CallbackQuery, state: FSMContext):
 
 @dp.message(PriceAlertState.enter_symbol)
 async def pa_manual_symbol(msg: types.Message, state: FSMContext):
-    sym = msg.text.strip().upper()
-    if not sym:
+    raw = (msg.text or "").strip().upper()
+    base = _base_from_symbol(raw)
+    if not base:
         await msg.answer("Введите тикер.")
         return
-    price = await fetch_price(sym)
+    price = await fetch_price(base)
     if price is None:
-        await msg.answer("Тикер не найден на Bybit.")
+        await msg.answer(
+            f"Монета {base} не найдена. Убедитесь, что она торгуется на Bybit и введите корректный тикер."
+        )
         return
-    await state.update_data(pa_symbol=sym)
+    await state.update_data(pa_symbol=base)
     await msg.answer("Введи цену для уведомления:")
     await state.set_state(PriceAlertState.waiting_price)
 
