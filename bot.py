@@ -4118,7 +4118,7 @@ async def _entry_exit_levels(
     ) -> tuple[list[dict], list[dict]]:
         """Select up to two support and resistance zones each.
 
-        Zones that overlap more than 50% with a stronger one are skipped.
+        Zones that overlap more than 60% with a stronger one are skipped.
         The routine always terminates because each level is inspected only
         once and comparisons are limited to already accepted zones.
         """
@@ -4134,43 +4134,31 @@ async def _entry_exit_levels(
 
         def _filter(levels: list[dict]) -> list[dict]:
             kept: list[dict] = []
-            core = 0
             for lvl in sorted(levels, key=prio, reverse=True):
-                band = lvl["level"] * 0.004  # ±0.4% зона
+                band = min(lvl["level"] * 0.004, cur_price * 0.015)
                 lo = lvl["level"] - band
                 hi = lvl["level"] + band
-                far = is_far(lvl)
                 overlap = False
-                close = False
-                if not far:
-                    for k in kept:
-                        k_band = k["level"] * 0.004
-                        k_lo = k["level"] - k_band
-                        k_hi = k["level"] + k_band
-                        inter = min(hi, k_hi) - max(lo, k_lo)
-                        if inter > 0 and inter >= 0.5 * min(hi - lo, k_hi - k_lo):
-                            overlap = True
-                            break
-                        # проверяем расстояние между зонами
-                        if hi <= k_lo:
-                            gap = k_lo - hi
-                        elif lo >= k_hi:
-                            gap = lo - k_hi
-                        else:
-                            gap = 0
-                        if gap and gap / min(lvl["level"], k["level"]) < 0.015:
-                            close = True
-                            break
-                if overlap or close:
+                for k in kept:
+                    k_band = min(k["level"] * 0.004, cur_price * 0.015)
+                    k_lo = k["level"] - k_band
+                    k_hi = k["level"] + k_band
+                    inter = min(hi, k_hi) - max(lo, k_lo)
+                    if inter > 0 and inter >= 0.6 * min(hi - lo, k_hi - k_lo):
+                        overlap = True
+                        break
+                    gap = max(k_lo - hi, lo - k_hi, 0)
+                    if gap and gap / min(lvl["level"], k["level"]) < 0.02:
+                        overlap = True
+                        break
+                if overlap:
                     continue
                 kept.append(lvl)
-                if not far:
-                    core += 1
-                    if core == 2:
-                        break
+                if len(kept) == 3:
+                    break
             return kept
 
-        all_ress = list(ress)
+        raw_ress = list(ress)
         sups = _filter(sups)
         ress = _filter(ress)
 
@@ -4179,31 +4167,29 @@ async def _entry_exit_levels(
         near_sups = [s for s in sups if not is_far(s)]
         near_ress = [r for r in ress if not is_far(r)]
 
-        near_sups.sort(key=prio, reverse=True)
-        near_ress.sort(key=prio, reverse=True)
-        far_sups.sort(key=prio, reverse=True)
-        far_ress.sort(key=prio, reverse=True)
+        all_sups = sorted(near_sups + far_sups, key=prio, reverse=True)[:3]
+        all_ress = sorted(near_ress + far_ress, key=prio, reverse=True)[:3]
 
-        sups = near_sups[:2] + far_sups
-        ress = near_ress[:2] + far_ress
+        sups = all_sups
+        ress = all_ress
 
         # ensure the very top swing-high survives filtering when strong enough
-        if all_ress:
-            top = max(all_ress, key=lambda x: x["level"])
+        if raw_ress:
+            top = max(raw_ress, key=lambda x: x["level"])
             if top not in ress and (top["touches"] >= 2 or top["vol"] >= 1.5):
-                band = top["level"] * 0.004
+                band = min(top["level"] * 0.004, cur_price * 0.015)
                 lo = top["level"] - band
                 hi = top["level"] + band
                 overlap = False
                 for r in ress:
-                    k_band = r["level"] * 0.004
+                    k_band = min(r["level"] * 0.004, cur_price * 0.015)
                     k_lo = r["level"] - k_band
                     k_hi = r["level"] + k_band
                     inter = min(hi, k_hi) - max(lo, k_lo)
-                    if inter > 0 and inter >= 0.5 * min(hi - lo, k_hi - k_lo):
+                    if inter > 0 and inter >= 0.6 * min(hi - lo, k_hi - k_lo):
                         overlap = True
                         break
-                if not overlap:
+                if not overlap and len(ress) < 3:
                     ress.append(top)
                     ress.sort(key=prio, reverse=True)
 
@@ -4308,6 +4294,7 @@ async def _generate_price_chart(
     lows = [float(c[3]) for c in candles]
     closes = [float(c[4]) for c in candles]
     volumes = [float(c[5]) for c in candles]
+    cur_price = closes[-1]
 
     fig, (ax, ax_v) = plt.subplots(
         2,
@@ -4362,23 +4349,24 @@ async def _generate_price_chart(
     def _draw_levels(levels: list[dict], is_support: bool) -> None:
         icon = "🟩" if is_support else "🟥"
         colors = (
-            {"strong": "#00FF00", "medium": "#90EE90", "weak": "#00FFFF"}
+            {"strong": "#00FF00", "medium": "#90EE90"}
             if is_support
-            else {"strong": "#FF0000", "medium": "#FFA500", "weak": "#FFFF00"}
+            else {"strong": "#FF0000", "medium": "#FFA500"}
         )
         for idx, lvl in enumerate(levels):
+            if lvl.get("importance") == "weak":
+                continue
             color = colors.get(lvl.get("importance"), list(colors.values())[1])
             base_alpha = 0.25 * (0.7 ** idx)
             if lvl["vol"] >= 1.5 or lvl["touches"] >= 3:
                 base_alpha += 0.15
             alpha = min(base_alpha, 0.7)
-            step = 10 if lvl["level"] >= 1000 else 5
-            band = max(step, round(lvl["level"] * 0.004 / step) * step)
+            band = min(lvl["level"] * 0.004, cur_price * 0.015)
             lo_zone = lvl["level"] - band
             hi_zone = lvl["level"] + band
             ax.axhspan(lo_zone, hi_zone, color=color, alpha=alpha)
             name = "Поддержка" if is_support else "Сопротивление"
-            text = f"{icon} {name}: {int(lo_zone)}–{int(hi_zone)}"
+            text = f"{icon} {name}: {lo_zone:.2f}–{hi_zone:.2f}"
             info: list[str] = []
             if lvl["touches"] > 1:
                 info.append(f"{lvl['touches']} касания")
