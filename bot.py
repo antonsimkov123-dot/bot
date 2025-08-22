@@ -4138,12 +4138,20 @@ async def _entry_exit_levels(
                 ):
                     continue
             chosen.append((typ, lvl))
+        def overlaps(a: dict, b: dict) -> bool:
+            band_a = a["level"] * 0.004
+            band_b = b["level"] * 0.004
+            lo = max(a["level"] - band_a, b["level"] - band_b)
+            hi = min(a["level"] + band_a, b["level"] + band_b)
+            if hi <= lo:
+                return False
+            inter = hi - lo
+            width_min = min(band_a * 2, band_b * 2)
+            return inter > 0.5 * width_min
+
         final: list[tuple[str, dict]] = []
         for typ, lvl in sorted(chosen, key=lambda x: prio(x[1]), reverse=True):
-            if any(
-                abs(lvl["level"] - c["level"]) / min(lvl["level"], c["level"]) < 0.004
-                for _, c in final
-            ):
+            if any(overlaps(lvl, c) for t, c in final if t == typ):
                 continue
             final.append((typ, lvl))
         sup_res = [lvl for t, lvl in final if t == "sup"]
