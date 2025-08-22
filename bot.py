@@ -4080,16 +4080,30 @@ async def _entry_exit_levels(
                     "dist": dist,
                 }
             )
+        # избегаем квадратичной фильтрации: уровни обрабатываются по приоритету,
+        # а проверки близости выполняются через двоичный поиск
+        from bisect import bisect_left
+
         res.sort(key=lambda x: (x["touches"], x["vol"] >= 1.5, -x["dist"]), reverse=True)
-        filtered: list[dict] = []
+        kept: list[dict] = []
+        prices: list[float] = []
         for lvl in res:
-            if any(
-                abs(lvl["level"] - f["level"]) / min(lvl["level"], f["level"]) < 0.005
-                for f in filtered
-            ):
+            pos = bisect_left(prices, lvl["level"])
+            near_prev = (
+                pos > 0
+                and abs(lvl["level"] - prices[pos - 1]) / min(lvl["level"], prices[pos - 1])
+                < 0.005
+            )
+            near_next = (
+                pos < len(prices)
+                and abs(lvl["level"] - prices[pos]) / min(lvl["level"], prices[pos])
+                < 0.005
+            )
+            if near_prev or near_next:
                 continue
-            filtered.append(lvl)
-        return filtered
+            prices.insert(pos, lvl["level"])
+            kept.insert(pos, lvl)
+        return kept
 
     res_levels = _prepare_levels(swing_highs, highs)
     sup_levels = _prepare_levels(swing_lows, lows)
@@ -4116,52 +4130,53 @@ async def _entry_exit_levels(
         if len(ress) > 1:
             extras.append(("res", ress[1]))
         extras.sort(key=lambda x: prio(x[1]), reverse=True)
+        # используем двоичный поиск по ценам, чтобы не перебирать все зоны
+        from bisect import bisect_left
+
+        def _take(levels: list[dict]) -> list[dict]:
+            result: list[dict] = []
+            lows: list[float] = []
+            highs: list[float] = []
+            for lvl in levels:
+                band = lvl["level"] * 0.02  # 2 % дистанция между зонами
+                lo = lvl["level"] - band
+                hi = lvl["level"] + band
+                i = bisect_left(lows, lo)
+                if i > 0 and hi > lows[i - 1] and lo < highs[i - 1]:
+                    continue
+                if i < len(lows) and hi > lows[i] and lo < highs[i]:
+                    continue
+                lows.insert(i, lo)
+                highs.insert(i, hi)
+                result.append(lvl)
+                if len(result) >= 2:
+                    break
+            return result
+
+        sup_main = _take(sups)
+        res_main = _take(ress)
+
+        chosen = [("sup", s) for s in sup_main] + [("res", r) for r in res_main]
         for typ, lvl in extras:
             if len(chosen) >= 3:
                 break
-            if typ == "sup":
-                if sum(1 for t, _ in chosen if t == "sup") >= 2:
-                    continue
-                if any(
-                    t == "sup"
-                    and abs(lvl["level"] - c["level"]) / min(lvl["level"], c["level"]) < 0.02
-                    for _, c in chosen
-                ):
-                    continue
-            else:
-                if sum(1 for t, _ in chosen if t == "res") >= 2:
-                    continue
-                if any(
-                    t == "res"
-                    and abs(lvl["level"] - c["level"]) / min(lvl["level"], c["level"]) < 0.02
-                    for _, c in chosen
-                ):
-                    continue
-            chosen.append((typ, lvl))
-        def overlaps(a: dict, b: dict) -> bool:
-            band_a = a["level"] * 0.004
-            band_b = b["level"] * 0.004
-            lo = max(a["level"] - band_a, b["level"] - band_b)
-            hi = min(a["level"] + band_a, b["level"] + band_b)
-            if hi <= lo:
-                return False
-            inter = hi - lo
-            width_min = min(band_a * 2, band_b * 2)
-            return inter > 0.5 * width_min
-
-        final: list[tuple[str, dict]] = []
-        for typ, lvl in sorted(chosen, key=lambda x: prio(x[1]), reverse=True):
-            if any(overlaps(lvl, c) for t, c in final if t == typ):
+            if typ == "sup" and len([t for t, _ in chosen if t == "sup"]) >= 2:
                 continue
-            final.append((typ, lvl))
-        sup_res = [lvl for t, lvl in final if t == "sup"]
-        res_res = [lvl for t, lvl in final if t == "res"]
-        return sup_res, res_res
+            if typ == "res" and len([t for t, _ in chosen if t == "res"]) >= 2:
+                continue
+            chosen.append((typ, lvl))
+
+        final_sup = _take([lvl for t, lvl in chosen if t == "sup"])
+        final_res = _take([lvl for t, lvl in chosen if t == "res"])
+        return final_sup, final_res
 
     sup_levels, res_levels = _select_zones(sup_levels, res_levels)
 
     if not sup_levels or not res_levels:
-        msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        msg = (
+            "📊 Уровни входа/выхода:\n"
+            "❌ Не удалось построить уровни: нет подходящих зон поддержки/сопротивления"
+        )
         return msg, [], []
 
     if not MULTI_SR_MODE:
