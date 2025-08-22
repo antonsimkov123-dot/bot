@@ -3517,7 +3517,7 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
             vol_line, vol_note, vol_short = await _volume_24h(symbol)
             trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype, vol_short)
             rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
-            levels_block = await _entry_exit_levels(symbol)
+            levels_block, _, _ = await _entry_exit_levels(symbol)
             vol_block = "\n".join(filter(None, [vol_line, vol_note]))
             reco_block = ""
             if vol_block:
@@ -3938,10 +3938,13 @@ def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str]:
     return "\n".join(lines), verdict
 
 
-async def _entry_exit_levels(symbol: str, entry: float | None = None) -> str:
+async def _entry_exit_levels(
+    symbol: str, entry: float | None = None
+) -> tuple[str, float | None, float | None]:
     candles = await _fetch_kline(symbol, "240", 30)
     if not candles or len(candles) < 20:
-        return "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        return msg, None, None
     candles = sorted(candles, key=lambda c: int(c[0]))[-30:]
     highs = [float(c[2]) for c in candles]
     lows = [float(c[3]) for c in candles]
@@ -3960,13 +3963,15 @@ async def _entry_exit_levels(symbol: str, entry: float | None = None) -> str:
     high_val, high_vol, high_touch = last_swing(highs, lambda a, b: a > b, cond_hi)
     low_val, low_vol, low_touch = last_swing(lows, lambda a, b: a < b, cond_lo)
     if not high_val or not low_val:
-        return "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        return msg, None, None
     basis = entry if entry is not None else max(high_val, low_val)
     step = 10 if basis >= 1000 else 5
     hi_lvl = int(round(high_val / step) * step)
     lo_lvl = int(round(low_val / step) * step)
     if hi_lvl <= lo_lvl:
-        return "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        return msg, None, None
     lines: list[str] = []
     desc = f"Следи за зоной {lo_lvl}–{hi_lvl}. Пробой вверх — можно входить."
     notes = []
@@ -3983,19 +3988,18 @@ async def _entry_exit_levels(symbol: str, entry: float | None = None) -> str:
     lines.append("— " + desc)
     lines.append(f"— Жди закрепа выше {hi_lvl} — для уверенного входа.")
     lines.append(f"— Пробой вниз ниже {lo_lvl} — лучше не входить (риск усилится).")
-    return "📊 Уровни входа/выхода:\n" + "\n".join(lines)
+    msg = "📊 Уровни входа/выхода:\n" + "\n".join(lines)
+    return msg, float(lo_lvl), float(hi_lvl)
 
 
-async def _generate_price_chart(symbol: str, interval: str) -> tuple[BufferedInputFile, float, float] | None:
+async def _generate_price_chart(
+    symbol: str, interval: str, support: float, resistance: float
+) -> BufferedInputFile | None:
     candles = await _fetch_kline(symbol, interval, 100)
     if not candles:
         return None
     candles = sorted(candles, key=lambda c: int(c[0]))
-    highs = [float(c[2]) for c in candles]
-    lows = [float(c[3]) for c in candles]
     closes = [float(c[4]) for c in candles]
-    support = min(lows)
-    resistance = max(highs)
     fig, ax = make_fig()
     ax.plot(range(len(closes)), closes, color="white", linewidth=1)
     ax.axhline(support, color="green", linestyle="--")
@@ -4005,16 +4009,18 @@ async def _generate_price_chart(symbol: str, interval: str) -> tuple[BufferedInp
     fig.savefig(buf, format="png", bbox_inches="tight")
     plt.close(fig)
     buf.seek(0)
-    file = BufferedInputFile(buf.getvalue(), filename=f"{symbol}_{interval}.png")
-    return file, support, resistance
+    return BufferedInputFile(buf.getvalue(), filename=f"{symbol}_{interval}.png")
 
 
-async def _send_sr_charts(chat_id: int, symbol: str) -> None:
+async def _send_sr_charts(
+    chat_id: int, symbol: str, support: float | None, resistance: float | None
+) -> None:
+    if support is None or resistance is None:
+        return
     for label, interval in (("1D", "D"), ("4H", "240")):
-        res = await _generate_price_chart(symbol, interval)
-        if not res:
+        file = await _generate_price_chart(symbol, interval, support, resistance)
+        if not file:
             continue
-        file, support, resistance = res
         caption = (
             f"{label}:\n🟩 Поддержка: {support:.2f}\n🟥 Сопротивление: {resistance:.2f}"
         )
@@ -4287,7 +4293,7 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
     vol_line, vol_note, vol_short = await _volume_24h(symbol)
     trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype, vol_short)
     rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
-    levels_block = await _entry_exit_levels(symbol)
+    levels_block, support, resistance = await _entry_exit_levels(symbol)
     vol_block = "\n".join(filter(None, [vol_line, vol_note]))
     trend_block = trend_text
     if vol_block:
@@ -4297,7 +4303,7 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
         trend_block += f"\n\n{levels_block}"
     text = "💡 Сетап оценён!\n\n" + trend_block + "\n\n" + await _build_ai_advice(uid, sig_list, strong, total, risk, symbol)
     await bot.send_message(uid, text)
-    await _send_sr_charts(uid, symbol)
+    await _send_sr_charts(uid, symbol, support, resistance)
 
 
 @dp.callback_query(TradeState.confirming, lambda c: c.data == "confirm_add")
@@ -4996,7 +5002,7 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
         vol_line, vol_note, vol_short = await _volume_24h(base)
         trend_text, d_res, h_res = await _analyze_micro_trend(base, "LONG", vol_short)
         rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
-        levels_block = await _entry_exit_levels(base, price)
+        levels_block, support, resistance = await _entry_exit_levels(base, price)
         vol_block = "\n".join(filter(None, [vol_line, vol_note]))
         trend_block = trend_text
         if vol_block:
@@ -5006,7 +5012,7 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
             trend_block += f"\n\n{levels_block}"
         advice = await _build_ai_advice(msg.from_user.id, [], 0, 0, 0, base)
         await msg.answer(trend_block + "\n\n" + advice, reply_markup=with_back(kb))
-        await _send_sr_charts(msg.chat.id, base)
+        await _send_sr_charts(msg.chat.id, base, support, resistance)
     await state.clear()
 
 
@@ -5088,7 +5094,7 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
         vol_line, vol_note, vol_short = await _volume_24h(symbol)
         trend_text, d_res, h_res = await _analyze_micro_trend(symbol, t_type, vol_short)
         rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
-        levels_block = await _entry_exit_levels(symbol)
+        levels_block, support, resistance = await _entry_exit_levels(symbol)
         vol_block = "\n".join(filter(None, [vol_line, vol_note]))
         trend_block = trend_text
         if vol_block:
@@ -5112,7 +5118,7 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
             )
         )
         await cb.message.answer(text, reply_markup=kb)
-        await _send_sr_charts(cb.message.chat.id, symbol)
+        await _send_sr_charts(cb.message.chat.id, symbol, support, resistance)
 
 
 @dp.callback_query(F.data == "ai_habits")
