@@ -4084,7 +4084,9 @@ async def _entry_exit_levels(
         # а проверки близости выполняются через двоичный поиск
         from bisect import bisect_left
 
-        res.sort(key=lambda x: (x["touches"], x["vol"] >= 1.5, -x["dist"]), reverse=True)
+        # приоритет: сначала число касаний, затем величина объёма,
+        # затем близость к текущей цене
+        res.sort(key=lambda x: (x["touches"], x["vol"], -x["dist"]), reverse=True)
         kept: list[dict] = []
         prices: list[float] = []
         for lvl in res:
@@ -4121,8 +4123,9 @@ async def _entry_exit_levels(
         once and comparisons are limited to already accepted zones.
         """
 
-        def prio(l: dict) -> tuple[int, bool, float]:
-            return (l["touches"], l["vol"] >= 1.5, -l["dist"])
+        def prio(l: dict) -> tuple[int, float, float]:
+            """Priority helper: more touches, then higher volume, then closer price."""
+            return (l["touches"], l["vol"], -l["dist"])
 
         def is_far(l: dict) -> bool:
             return l["dist"] >= 0.2 * cur_price and (
