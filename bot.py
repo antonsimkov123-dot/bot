@@ -4110,18 +4110,30 @@ async def _entry_exit_levels(
         return msg, [], []
 
     basis = entry if entry is not None else cur_price
-    step = 10 if basis >= 1000 else 5
-    top_lvl = int(round(top_high / step) * step)
+    if basis >= 1000:
+        step = 10
+    elif basis >= 100:
+        step = 5
+    elif basis >= 10:
+        step = 1
+    elif basis >= 1:
+        step = 0.1
+    elif basis >= 0.1:
+        step = 0.01
+    else:
+        step = 0.001
+    top_lvl = round(top_high / step) * step
 
     def _prepare_levels(swings: list[tuple[float, float]], arr: list[float]) -> list[dict]:
-        levels: dict[int, dict] = {}
+        levels: dict[float, dict] = {}
         for val, vol in swings:
-            lvl = int(round(val / step) * step)
+            lvl = round(val / step) * step
             rec = levels.setdefault(lvl, {"vol": 0.0})
             rec["vol"] = max(rec["vol"], vol)
         res: list[dict] = []
         for lvl, rec in levels.items():
-            touches = sum(1 for v in arr if abs(v - lvl) / lvl < 0.004)
+            denom = lvl if lvl else step
+            touches = sum(1 for v in arr if abs(v - lvl) / denom < 0.004)
             vol_ratio = rec["vol"] / avg_vol if avg_vol else 0
             dist = abs(cur_price - lvl)
             res.append(
@@ -4165,7 +4177,7 @@ async def _entry_exit_levels(
         msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
         return msg, [], []
     for lvl in res_levels:
-        if lvl["level"] == top_lvl:
+        if abs(lvl["level"] - top_lvl) < step / 2:
             lvl["top"] = True
             if top_reject or lvl["vol"] >= 1.5:
                 lvl["reject"] = True
