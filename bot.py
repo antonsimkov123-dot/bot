@@ -4059,8 +4059,8 @@ async def _entry_exit_levels(
     wick_ratio = (top_high - top_close) / top_high
     drop_ratio = (top_high - future_low) / top_high
     top_reject = wick_ratio >= 0.006 or drop_ratio >= 0.01
-    if top_reject or top_vol >= avg_vol * 1.5:
-        swing_highs.append((top_high, top_vol))
+    # всегда учитываем самый высокий экстремум как сопротивление, даже без повторных тестов
+    swing_highs.append((top_high, top_vol))
     if not swing_highs and entry is not None:
         swing_highs = [(highs[i], vols[i]) for i in range(len(highs))]
     if not swing_lows and entry is not None:
@@ -4191,12 +4191,10 @@ async def _entry_exit_levels(
         sups = all_sups
         ress = all_ress
 
-        # ensure the very top swing-high survives filtering when rejected strongly
+        # гарантируем, что самый высокий экстремум всегда сохранится как сопротивление
         if raw_ress:
             top = max(raw_ress, key=lambda x: x["level"])
-            if top not in ress and (
-                top["touches"] >= 2 or top["vol"] >= 1.5 or top.get("reject")
-            ):
+            if top not in ress:
                 band = min(top["level"] * 0.004, cur_price * 0.015)
                 lo = top["level"] - band
                 hi = top["level"] + band
@@ -4209,9 +4207,10 @@ async def _entry_exit_levels(
                     if inter > 0 and inter >= 0.6 * min(hi - lo, k_hi - k_lo):
                         overlap = True
                         break
-                if not overlap and len(ress) < 3:
+                if not overlap:
                     ress.append(top)
                     ress.sort(key=prio, reverse=True)
+                    ress = ress[:3]
 
         return sups, ress
 
