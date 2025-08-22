@@ -4141,6 +4141,7 @@ async def _entry_exit_levels(
                 hi = lvl["level"] + band
                 far = is_far(lvl)
                 overlap = False
+                close = False
                 if not far:
                     for k in kept:
                         k_band = k["level"] * 0.004
@@ -4150,7 +4151,17 @@ async def _entry_exit_levels(
                         if inter > 0 and inter >= 0.5 * min(hi - lo, k_hi - k_lo):
                             overlap = True
                             break
-                if overlap:
+                        # проверяем расстояние между зонами
+                        if hi <= k_lo:
+                            gap = k_lo - hi
+                        elif lo >= k_hi:
+                            gap = lo - k_hi
+                        else:
+                            gap = 0
+                        if gap and gap / min(lvl["level"], k["level"]) < 0.015:
+                            close = True
+                            break
+                if overlap or close:
                     continue
                 kept.append(lvl)
                 if not far:
@@ -4167,30 +4178,13 @@ async def _entry_exit_levels(
         near_sups = [s for s in sups if not is_far(s)]
         near_ress = [r for r in ress if not is_far(r)]
 
-        # ограничиваем количество ближних зон
-        if len(near_sups) + len(near_ress) > 3:
-            combined = sorted(
-                [(lvl, "sup") for lvl in near_sups]
-                + [(lvl, "res") for lvl in near_ress],
-                key=lambda x: prio(x[0]),
-                reverse=True,
-            )
-            near_sups, near_ress = [], []
-            for lvl, typ in combined:
-                if typ == "sup" and len(near_sups) < 2:
-                    near_sups.append(lvl)
-                elif typ == "res" and len(near_ress) < 2:
-                    near_ress.append(lvl)
-                if len(near_sups) + len(near_ress) == 3:
-                    break
-
         near_sups.sort(key=prio, reverse=True)
         near_ress.sort(key=prio, reverse=True)
         far_sups.sort(key=prio, reverse=True)
         far_ress.sort(key=prio, reverse=True)
 
-        sups = near_sups + far_sups
-        ress = near_ress + far_ress
+        sups = near_sups[:2] + far_sups
+        ress = near_ress[:2] + far_ress
 
         return sups, ress
 
