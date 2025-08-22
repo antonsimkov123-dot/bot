@@ -4941,12 +4941,12 @@ async def ai_coin_prompt(cb: types.CallbackQuery, state: FSMContext):
 @dp.message(AICoinState.enter_symbol)
 async def ai_coin_analyze(msg: types.Message, state: FSMContext):
     sym = (msg.text or "").strip().upper()
-    base = sym
-    symbol = f"{base}USDT"
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
-    )
     async with ChatActionSender.typing(bot, msg.chat.id):
+        base = sym
+        symbol = f"{base}USDT"
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
+        )
         price = await fetch_price(base)
         if price is None:
             await msg.answer(
