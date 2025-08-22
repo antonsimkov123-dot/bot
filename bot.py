@@ -26,6 +26,9 @@ import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.patches import Rectangle
+import matplotlib.patheffects as pe
 
 plt.rcParams.update({
     "font.family": "sans-serif",
@@ -3999,14 +4002,74 @@ async def _generate_price_chart(
     if not candles:
         return None
     candles = sorted(candles, key=lambda c: int(c[0]))
+    opens = [float(c[1]) for c in candles]
+    highs = [float(c[2]) for c in candles]
+    lows = [float(c[3]) for c in candles]
     closes = [float(c[4]) for c in candles]
-    fig, ax = make_fig()
-    ax.plot(range(len(closes)), closes, color="white", linewidth=1)
-    ax.axhline(support, color="green", linestyle="--")
-    ax.axhline(resistance, color="red", linestyle="--")
+    volumes = [float(c[5]) for c in candles]
+
+    fig, (ax, ax_v) = plt.subplots(
+        2,
+        1,
+        figsize=(8, 6),
+        sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]},
+        facecolor="#1e1e1e",
+    )
+    for a in (ax, ax_v):
+        a.set_facecolor("#1e1e1e")
+        a.grid(color="gray", linestyle="--", alpha=0.3)
+        a.tick_params(colors="white")
+        for spine in a.spines.values():
+            spine.set_color("white")
+
+    width = 0.6
+    for i, (o, h, l, c, v) in enumerate(zip(opens, highs, lows, closes, volumes)):
+        color = "#00e676" if c >= o else "#ff1744"
+        ax.plot([i, i], [l, h], color=color, linewidth=1, zorder=1)
+        rect = Rectangle(
+            (i - width / 2, min(o, c)),
+            width,
+            abs(c - o) or 0.001,
+            facecolor=color,
+            edgecolor=color,
+            alpha=0.9,
+            zorder=2,
+        )
+        rect.set_path_effects([
+            pe.withStroke(linewidth=2, foreground="black", alpha=0.3)
+        ])
+        ax.add_patch(rect)
+        ax_v.bar(i, v, width=width, color=color, alpha=0.5)
+
+    ax.set_xlim(-0.5, len(candles) - 0.5)
+
+    lo, hi = sorted([support, resistance])
+    gradient = np.linspace(0, 1, 256).reshape(-1, 1)
+    ax.imshow(
+        gradient,
+        extent=[-0.5, len(candles) - 0.5, lo, hi],
+        cmap="Greys",
+        alpha=0.05,
+        aspect="auto",
+        zorder=0,
+    )
+    band = (hi - lo) * 0.003 or lo * 0.0003
+    ax.axhspan(support - band, support + band, color="#4caf50", alpha=0.2)
+    ax.axhspan(resistance - band, resistance + band, color="#f44336", alpha=0.2)
+    ax.text(len(candles) + 0.5, support, f"🟩 {support:.2f}", color="#4caf50", va="center")
+    ax.text(
+        len(candles) + 0.5, resistance, f"🟥 {resistance:.2f}", color="#f44336", va="center"
+    )
+
     ax.set_title(f"{symbol} {interval}")
+    plt.setp(ax.get_xticklabels(), visible=False)
+    ax_v.tick_params(axis="x", colors="white")
+    ax_v.set_ylabel("Vol", color="white")
+
     buf = BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight")
+    fig.tight_layout()
+    fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
     plt.close(fig)
     buf.seek(0)
     return BufferedInputFile(buf.getvalue(), filename=f"{symbol}_{interval}.png")
