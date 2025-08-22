@@ -4209,27 +4209,36 @@ async def _generate_price_chart(
     )
     def _draw_levels(levels: list[dict], color: str, icon: str) -> None:
         for idx, lvl in enumerate(levels):
-            alpha = 0.9 - idx * 0.3
-            style = "-" if idx == 0 else "--"
-            band = (hi - lo) * 0.003 or lvl["level"] * 0.0003
-            ax.axhspan(lvl["level"] - band, lvl["level"] + band, color=color, alpha=alpha * 0.2)
-            ax.axhline(lvl["level"], color=color, alpha=alpha, linestyle=style, linewidth=2)
-            text = f"{icon} {lvl['touches']} "
-            text += "касания" if icon == "⚠️" else "теста"
+            base_alpha = 0.25 * (0.7 ** idx)
+            if lvl["vol"] >= 1.5 or lvl["touches"] >= 3:
+                base_alpha += 0.15
+            alpha = min(base_alpha, 0.7)
+            step = 10 if lvl["level"] >= 1000 else 5
+            band = max(step, round(lvl["level"] * 0.004 / step) * step)
+            lo_zone = lvl["level"] - band
+            hi_zone = lvl["level"] + band
+            ax.axhspan(lo_zone, hi_zone, color=color, alpha=alpha)
+            name = "Поддержка" if icon == "🟩" else "Сопротивление"
+            text = f"{icon} {name}: {int(lo_zone)}–{int(hi_zone)}"
+            info: list[str] = []
+            if lvl["touches"] > 1:
+                info.append(f"{lvl['touches']} касания")
             if lvl["vol"] >= 1.5:
-                text += f" • объём {lvl['vol']:.1f}×"
+                info.append(f"объём {lvl['vol']:.1f}×")
+            if info:
+                text += " • " + ", ".join(info)
             ax.text(
                 len(candles) + 0.5,
-                lvl["level"],
+                (lo_zone + hi_zone) / 2,
                 text,
                 color=color,
                 va="center",
-                alpha=alpha,
+                alpha=min(alpha + 0.2, 1),
                 fontsize=8,
             )
 
-    _draw_levels(supports, "#4caf50", "🛡️")
-    _draw_levels(resistances, "#f44336", "⚠️")
+    _draw_levels(supports, "#4caf50", "🟩")
+    _draw_levels(resistances, "#f44336", "🟥")
 
     ax.set_title(f"{symbol} {interval}")
     plt.setp(ax.get_xticklabels(), visible=False)
