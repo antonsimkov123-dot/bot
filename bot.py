@@ -4072,21 +4072,87 @@ async def _entry_exit_levels(
             touches = sum(1 for v in arr if abs(v - lvl) / lvl < 0.004)
             vol_ratio = rec["vol"] / avg_vol if avg_vol else 0
             dist = abs(cur_price - lvl)
-            weight = touches + (1 if vol_ratio >= 1.5 else 0) + 1 / (1 + dist / basis)
             res.append(
                 {
                     "level": float(lvl),
                     "touches": touches,
                     "vol": vol_ratio,
-                    "weight": weight,
+                    "dist": dist,
                 }
             )
-        res.sort(key=lambda x: x["weight"], reverse=True)
-        return res[:3]
+        res.sort(key=lambda x: (x["touches"], x["vol"] >= 1.5, -x["dist"]), reverse=True)
+        filtered: list[dict] = []
+        for lvl in res:
+            if any(
+                abs(lvl["level"] - f["level"]) / min(lvl["level"], f["level"]) < 0.005
+                for f in filtered
+            ):
+                continue
+            filtered.append(lvl)
+        return filtered
 
     res_levels = _prepare_levels(swing_highs, highs)
     sup_levels = _prepare_levels(swing_lows, lows)
     if not res_levels or not sup_levels:
+        msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        return msg, [], []
+
+    def _select_zones(
+        sups: list[dict], ress: list[dict]
+    ) -> tuple[list[dict], list[dict]]:
+        def prio(l: dict) -> tuple[int, bool, float]:
+            return (l["touches"], l["vol"] >= 1.5, -l["dist"])
+
+        sups.sort(key=prio, reverse=True)
+        ress.sort(key=prio, reverse=True)
+        chosen: list[tuple[str, dict]] = []
+        if sups:
+            chosen.append(("sup", sups[0]))
+        if ress:
+            chosen.append(("res", ress[0]))
+        extras: list[tuple[str, dict]] = []
+        if len(sups) > 1:
+            extras.append(("sup", sups[1]))
+        if len(ress) > 1:
+            extras.append(("res", ress[1]))
+        extras.sort(key=lambda x: prio(x[1]), reverse=True)
+        for typ, lvl in extras:
+            if len(chosen) >= 3:
+                break
+            if typ == "sup":
+                if sum(1 for t, _ in chosen if t == "sup") >= 2:
+                    continue
+                if any(
+                    t == "sup"
+                    and abs(lvl["level"] - c["level"]) / min(lvl["level"], c["level"]) < 0.02
+                    for _, c in chosen
+                ):
+                    continue
+            else:
+                if sum(1 for t, _ in chosen if t == "res") >= 2:
+                    continue
+                if any(
+                    t == "res"
+                    and abs(lvl["level"] - c["level"]) / min(lvl["level"], c["level"]) < 0.02
+                    for _, c in chosen
+                ):
+                    continue
+            chosen.append((typ, lvl))
+        final: list[tuple[str, dict]] = []
+        for typ, lvl in sorted(chosen, key=lambda x: prio(x[1]), reverse=True):
+            if any(
+                abs(lvl["level"] - c["level"]) / min(lvl["level"], c["level"]) < 0.004
+                for _, c in final
+            ):
+                continue
+            final.append((typ, lvl))
+        sup_res = [lvl for t, lvl in final if t == "sup"]
+        res_res = [lvl for t, lvl in final if t == "res"]
+        return sup_res, res_res
+
+    sup_levels, res_levels = _select_zones(sup_levels, res_levels)
+
+    if not sup_levels or not res_levels:
         msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
         return msg, [], []
 
