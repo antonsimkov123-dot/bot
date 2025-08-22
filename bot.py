@@ -3508,10 +3508,15 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
         reco_block = ""
         levels_block = ""
         if symbol and ttype:
-            trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype)
+            vol_line, vol_note, vol_short = await _volume_24h(symbol)
+            trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype, vol_short)
             rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
             levels_block = await _entry_exit_levels(symbol)
-            reco_block = f"\n\n{rec_block}\n{verdict_line}"
+            vol_block = "\n".join(filter(None, [vol_line, vol_note]))
+            reco_block = ""
+            if vol_block:
+                reco_block += f"\n\n{vol_block}"
+            reco_block += f"\n\n{rec_block}\n{verdict_line}"
             if levels_block:
                 reco_block += f"\n\n{levels_block}"
         if trend_text:
@@ -3668,6 +3673,41 @@ async def _fetch_kline(symbol: str, interval: str, limit: int = 7) -> list:
     return []
 
 
+async def _volume_24h(symbol: str) -> tuple[str, str, str]:
+    candles = await _fetch_kline(symbol, "D", 6)
+    if not candles:
+        return "", "", ""
+    candles = sorted(candles, key=lambda c: int(c[0]))[-6:]
+    vols = [float(c[5]) for c in candles]
+    cur = vols[-1]
+    prev = vols[:-1]
+    avg = sum(prev) / len(prev) if prev else 0
+
+    def fmt_vol(v: float) -> str:
+        if v >= 1e9:
+            return f"${v/1e9:.2f} млрд"
+        if v >= 1e6:
+            return f"${v/1e6:.2f} млн"
+        return f"${v:.0f}"
+
+    base = f"📊 Объём за 24ч: {fmt_vol(cur)}"
+    if avg:
+        diff = (cur - avg) / avg * 100
+        if diff >= 15:
+            note = f"🟢 Выше среднего на {diff:.0f}% — сигнал усиливается"
+            short = "объёмы выше среднего"
+        elif diff <= -15:
+            note = f"🔴 Ниже среднего на {abs(diff):.0f}% — возможная слабость сигнала"
+            short = "объёмы ниже среднего"
+        else:
+            note = "⚪ Объёмы на среднем уровне — нейтрально"
+            short = "объёмы на среднем уровне"
+    else:
+        note = "⚪ Объём на текущем уровне — нейтрально"
+        short = "объёмы на текущем уровне"
+    return base, note, short
+
+
 async def _micro_trend_tf(symbol: str, interval: str, limit: int = 50) -> dict:
     candles = await _fetch_kline(symbol, interval, limit + 10)
     if not candles:
@@ -3767,7 +3807,7 @@ async def _micro_trend_tf(symbol: str, interval: str, limit: int = 50) -> dict:
     }
 
 
-def _trend_line(name: str, limit: int, data: dict) -> str:
+def _trend_line(name: str, limit: int, data: dict, extra_vol: str = "") -> str:
     trend = data.get("trend")
     used = data.get("used", 0)
     if trend == "nodata":
@@ -3794,6 +3834,8 @@ def _trend_line(name: str, limit: int, data: dict) -> str:
         "down": "объёмы падают",
         "flat": "объёмы стабильны",
     }.get(vol_dir, "объёмы без изменений")
+    if extra_vol:
+        vol_phrase += f", {extra_vol}"
 
     arrow = {
         "up": "⬆️ Восходящий",
@@ -3808,7 +3850,7 @@ def _trend_line(name: str, limit: int, data: dict) -> str:
     return f"🔵 {name} ({limit} свечей): {arrow} ({price_str}, {slope_str}, {struct_phrase}, {vol_phrase})"
 
 
-async def _analyze_micro_trend(symbol: str, ttype: str) -> tuple[str, dict, dict]:
+async def _analyze_micro_trend(symbol: str, ttype: str, vol_short: str = "") -> tuple[str, dict, dict]:
     d_res: dict[str, dict] = {}
     for lvl, lim in TREND_WINDOWS["D"].items():
         d_res[lvl] = await _micro_trend_tf(symbol, "D", lim)
@@ -3818,11 +3860,11 @@ async def _analyze_micro_trend(symbol: str, ttype: str) -> tuple[str, dict, dict
 
     d_lines = ["📈 Тренд по 1D:"]
     for lvl, lim in TREND_WINDOWS["D"].items():
-        d_lines.append(_trend_line(TREND_LEVELS[lvl], lim, d_res[lvl]))
+        d_lines.append(_trend_line(TREND_LEVELS[lvl], lim, d_res[lvl], vol_short))
 
     h_lines = ["📉 Тренд по 4H:"]
     for lvl, lim in TREND_WINDOWS["240"].items():
-        h_lines.append(_trend_line(TREND_LEVELS[lvl], lim, h_res[lvl]))
+        h_lines.append(_trend_line(TREND_LEVELS[lvl], lim, h_res[lvl], vol_short))
 
     if d_res["global"].get("trend") == "down" and h_res["global"].get("trend") == "up":
         h_lines[1] = h_lines[1].replace("⬆️ Восходящий", "⬆️ Восходящий откат в нисходящем тренде")
@@ -4149,10 +4191,15 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
         return
     total, strong, _, _ = signal_stats(sig_list)
     risk = float(risk)
-    trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype)
+    vol_line, vol_note, vol_short = await _volume_24h(symbol)
+    trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype, vol_short)
     rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
     levels_block = await _entry_exit_levels(symbol)
-    trend_block = trend_text + f"\n\n{rec_block}\n{verdict_line}"
+    vol_block = "\n".join(filter(None, [vol_line, vol_note]))
+    trend_block = trend_text
+    if vol_block:
+        trend_block += f"\n\n{vol_block}"
+    trend_block += f"\n\n{rec_block}\n{verdict_line}"
     if levels_block:
         trend_block += f"\n\n{levels_block}"
     text = "💡 Сетап оценён!\n\n" + trend_block + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
@@ -4894,10 +4941,15 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
        f"⚪️ Слабые: {weak}",
        f"🛑 Риск по стопу: {risk:.1f}%",
     ]
-    trend_text, d_res, h_res = await _analyze_micro_trend(symbol, t_type)
+    vol_line, vol_note, vol_short = await _volume_24h(symbol)
+    trend_text, d_res, h_res = await _analyze_micro_trend(symbol, t_type, vol_short)
     rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
     levels_block = await _entry_exit_levels(symbol)
-    trend_block = trend_text + f"\n\n{rec_block}\n{verdict_line}"
+    vol_block = "\n".join(filter(None, [vol_line, vol_note]))
+    trend_block = trend_text
+    if vol_block:
+        trend_block += f"\n\n{vol_block}"
+    trend_block += f"\n\n{rec_block}\n{verdict_line}"
     if levels_block:
         trend_block += f"\n\n{levels_block}"
     text = "\n".join(parts) + "\n\n" + trend_block + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
