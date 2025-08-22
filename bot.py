@@ -65,6 +65,7 @@ def add_labels(ax: plt.Axes, fmt: str = "{:.1f}") -> None:
 # ---------- CONFIG ----------
 BOT_TOKEN = "8205192350:AAHUEmqDQK37-5D7dpcTUeMdpA6WpDACMkc"  # поменяй после теста!
 DB_PATH = "trades.db"
+MULTI_SR_MODE = True  # переключатель множественных уровней поддержки/сопротивления
 
 MONTHS_RU = [
     "",
@@ -3941,7 +3942,7 @@ def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str]:
     return "\n".join(lines), verdict
 
 
-async def _entry_exit_levels(
+async def _entry_exit_levels_old(
     symbol: str, entry: float | None = None, interval: str = "240"
 ) -> tuple[str, float | None, float | None]:
     candles = await _fetch_kline(symbol, interval, 60)
@@ -4013,11 +4014,137 @@ async def _entry_exit_levels(
     return msg, float(lo_lvl), float(hi_lvl)
 
 
+async def _entry_exit_levels(
+    symbol: str, entry: float | None = None, interval: str = "240",
+) -> tuple[str, list[dict], list[dict]]:
+    candles = await _fetch_kline(symbol, interval, 60)
+    if not candles or len(candles) < 50:
+        msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        return msg, [], []
+    candles = sorted(candles, key=lambda c: int(c[0]))[-50:]
+    highs = [float(c[2]) for c in candles]
+    lows = [float(c[3]) for c in candles]
+    closes = [float(c[4]) for c in candles]
+    vols = [float(c[5]) for c in candles]
+    avg_vol = sum(vols) / len(vols) if vols else 0
+    cur_price = closes[-1]
+
+    swing_highs: list[tuple[float, float]] = []
+    swing_lows: list[tuple[float, float]] = []
+    for i in range(2, len(highs) - 2):
+        h = highs[i]
+        l = lows[i]
+        if (
+            h >= highs[i - 1]
+            and h >= highs[i - 2]
+            and h >= highs[i + 1]
+            and h >= highs[i + 2]
+            and (entry is None or h >= entry)
+        ):
+            swing_highs.append((h, vols[i]))
+        if (
+            l <= lows[i - 1]
+            and l <= lows[i - 2]
+            and l <= lows[i + 1]
+            and l <= lows[i + 2]
+            and (entry is None or l <= entry)
+        ):
+            swing_lows.append((l, vols[i]))
+    if not swing_highs and entry is not None:
+        swing_highs = [(highs[i], vols[i]) for i in range(len(highs))]
+    if not swing_lows and entry is not None:
+        swing_lows = [(lows[i], vols[i]) for i in range(len(lows))]
+    if not swing_highs or not swing_lows:
+        msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        return msg, [], []
+
+    basis = entry if entry is not None else cur_price
+    step = 10 if basis >= 1000 else 5
+
+    def _prepare_levels(swings: list[tuple[float, float]], arr: list[float]) -> list[dict]:
+        levels: dict[int, dict] = {}
+        for val, vol in swings:
+            lvl = int(round(val / step) * step)
+            rec = levels.setdefault(lvl, {"vol": 0.0})
+            rec["vol"] = max(rec["vol"], vol)
+        res: list[dict] = []
+        for lvl, rec in levels.items():
+            touches = sum(1 for v in arr if abs(v - lvl) / lvl < 0.004)
+            vol_ratio = rec["vol"] / avg_vol if avg_vol else 0
+            dist = abs(cur_price - lvl)
+            weight = touches + (1 if vol_ratio >= 1.5 else 0) + 1 / (1 + dist / basis)
+            res.append(
+                {
+                    "level": float(lvl),
+                    "touches": touches,
+                    "vol": vol_ratio,
+                    "weight": weight,
+                }
+            )
+        res.sort(key=lambda x: x["weight"], reverse=True)
+        return res[:3]
+
+    res_levels = _prepare_levels(swing_highs, highs)
+    sup_levels = _prepare_levels(swing_lows, lows)
+    if not res_levels or not sup_levels:
+        msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        return msg, [], []
+
+    if not MULTI_SR_MODE:
+        res_levels = res_levels[:1]
+        sup_levels = sup_levels[:1]
+
+    hi_lvl = res_levels[0]["level"]
+    lo_lvl = sup_levels[0]["level"]
+    if hi_lvl <= lo_lvl:
+        msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        return msg, [], []
+
+    lines: list[str] = []
+    desc = f"Следи за зоной {int(lo_lvl)}–{int(hi_lvl)}. Пробой вверх — можно входить."
+    notes = []
+    if res_levels[0]["vol"] >= 1.5:
+        notes.append("сопротивление усилено объёмом")
+    if sup_levels[0]["vol"] >= 1.5:
+        notes.append("поддержка подтверждена объёмом")
+    if res_levels[0]["touches"] > 1:
+        notes.append(f"верх тестировался {res_levels[0]['touches']} раза")
+    if sup_levels[0]["touches"] > 1:
+        notes.append(f"низ тестировался {sup_levels[0]['touches']} раза")
+    if notes:
+        desc += " " + ", ".join(notes) + "."
+    lines.append("— " + desc)
+    lines.append(f"— Жди закрепа выше {int(hi_lvl)} — для уверенного входа.")
+    lines.append(f"— Пробой вниз ниже {int(lo_lvl)} — лучше не входить (риск усилится).")
+    msg = "📊 Уровни входа/выхода:\n" + "\n".join(lines)
+
+    if MULTI_SR_MODE:
+        tbl: list[str] = []
+        if sup_levels:
+            tbl.append(f"Поддержки ({'1D' if interval == 'D' else '4H'}):")
+            for s in sup_levels:
+                vol_txt = (
+                    f", объём {s['vol']:.1f}×" if s["vol"] >= 1.5 else ", слабый объём"
+                )
+                tbl.append(f"— {s['level']:.2f} ({s['touches']} теста{vol_txt})")
+        if res_levels:
+            tbl.append(f"Сопротивления ({'1D' if interval == 'D' else '4H'}):")
+            for r in res_levels:
+                vol_txt = (
+                    f", объём {r['vol']:.1f}×" if r["vol"] >= 1.5 else ", слабый объём"
+                )
+                tbl.append(f"— {r['level']:.2f} ({r['touches']} касания{vol_txt})")
+        if tbl:
+            msg += "\n\n" + "\n".join(tbl)
+
+    return msg, sup_levels, res_levels
+
+
 async def _generate_price_chart(
     symbol: str,
     interval: str,
-    support: float,
-    resistance: float,
+    supports: list[dict],
+    resistances: list[dict],
     label: str,
 ) -> BufferedInputFile | None:
     candles = await _fetch_kline(symbol, interval, 100)
@@ -4066,7 +4193,11 @@ async def _generate_price_chart(
 
     ax.set_xlim(-0.5, len(candles) - 0.5)
 
-    lo, hi = sorted([support, resistance])
+    if not supports or not resistances:
+        return None
+    main_sup = supports[0]["level"]
+    main_res = resistances[0]["level"]
+    lo, hi = sorted([main_sup, main_res])
     gradient = np.linspace(0, 1, 256).reshape(-1, 1)
     ax.imshow(
         gradient,
@@ -4076,23 +4207,29 @@ async def _generate_price_chart(
         aspect="auto",
         zorder=0,
     )
-    band = (hi - lo) * 0.003 or lo * 0.0003
-    ax.axhspan(support - band, support + band, color="#4caf50", alpha=0.2)
-    ax.axhspan(resistance - band, resistance + band, color="#f44336", alpha=0.2)
-    ax.text(
-        len(candles) + 0.5,
-        support,
-        f"🟩 Поддержка {label}: {support:.2f}",
-        color="#4caf50",
-        va="center",
-    )
-    ax.text(
-        len(candles) + 0.5,
-        resistance,
-        f"🟥 Сопротивление {label}: {resistance:.2f}",
-        color="#f44336",
-        va="center",
-    )
+    def _draw_levels(levels: list[dict], color: str, icon: str) -> None:
+        for idx, lvl in enumerate(levels):
+            alpha = 0.9 - idx * 0.3
+            style = "-" if idx == 0 else "--"
+            band = (hi - lo) * 0.003 or lvl["level"] * 0.0003
+            ax.axhspan(lvl["level"] - band, lvl["level"] + band, color=color, alpha=alpha * 0.2)
+            ax.axhline(lvl["level"], color=color, alpha=alpha, linestyle=style, linewidth=2)
+            text = f"{icon} {lvl['touches']} "
+            text += "касания" if icon == "⚠️" else "теста"
+            if lvl["vol"] >= 1.5:
+                text += f" • объём {lvl['vol']:.1f}×"
+            ax.text(
+                len(candles) + 0.5,
+                lvl["level"],
+                text,
+                color=color,
+                va="center",
+                alpha=alpha,
+                fontsize=8,
+            )
+
+    _draw_levels(supports, "#4caf50", "🛡️")
+    _draw_levels(resistances, "#f44336", "⚠️")
 
     ax.set_title(f"{symbol} {interval}")
     plt.setp(ax.get_xticklabels(), visible=False)
@@ -4110,25 +4247,25 @@ async def _generate_price_chart(
 async def _send_sr_charts(
     chat_id: int,
     symbol: str,
-    support_4h: float | None,
-    resistance_4h: float | None,
+    supports_4h: list[dict] | None,
+    resistances_4h: list[dict] | None,
     entry: float | None = None,
 ) -> None:
-    _, support_1d, resistance_1d = await _entry_exit_levels(symbol, entry, interval="D")
-    if support_4h is None or resistance_4h is None:
-        _, support_4h, resistance_4h = await _entry_exit_levels(symbol, entry)
-    for label, interval, sup, res in (
-        ("1D", "D", support_1d, resistance_1d),
-        ("4H", "240", support_4h, resistance_4h),
+    _, sup_1d, res_1d = await _entry_exit_levels(symbol, entry, interval="D")
+    if not supports_4h or not resistances_4h:
+        _, supports_4h, resistances_4h = await _entry_exit_levels(symbol, entry)
+    for label, interval, sup_list, res_list in (
+        ("1D", "D", sup_1d, res_1d),
+        ("4H", "240", supports_4h, resistances_4h),
     ):
-        if sup is None or res is None:
+        if not sup_list or not res_list:
             continue
-        file = await _generate_price_chart(symbol, interval, sup, res, label)
+        file = await _generate_price_chart(symbol, interval, sup_list, res_list, label)
         if not file:
             continue
-        caption = (
-            f"{label}:\n🟩 Поддержка {label}: {sup:.2f}\n🟥 Сопротивление {label}: {res:.2f}"
-        )
+        sup = sup_list[0]["level"]
+        res = res_list[0]["level"]
+        caption = f"{label}:\n🟩 Поддержка {label}: {sup:.2f}\n🟥 Сопротивление {label}: {res:.2f}"
         await bot.send_photo(chat_id, file, caption=caption)
 
 
@@ -4398,7 +4535,7 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
     vol_line, vol_note, vol_short = await _volume_24h(symbol)
     trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype, vol_short)
     rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
-    levels_block, support, resistance = await _entry_exit_levels(symbol)
+    levels_block, supports, resistances = await _entry_exit_levels(symbol)
     vol_block = "\n".join(filter(None, [vol_line, vol_note]))
     trend_block = trend_text
     if vol_block:
@@ -4408,7 +4545,7 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
         trend_block += f"\n\n{levels_block}"
     text = "💡 Сетап оценён!\n\n" + trend_block + "\n\n" + await _build_ai_advice(uid, sig_list, strong, total, risk, symbol)
     await bot.send_message(uid, text)
-    await _send_sr_charts(uid, symbol, support, resistance)
+    await _send_sr_charts(uid, symbol, supports, resistances)
 
 
 @dp.callback_query(TradeState.confirming, lambda c: c.data == "confirm_add")
@@ -5107,7 +5244,7 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
         vol_line, vol_note, vol_short = await _volume_24h(base)
         trend_text, d_res, h_res = await _analyze_micro_trend(base, "LONG", vol_short)
         rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
-        levels_block, support, resistance = await _entry_exit_levels(base, price)
+        levels_block, supports, resistances = await _entry_exit_levels(base, price)
         vol_block = "\n".join(filter(None, [vol_line, vol_note]))
         trend_block = trend_text
         if vol_block:
@@ -5117,7 +5254,7 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
             trend_block += f"\n\n{levels_block}"
         advice = await _build_ai_advice(msg.from_user.id, [], 0, 0, 0, base)
         await msg.answer(trend_block + "\n\n" + advice, reply_markup=with_back(kb))
-        await _send_sr_charts(msg.chat.id, base, support, resistance, price)
+        await _send_sr_charts(msg.chat.id, base, supports, resistances, price)
     await state.clear()
 
 
@@ -5199,7 +5336,7 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
         vol_line, vol_note, vol_short = await _volume_24h(symbol)
         trend_text, d_res, h_res = await _analyze_micro_trend(symbol, t_type, vol_short)
         rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
-        levels_block, support, resistance = await _entry_exit_levels(symbol)
+        levels_block, supports, resistances = await _entry_exit_levels(symbol)
         vol_block = "\n".join(filter(None, [vol_line, vol_note]))
         trend_block = trend_text
         if vol_block:
@@ -5223,7 +5360,7 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
             )
         )
         await cb.message.answer(text, reply_markup=kb)
-        await _send_sr_charts(cb.message.chat.id, symbol, support, resistance)
+        await _send_sr_charts(cb.message.chat.id, symbol, supports, resistances)
 
 
 @dp.callback_query(F.data == "ai_habits")
