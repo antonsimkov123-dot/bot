@@ -4914,7 +4914,6 @@ async def ai_menu(cb: types.CallbackQuery, state: FSMContext):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🧠 AI-Советник", callback_data="ai_trades")],
-            [InlineKeyboardButton(text="🤖 Проанализировать монету", callback_data="ai_coin")],
             [InlineKeyboardButton(text="📊 Мои привычки", callback_data="ai_habits")],
             [InlineKeyboardButton(text="🔔 Уведомления", callback_data="ai_notif")],
             [InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")],
@@ -4975,7 +4974,10 @@ async def ai_advisor_list(cb: types.CallbackQuery, state: FSMContext):
         ).fetchall()
     if not rows:
         kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🤖 Проанализировать монету", callback_data="ai_coin")],
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")],
+            ]
         )
         await cb.message.answer("У тебя нет активных сделок.", reply_markup=with_back(kb))
         return
@@ -4992,6 +4994,7 @@ async def ai_advisor_list(cb: types.CallbackQuery, state: FSMContext):
         buttons.append([
             InlineKeyboardButton(text=label, callback_data=f"aix_{tid}")
         ])
+    buttons.append([InlineKeyboardButton(text="🤖 Проанализировать монету", callback_data="ai_coin")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")])
     kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
     await cb.message.answer("Выбери сделку для анализа:", reply_markup=kb)
