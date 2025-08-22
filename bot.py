@@ -573,6 +573,10 @@ class HabitNotifyState(StatesGroup):
     time = State()
 
 
+class AICoinState(StatesGroup):
+    enter_symbol = State()
+
+
 class PriceAlertState(StatesGroup):
     enter_symbol = State()
     waiting_price = State()
@@ -4910,12 +4914,51 @@ async def ai_menu(cb: types.CallbackQuery, state: FSMContext):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="🧠 AI-Советник", callback_data="ai_trades")],
+            [InlineKeyboardButton(text="🤖 Проанализировать монету", callback_data="ai_coin")],
             [InlineKeyboardButton(text="📊 Мои привычки", callback_data="ai_habits")],
             [InlineKeyboardButton(text="🔔 Уведомления", callback_data="ai_notif")],
             [InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")],
         ]
     )
     await cb.message.answer("Что тебя интересует?", reply_markup=with_back(kb))
+
+
+@dp.callback_query(F.data == "ai_coin")
+async def ai_coin_prompt(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    await cb.message.answer("Введи тикер монеты (например, BTC):")
+    await state.set_state(AICoinState.enter_symbol)
+
+
+@dp.message(AICoinState.enter_symbol)
+async def ai_coin_analyze(msg: types.Message, state: FSMContext):
+    sym = (msg.text or "").strip().upper()
+    base = sym
+    symbol = f"{base}USDT"
+    price = await fetch_price(base)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
+    )
+    if price is None:
+        await msg.answer(f"❌ Монета {symbol} не найдена. Проверь тикер.", reply_markup=with_back(kb))
+        await state.clear()
+        return
+    vol_line, vol_note, vol_short = await _volume_24h(base)
+    trend_text, d_res, h_res = await _analyze_micro_trend(base, "LONG", vol_short)
+    rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
+    levels_block = await _entry_exit_levels(base)
+    vol_block = "\n".join(filter(None, [vol_line, vol_note]))
+    trend_block = trend_text
+    if vol_block:
+        trend_block += f"\n\n{vol_block}"
+    trend_block += f"\n\n{rec_block}\n{verdict_line}"
+    if levels_block:
+        trend_block += f"\n\n{levels_block}"
+    advice = await _build_ai_advice(msg.from_user.id, [], 0, 0, 0, base)
+    await msg.answer(trend_block + "\n\n" + advice, reply_markup=with_back(kb))
+    await state.clear()
 
 
 @dp.callback_query(F.data == "ai_trades")
