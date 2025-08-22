@@ -3906,9 +3906,12 @@ def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str]:
                 action = "следи за разворотом вниз" if trend == "up" else "следи за разворотом вверх"
                 return f"{LEVEL_EMOJI[lvl]} {LEVEL_NAME[lvl]} ({tf}): {arrow} — {action}"
         if trend not in {"up", "down"} or struct == "mixed":
-            action = "Неопределённый — наблюдай"
+            action = "🟡 Тренд неопределён — наблюдай, жди подтверждений"
         elif vol == trend:
-            action = "Ищи вход"
+            if trend == "down":
+                action = "🟢 Ищи вход на Long — возможно дно, смотри уровни"
+            else:
+                action = "🔴 Ищи вход на Short — возможно вершина"
         else:
             action = "Жди подтверждения"
         return f"{LEVEL_EMOJI[lvl]} {LEVEL_NAME[lvl]} ({tf}): {arrow} — {action}"
