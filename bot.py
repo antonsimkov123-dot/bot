@@ -4443,9 +4443,11 @@ async def _send_sr_charts(
     if not supports_4h or not resistances_4h:
         return
     _, sup_1d, res_1d = await _entry_exit_levels(symbol, entry, interval="D")
+    _, sup_1h, res_1h = await _entry_exit_levels(symbol, entry, interval="60")
     for label, interval, sup_list, res_list in (
-        ("4H", "240", supports_4h, resistances_4h),
         ("1D", "D", sup_1d, res_1d),
+        ("4H", "240", supports_4h, resistances_4h),
+        ("1H", "60", sup_1h, res_1h),
     ):
         if not sup_list or not res_list:
             continue
