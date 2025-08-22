@@ -3944,30 +3944,48 @@ def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str]:
 async def _entry_exit_levels(
     symbol: str, entry: float | None = None, interval: str = "240"
 ) -> tuple[str, float | None, float | None]:
-    candles = await _fetch_kline(symbol, interval, 30)
-    if not candles or len(candles) < 20:
+    candles = await _fetch_kline(symbol, interval, 60)
+    if not candles or len(candles) < 50:
         msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
         return msg, None, None
-    candles = sorted(candles, key=lambda c: int(c[0]))[-30:]
+    candles = sorted(candles, key=lambda c: int(c[0]))[-50:]
     highs = [float(c[2]) for c in candles]
     lows = [float(c[3]) for c in candles]
     vols = [float(c[5]) for c in candles]
     avg_vol = sum(vols) / len(vols) if vols else 0
 
-    def last_swing(vals, cmp, cond):
-        for i in range(len(vals) - 2, 0, -1):
-            if cmp(vals[i], vals[i - 1]) and cmp(vals[i], vals[i + 1]) and cond(vals[i]):
-                touches = sum(1 for v in vals if abs(v - vals[i]) / vals[i] < 0.002)
-                return vals[i], vols[i], touches
-        return None, None, None
-
-    cond_hi = (lambda v: entry is None or v >= entry)
-    cond_lo = (lambda v: entry is None or v <= entry)
-    high_val, high_vol, high_touch = last_swing(highs, lambda a, b: a > b, cond_hi)
-    low_val, low_vol, low_touch = last_swing(lows, lambda a, b: a < b, cond_lo)
-    if not high_val or not low_val:
+    swing_highs: list[tuple[float, float]] = []
+    swing_lows: list[tuple[float, float]] = []
+    for i in range(2, len(highs) - 2):
+        h = highs[i]
+        l = lows[i]
+        if (
+            h >= highs[i - 1]
+            and h >= highs[i - 2]
+            and h >= highs[i + 1]
+            and h >= highs[i + 2]
+            and (entry is None or h >= entry)
+        ):
+            swing_highs.append((h, vols[i]))
+        if (
+            l <= lows[i - 1]
+            and l <= lows[i - 2]
+            and l <= lows[i + 1]
+            and l <= lows[i + 2]
+            and (entry is None or l <= entry)
+        ):
+            swing_lows.append((l, vols[i]))
+    if not swing_highs and entry is not None:
+        swing_highs = [(highs[i], vols[i]) for i in range(len(highs))]
+    if not swing_lows and entry is not None:
+        swing_lows = [(lows[i], vols[i]) for i in range(len(lows))]
+    if not swing_highs or not swing_lows:
         msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
         return msg, None, None
+    high_val, high_vol = max(swing_highs, key=lambda x: x[0])
+    low_val, low_vol = min(swing_lows, key=lambda x: x[0])
+    high_touch = sum(1 for v in highs if abs(v - high_val) / high_val < 0.002)
+    low_touch = sum(1 for v in lows if abs(v - low_val) / low_val < 0.002)
     basis = entry if entry is not None else max(high_val, low_val)
     step = 10 if basis >= 1000 else 5
     hi_lvl = int(round(high_val / step) * step)
@@ -3982,9 +4000,9 @@ async def _entry_exit_levels(
         notes.append("сопротивление усилено объёмом")
     if low_vol and low_vol >= avg_vol * 1.5:
         notes.append("поддержка подтверждена объёмом")
-    if high_touch and high_touch > 1:
+    if high_touch > 1:
         notes.append(f"верх тестировался {high_touch} раза")
-    if low_touch and low_touch > 1:
+    if low_touch > 1:
         notes.append(f"низ тестировался {low_touch} раза")
     if notes:
         desc += " " + ", ".join(notes) + "."
