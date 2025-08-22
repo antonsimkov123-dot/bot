@@ -4172,7 +4172,7 @@ async def _entry_exit_levels(
                 if overlap:
                     continue
                 kept.append(lvl)
-                if len(kept) == 3:
+                if len(kept) == 5:
                     break
             return kept
 
@@ -4185,8 +4185,8 @@ async def _entry_exit_levels(
         near_sups = [s for s in sups if not is_far(s)]
         near_ress = [r for r in ress if not is_far(r)]
 
-        all_sups = sorted(near_sups + far_sups, key=prio, reverse=True)[:3]
-        all_ress = sorted(near_ress + far_ress, key=prio, reverse=True)[:3]
+        all_sups = sorted(near_sups + far_sups, key=prio, reverse=True)[:5]
+        all_ress = sorted(near_ress + far_ress, key=prio, reverse=True)[:5]
 
         sups = all_sups
         ress = all_ress
@@ -4210,7 +4210,7 @@ async def _entry_exit_levels(
                 if not overlap:
                     ress.append(top)
                     ress.sort(key=prio, reverse=True)
-                    ress = ress[:3]
+                    ress = ress[:5]
 
         return sups, ress
 
@@ -4376,15 +4376,15 @@ async def _generate_price_chart(
     def _draw_levels(levels: list[dict], is_support: bool) -> None:
         icon = "🟩" if is_support else "🟥"
         colors = (
-            {"strong": "#00FF00", "medium": "#90EE90"}
+            {"strong": "#00FF00", "medium": "#90EE90", "weak": "#00FFFF"}
             if is_support
-            else {"strong": "#FF0000", "medium": "#FFA500"}
+            else {"strong": "#FF0000", "medium": "#FFA500", "weak": "#FFFF00"}
         )
         for idx, lvl in enumerate(levels):
-            if lvl.get("importance") == "weak":
-                continue
             color = colors.get(lvl.get("importance"), list(colors.values())[1])
             base_alpha = 0.25 * (0.7 ** idx)
+            if lvl["importance"] == "weak":
+                base_alpha *= 0.6
             if lvl["vol"] >= 1.5 or lvl["touches"] >= 3:
                 base_alpha += 0.15
             alpha = min(base_alpha, 0.7)
@@ -4457,9 +4457,13 @@ async def _send_sr_charts(
         file = await _generate_price_chart(symbol, interval, sup_list, res_list, label, 300)
         if not file:
             continue
-        sup = sup_list[0]["level"]
-        res = res_list[0]["level"]
-        caption = f"{label}:\n🟩 Поддержка {label}: {sup:.2f}\n🟥 Сопротивление {label}: {res:.2f}"
+        sup_vals = ", ".join(f"{lvl['level']:.2f}" for lvl in sup_list[:5])
+        res_vals = ", ".join(f"{lvl['level']:.2f}" for lvl in res_list[:5])
+        caption = (
+            f"{label}:\n"
+            f"🟩 Поддержка {label}: {sup_vals}\n"
+            f"🟥 Сопротивление {label}: {res_vals}"
+        )
         await bot.send_photo(chat_id, file, caption=caption)
 
 
