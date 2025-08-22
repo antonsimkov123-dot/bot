@@ -4218,6 +4218,30 @@ async def _entry_exit_levels(
         )
         return msg, [], []
 
+    def _importance(level: dict) -> str:
+        score = 0
+        if level["touches"] >= 3:
+            score += 2
+        elif level["touches"] == 2:
+            score += 1
+        if level["vol"] >= 1.5:
+            score += 1
+        dist_pct = level["dist"] / cur_price if cur_price else 1
+        if dist_pct <= 0.02:
+            score += 2
+        elif dist_pct <= 0.05:
+            score += 1
+        if score >= 4:
+            return "strong"
+        if score >= 2:
+            return "medium"
+        return "weak"
+
+    for lvl in sup_levels:
+        lvl["importance"] = _importance(lvl)
+    for lvl in res_levels:
+        lvl["importance"] = _importance(lvl)
+
     if not MULTI_SR_MODE:
         res_levels = res_levels[:1]
         sup_levels = sup_levels[:1]
@@ -4335,8 +4359,15 @@ async def _generate_price_chart(
         aspect="auto",
         zorder=0,
     )
-    def _draw_levels(levels: list[dict], color: str, icon: str) -> None:
+    def _draw_levels(levels: list[dict], is_support: bool) -> None:
+        icon = "🟩" if is_support else "🟥"
+        colors = (
+            {"strong": "#00FF00", "medium": "#90EE90", "weak": "#00FFFF"}
+            if is_support
+            else {"strong": "#FF0000", "medium": "#FFA500", "weak": "#FFFF00"}
+        )
         for idx, lvl in enumerate(levels):
+            color = colors.get(lvl.get("importance"), list(colors.values())[1])
             base_alpha = 0.25 * (0.7 ** idx)
             if lvl["vol"] >= 1.5 or lvl["touches"] >= 3:
                 base_alpha += 0.15
@@ -4346,15 +4377,20 @@ async def _generate_price_chart(
             lo_zone = lvl["level"] - band
             hi_zone = lvl["level"] + band
             ax.axhspan(lo_zone, hi_zone, color=color, alpha=alpha)
-            name = "Поддержка" if icon == "🟩" else "Сопротивление"
+            name = "Поддержка" if is_support else "Сопротивление"
             text = f"{icon} {name}: {int(lo_zone)}–{int(hi_zone)}"
             info: list[str] = []
             if lvl["touches"] > 1:
                 info.append(f"{lvl['touches']} касания")
             if lvl["vol"] >= 1.5:
                 info.append(f"объём {lvl['vol']:.1f}×")
-            if info:
-                text += " • " + ", ".join(info)
+            importance_words = {
+                "strong": "сильная",
+                "medium": "средняя",
+                "weak": "слабая",
+            }
+            info.append(f"важность: {importance_words.get(lvl.get('importance'), 'средняя')}")
+            text += " • " + ", ".join(info)
             ax.text(
                 len(candles) + 0.5,
                 (lo_zone + hi_zone) / 2,
@@ -4365,8 +4401,8 @@ async def _generate_price_chart(
                 fontsize=8,
             )
 
-    _draw_levels(supports, "#4caf50", "🟩")
-    _draw_levels(resistances, "#f44336", "🟥")
+    _draw_levels(supports, True)
+    _draw_levels(resistances, False)
 
     ax.set_title(f"{symbol} {interval}")
     plt.setp(ax.get_xticklabels(), visible=False)
