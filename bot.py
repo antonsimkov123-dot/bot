@@ -4321,10 +4321,12 @@ async def _generate_price_chart(
     volumes = [float(c[5]) for c in candles]
     cur_price = closes[-1]
 
+    n = len(candles)
+    fig_width = 8 if n <= 120 else 8 * n / 120
     fig, (ax, ax_v) = plt.subplots(
         2,
         1,
-        figsize=(8, 6),
+        figsize=(fig_width, 6),
         sharex=True,
         gridspec_kw={"height_ratios": [3, 1]},
         facecolor="#1e1e1e",
