@@ -4308,8 +4308,9 @@ async def _generate_price_chart(
     supports: list[dict],
     resistances: list[dict],
     label: str,
+    limit: int = 120,
 ) -> BufferedInputFile | None:
-    candles = await _fetch_kline(symbol, interval, 100)
+    candles = await _fetch_kline(symbol, interval, limit)
     if not candles:
         return None
     candles = sorted(candles, key=lambda c: int(c[0]))
@@ -4425,7 +4426,7 @@ async def _generate_price_chart(
 
     buf = BytesIO()
     fig.tight_layout()
-    fig.savefig(buf, format="png", bbox_inches="tight", facecolor=fig.get_facecolor())
+    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
     plt.close(fig)
     buf.seek(0)
     return BufferedInputFile(buf.getvalue(), filename=f"{symbol}_{interval}.png")
@@ -4451,7 +4452,7 @@ async def _send_sr_charts(
     ):
         if not sup_list or not res_list:
             continue
-        file = await _generate_price_chart(symbol, interval, sup_list, res_list, label)
+        file = await _generate_price_chart(symbol, interval, sup_list, res_list, label, 120)
         if not file:
             continue
         sup = sup_list[0]["level"]
