@@ -3942,9 +3942,9 @@ def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str]:
 
 
 async def _entry_exit_levels(
-    symbol: str, entry: float | None = None
+    symbol: str, entry: float | None = None, interval: str = "240"
 ) -> tuple[str, float | None, float | None]:
-    candles = await _fetch_kline(symbol, "240", 30)
+    candles = await _fetch_kline(symbol, interval, 30)
     if not candles or len(candles) < 20:
         msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
         return msg, None, None
@@ -3996,7 +3996,11 @@ async def _entry_exit_levels(
 
 
 async def _generate_price_chart(
-    symbol: str, interval: str, support: float, resistance: float
+    symbol: str,
+    interval: str,
+    support: float,
+    resistance: float,
+    label: str,
 ) -> BufferedInputFile | None:
     candles = await _fetch_kline(symbol, interval, 100)
     if not candles:
@@ -4057,9 +4061,19 @@ async def _generate_price_chart(
     band = (hi - lo) * 0.003 or lo * 0.0003
     ax.axhspan(support - band, support + band, color="#4caf50", alpha=0.2)
     ax.axhspan(resistance - band, resistance + band, color="#f44336", alpha=0.2)
-    ax.text(len(candles) + 0.5, support, f"🟩 {support:.2f}", color="#4caf50", va="center")
     ax.text(
-        len(candles) + 0.5, resistance, f"🟥 {resistance:.2f}", color="#f44336", va="center"
+        len(candles) + 0.5,
+        support,
+        f"🟩 Поддержка {label}: {support:.2f}",
+        color="#4caf50",
+        va="center",
+    )
+    ax.text(
+        len(candles) + 0.5,
+        resistance,
+        f"🟥 Сопротивление {label}: {resistance:.2f}",
+        color="#f44336",
+        va="center",
     )
 
     ax.set_title(f"{symbol} {interval}")
@@ -4076,16 +4090,26 @@ async def _generate_price_chart(
 
 
 async def _send_sr_charts(
-    chat_id: int, symbol: str, support: float | None, resistance: float | None
+    chat_id: int,
+    symbol: str,
+    support_4h: float | None,
+    resistance_4h: float | None,
+    entry: float | None = None,
 ) -> None:
-    if support is None or resistance is None:
-        return
-    for label, interval in (("1D", "D"), ("4H", "240")):
-        file = await _generate_price_chart(symbol, interval, support, resistance)
+    _, support_1d, resistance_1d = await _entry_exit_levels(symbol, entry, interval="D")
+    if support_4h is None or resistance_4h is None:
+        _, support_4h, resistance_4h = await _entry_exit_levels(symbol, entry)
+    for label, interval, sup, res in (
+        ("1D", "D", support_1d, resistance_1d),
+        ("4H", "240", support_4h, resistance_4h),
+    ):
+        if sup is None or res is None:
+            continue
+        file = await _generate_price_chart(symbol, interval, sup, res, label)
         if not file:
             continue
         caption = (
-            f"{label}:\n🟩 Поддержка: {support:.2f}\n🟥 Сопротивление: {resistance:.2f}"
+            f"{label}:\n🟩 Поддержка {label}: {sup:.2f}\n🟥 Сопротивление {label}: {res:.2f}"
         )
         await bot.send_photo(chat_id, file, caption=caption)
 
@@ -5075,7 +5099,7 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
             trend_block += f"\n\n{levels_block}"
         advice = await _build_ai_advice(msg.from_user.id, [], 0, 0, 0, base)
         await msg.answer(trend_block + "\n\n" + advice, reply_markup=with_back(kb))
-        await _send_sr_charts(msg.chat.id, base, support, resistance)
+        await _send_sr_charts(msg.chat.id, base, support, resistance, price)
     await state.clear()
 
 
