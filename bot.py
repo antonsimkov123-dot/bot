@@ -3937,33 +3937,36 @@ def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str]:
     return "\n".join(lines), verdict
 
 
-async def _entry_exit_levels(symbol: str) -> str:
+async def _entry_exit_levels(symbol: str, entry: float | None = None) -> str:
     candles = await _fetch_kline(symbol, "240", 30)
     if not candles or len(candles) < 20:
-        return ""
+        return "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
     candles = sorted(candles, key=lambda c: int(c[0]))[-30:]
     highs = [float(c[2]) for c in candles]
     lows = [float(c[3]) for c in candles]
     vols = [float(c[5]) for c in candles]
     avg_vol = sum(vols) / len(vols) if vols else 0
 
-    def last_swing(vals, cmp):
+    def last_swing(vals, cmp, cond):
         for i in range(len(vals) - 2, 0, -1):
-            if cmp(vals[i], vals[i - 1]) and cmp(vals[i], vals[i + 1]):
+            if cmp(vals[i], vals[i - 1]) and cmp(vals[i], vals[i + 1]) and cond(vals[i]):
                 touches = sum(1 for v in vals if abs(v - vals[i]) / vals[i] < 0.002)
                 return vals[i], vols[i], touches
         return None, None, None
 
-    high_val, high_vol, high_touch = last_swing(highs, lambda a, b: a > b)
-    low_val, low_vol, low_touch = last_swing(lows, lambda a, b: a < b)
+    cond_hi = (lambda v: entry is None or v >= entry)
+    cond_lo = (lambda v: entry is None or v <= entry)
+    high_val, high_vol, high_touch = last_swing(highs, lambda a, b: a > b, cond_hi)
+    low_val, low_vol, low_touch = last_swing(lows, lambda a, b: a < b, cond_lo)
     if not high_val or not low_val:
-        return ""
-    step = 10 if max(high_val, low_val) >= 1000 else 5
+        return "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+    basis = entry if entry is not None else max(high_val, low_val)
+    step = 10 if basis >= 1000 else 5
     hi_lvl = int(round(high_val / step) * step)
     lo_lvl = int(round(low_val / step) * step)
     if hi_lvl <= lo_lvl:
-        return ""
-    lines = []
+        return "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+    lines: list[str] = []
     desc = f"Следи за зоной {lo_lvl}–{hi_lvl}. Пробой вверх — можно входить."
     notes = []
     if high_vol and high_vol >= avg_vol * 1.5:
@@ -4955,7 +4958,7 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
         vol_line, vol_note, vol_short = await _volume_24h(base)
         trend_text, d_res, h_res = await _analyze_micro_trend(base, "LONG", vol_short)
         rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
-        levels_block = await _entry_exit_levels(base)
+        levels_block = await _entry_exit_levels(base, price)
         vol_block = "\n".join(filter(None, [vol_line, vol_note]))
         trend_block = trend_text
         if vol_block:
