@@ -4114,61 +4114,57 @@ async def _entry_exit_levels(
     def _select_zones(
         sups: list[dict], ress: list[dict]
     ) -> tuple[list[dict], list[dict]]:
+        """Select up to two support and resistance zones each.
+
+        Zones that overlap more than 50% with a stronger one are skipped.
+        The routine always terminates because each level is inspected only
+        once and comparisons are limited to already accepted zones.
+        """
+
         def prio(l: dict) -> tuple[int, bool, float]:
             return (l["touches"], l["vol"] >= 1.5, -l["dist"])
 
-        sups.sort(key=prio, reverse=True)
-        ress.sort(key=prio, reverse=True)
-        chosen: list[tuple[str, dict]] = []
-        if sups:
-            chosen.append(("sup", sups[0]))
-        if ress:
-            chosen.append(("res", ress[0]))
-        extras: list[tuple[str, dict]] = []
-        if len(sups) > 1:
-            extras.append(("sup", sups[1]))
-        if len(ress) > 1:
-            extras.append(("res", ress[1]))
-        extras.sort(key=lambda x: prio(x[1]), reverse=True)
-        # используем двоичный поиск по ценам, чтобы не перебирать все зоны
-        from bisect import bisect_left
-
-        def _take(levels: list[dict]) -> list[dict]:
-            result: list[dict] = []
-            lows: list[float] = []
-            highs: list[float] = []
-            for lvl in levels:
-                band = lvl["level"] * 0.02  # 2 % дистанция между зонами
+        def _filter(levels: list[dict]) -> list[dict]:
+            kept: list[dict] = []
+            for lvl in sorted(levels, key=prio, reverse=True):
+                band = lvl["level"] * 0.004  # ±0.4% зона
                 lo = lvl["level"] - band
                 hi = lvl["level"] + band
-                i = bisect_left(lows, lo)
-                if i > 0 and hi > lows[i - 1] and lo < highs[i - 1]:
-                    continue
-                if i < len(lows) and hi > lows[i] and lo < highs[i]:
-                    continue
-                lows.insert(i, lo)
-                highs.insert(i, hi)
-                result.append(lvl)
-                if len(result) >= 2:
+                overlap = False
+                for k in kept:
+                    k_band = k["level"] * 0.004
+                    k_lo = k["level"] - k_band
+                    k_hi = k["level"] + k_band
+                    inter = min(hi, k_hi) - max(lo, k_lo)
+                    if inter > 0 and inter >= 0.5 * min(hi - lo, k_hi - k_lo):
+                        overlap = True
+                        break
+                if not overlap:
+                    kept.append(lvl)
+                if len(kept) == 2:
                     break
-            return result
+            return kept
 
-        sup_main = _take(sups)
-        res_main = _take(ress)
+        sups = _filter(sups)
+        ress = _filter(ress)
 
-        chosen = [("sup", s) for s in sup_main] + [("res", r) for r in res_main]
-        for typ, lvl in extras:
-            if len(chosen) >= 3:
-                break
-            if typ == "sup" and len([t for t, _ in chosen if t == "sup"]) >= 2:
-                continue
-            if typ == "res" and len([t for t, _ in chosen if t == "res"]) >= 2:
-                continue
-            chosen.append((typ, lvl))
+        # ограничиваем общее количество зон тремя, не более двух на сторону
+        if len(sups) + len(ress) > 3:
+            combined = sorted(
+                [(lvl, "sup") for lvl in sups] + [(lvl, "res") for lvl in ress],
+                key=lambda x: prio(x[0]),
+                reverse=True,
+            )
+            sups, ress = [], []
+            for lvl, typ in combined:
+                if typ == "sup" and len(sups) < 2:
+                    sups.append(lvl)
+                elif typ == "res" and len(ress) < 2:
+                    ress.append(lvl)
+                if len(sups) + len(ress) == 3:
+                    break
 
-        final_sup = _take([lvl for t, lvl in chosen if t == "sup"])
-        final_res = _take([lvl for t, lvl in chosen if t == "res"])
-        return final_sup, final_res
+        return sups, ress
 
     sup_levels, res_levels = _select_zones(sup_levels, res_levels)
 
@@ -4349,12 +4345,14 @@ async def _send_sr_charts(
     resistances_4h: list[dict] | None,
     entry: float | None = None,
 ) -> None:
-    _, sup_1d, res_1d = await _entry_exit_levels(symbol, entry, interval="D")
     if not supports_4h or not resistances_4h:
         _, supports_4h, resistances_4h = await _entry_exit_levels(symbol, entry)
+    if not supports_4h or not resistances_4h:
+        return
+    _, sup_1d, res_1d = await _entry_exit_levels(symbol, entry, interval="D")
     for label, interval, sup_list, res_list in (
-        ("1D", "D", sup_1d, res_1d),
         ("4H", "240", supports_4h, resistances_4h),
+        ("1D", "D", sup_1d, res_1d),
     ):
         if not sup_list or not res_list:
             continue
@@ -4643,7 +4641,8 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
         trend_block += f"\n\n{levels_block}"
     text = "💡 Сетап оценён!\n\n" + trend_block + "\n\n" + await _build_ai_advice(uid, sig_list, strong, total, risk, symbol)
     await bot.send_message(uid, text)
-    await _send_sr_charts(uid, symbol, supports, resistances)
+    if supports and resistances:
+        await _send_sr_charts(uid, symbol, supports, resistances)
 
 
 @dp.callback_query(TradeState.confirming, lambda c: c.data == "confirm_add")
@@ -5352,7 +5351,8 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
             trend_block += f"\n\n{levels_block}"
         advice = await _build_ai_advice(msg.from_user.id, [], 0, 0, 0, base)
         await msg.answer(trend_block + "\n\n" + advice, reply_markup=with_back(kb))
-        await _send_sr_charts(msg.chat.id, base, supports, resistances, price)
+        if supports and resistances:
+            await _send_sr_charts(msg.chat.id, base, supports, resistances, price)
     await state.clear()
 
 
@@ -5458,7 +5458,8 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
             )
         )
         await cb.message.answer(text, reply_markup=kb)
-        await _send_sr_charts(cb.message.chat.id, symbol, supports, resistances)
+        if supports and resistances:
+            await _send_sr_charts(cb.message.chat.id, symbol, supports, resistances)
 
 
 @dp.callback_query(F.data == "ai_habits")
