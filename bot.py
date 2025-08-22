@@ -3521,7 +3521,7 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
                 reco_block += f"\n\n{levels_block}"
         if trend_text:
             text += "\n\n" + trend_text + reco_block
-        text += "\n\n" + _build_ai_advice(uid, signals, strong, total, float(risk or 0))
+        text += "\n\n" + _build_ai_advice(uid, signals, strong, total, float(risk or 0), symbol)
     else:
         text += "\n\n🔐 Расширенный анализ доступен только с подпиской Basic. Сейчас отображён упрощённый анализ."
     await cb.message.answer(text)
@@ -4132,7 +4132,34 @@ def build_habits_report(uid: int) -> str:
     return "\n".join(lines)
 
 
-def _build_ai_advice(uid: int, signals: list[str], strong: int, total: int, risk: float) -> str:
+def _market_signal_balance(symbol: str) -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT trade_type FROM trades WHERE symbol != ? AND exit_price IS NULL AND trade_type IN ('Long','Short') AND COALESCE(is_deleted,0)=0 ORDER BY entry_date DESC LIMIT 30",
+            (symbol,),
+        ).fetchall()
+    total = len(rows)
+    if total < 5:
+        return ""
+    long_count = sum(1 for (t,) in rows if t == 'Long')
+    short_count = total - long_count
+    long_pct = long_count / total * 100
+    short_pct = short_count / total * 100
+    if max(long_pct, short_pct) < 65:
+        return "⚖️ Баланс сигналов нейтральный — тренд неясен, анализируй монету отдельно."
+    lines = [
+        "📊 Рыночное соотношение сигналов:",
+        f"— Long: {long_pct:.0f}%",
+        f"— Short: {short_pct:.0f}%",
+    ]
+    if long_pct > short_pct:
+        lines.append("⚠️ Большинство ждёт рост — возможен откат вниз (движение против толпы).")
+    else:
+        lines.append("⚠️ Большинство ждёт падение — возможен шорт-сквиз и отскок вверх (движение против толпы).")
+    return "\n".join(lines)
+
+
+def _build_ai_advice(uid: int, signals: list[str], strong: int, total: int, risk: float, symbol: str | None = None) -> str:
     sig_names = ", ".join(signals) if signals else "—"
     header = (
         f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
@@ -4161,7 +4188,8 @@ def _build_ai_advice(uid: int, signals: list[str], strong: int, total: int, risk
     style = _analyze_trader_style(uid, risk, strong)
     combos = _analyze_signal_combos(uid, signals)
     rec = _recommend_setup(strong, risk)
-    for extra in (style, combos, rec):
+    market = _market_signal_balance(symbol) if symbol else ""
+    for extra in (style, combos, rec, market):
         if extra:
             parts.append(extra)
     return "\n\n".join(parts)
@@ -4202,7 +4230,7 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
     trend_block += f"\n\n{rec_block}\n{verdict_line}"
     if levels_block:
         trend_block += f"\n\n{levels_block}"
-    text = "💡 Сетап оценён!\n\n" + trend_block + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
+    text = "💡 Сетап оценён!\n\n" + trend_block + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk, symbol)
     await bot.send_message(uid, text)
 
 
@@ -4952,7 +4980,7 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
     trend_block += f"\n\n{rec_block}\n{verdict_line}"
     if levels_block:
         trend_block += f"\n\n{levels_block}"
-    text = "\n".join(parts) + "\n\n" + trend_block + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk)
+    text = "\n".join(parts) + "\n\n" + trend_block + "\n\n" + _build_ai_advice(uid, sig_list, strong, total, risk, symbol)
     text += "\n\n" + _similar_trades_summary(uid, symbol, t_type, lev, total, sig_list, risk)
     kb = with_back(
         InlineKeyboardMarkup(
