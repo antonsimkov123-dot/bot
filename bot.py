@@ -15,11 +15,12 @@ from itertools import combinations
 load_dotenv()
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile, BufferedInputFile
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.utils.chat_action import ChatActionSender
+from io import BytesIO
 
 import pandas as pd
 import matplotlib
@@ -3985,6 +3986,41 @@ async def _entry_exit_levels(symbol: str, entry: float | None = None) -> str:
     return "📊 Уровни входа/выхода:\n" + "\n".join(lines)
 
 
+async def _generate_price_chart(symbol: str, interval: str) -> tuple[BufferedInputFile, float, float] | None:
+    candles = await _fetch_kline(symbol, interval, 100)
+    if not candles:
+        return None
+    candles = sorted(candles, key=lambda c: int(c[0]))
+    highs = [float(c[2]) for c in candles]
+    lows = [float(c[3]) for c in candles]
+    closes = [float(c[4]) for c in candles]
+    support = min(lows)
+    resistance = max(highs)
+    fig, ax = make_fig()
+    ax.plot(range(len(closes)), closes, color="white", linewidth=1)
+    ax.axhline(support, color="green", linestyle="--")
+    ax.axhline(resistance, color="red", linestyle="--")
+    ax.set_title(f"{symbol} {interval}")
+    buf = BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    file = BufferedInputFile(buf.getvalue(), filename=f"{symbol}_{interval}.png")
+    return file, support, resistance
+
+
+async def _send_sr_charts(chat_id: int, symbol: str) -> None:
+    for label, interval in (("1D", "D"), ("4H", "240")):
+        res = await _generate_price_chart(symbol, interval)
+        if not res:
+            continue
+        file, support, resistance = res
+        caption = (
+            f"{label}:\n🟩 Поддержка: {support:.2f}\n🟥 Сопротивление: {resistance:.2f}"
+        )
+        await bot.send_photo(chat_id, file, caption=caption)
+
+
 def _similar_trades_summary(
     uid: int,
     symbol: str,
@@ -4261,6 +4297,7 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
         trend_block += f"\n\n{levels_block}"
     text = "💡 Сетап оценён!\n\n" + trend_block + "\n\n" + await _build_ai_advice(uid, sig_list, strong, total, risk, symbol)
     await bot.send_message(uid, text)
+    await _send_sr_charts(uid, symbol)
 
 
 @dp.callback_query(TradeState.confirming, lambda c: c.data == "confirm_add")
@@ -4969,6 +5006,7 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
             trend_block += f"\n\n{levels_block}"
         advice = await _build_ai_advice(msg.from_user.id, [], 0, 0, 0, base)
         await msg.answer(trend_block + "\n\n" + advice, reply_markup=with_back(kb))
+        await _send_sr_charts(msg.chat.id, base)
     await state.clear()
 
 
@@ -5074,6 +5112,7 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
             )
         )
         await cb.message.answer(text, reply_markup=kb)
+        await _send_sr_charts(cb.message.chat.id, symbol)
 
 
 @dp.callback_query(F.data == "ai_habits")
