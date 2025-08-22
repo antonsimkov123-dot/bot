@@ -4124,45 +4124,70 @@ async def _entry_exit_levels(
         def prio(l: dict) -> tuple[int, bool, float]:
             return (l["touches"], l["vol"] >= 1.5, -l["dist"])
 
+        def is_far(l: dict) -> bool:
+            return l["dist"] >= 0.2 * cur_price and (
+                l["touches"] >= 2 or l["vol"] >= 1.5
+            )
+
         def _filter(levels: list[dict]) -> list[dict]:
             kept: list[dict] = []
+            core = 0
             for lvl in sorted(levels, key=prio, reverse=True):
                 band = lvl["level"] * 0.004  # ±0.4% зона
                 lo = lvl["level"] - band
                 hi = lvl["level"] + band
+                far = is_far(lvl)
                 overlap = False
-                for k in kept:
-                    k_band = k["level"] * 0.004
-                    k_lo = k["level"] - k_band
-                    k_hi = k["level"] + k_band
-                    inter = min(hi, k_hi) - max(lo, k_lo)
-                    if inter > 0 and inter >= 0.5 * min(hi - lo, k_hi - k_lo):
-                        overlap = True
+                if not far:
+                    for k in kept:
+                        k_band = k["level"] * 0.004
+                        k_lo = k["level"] - k_band
+                        k_hi = k["level"] + k_band
+                        inter = min(hi, k_hi) - max(lo, k_lo)
+                        if inter > 0 and inter >= 0.5 * min(hi - lo, k_hi - k_lo):
+                            overlap = True
+                            break
+                if overlap:
+                    continue
+                kept.append(lvl)
+                if not far:
+                    core += 1
+                    if core == 2:
                         break
-                if not overlap:
-                    kept.append(lvl)
-                if len(kept) == 2:
-                    break
             return kept
 
         sups = _filter(sups)
         ress = _filter(ress)
 
-        # ограничиваем общее количество зон тремя, не более двух на сторону
-        if len(sups) + len(ress) > 3:
+        far_sups = [s for s in sups if is_far(s)]
+        far_ress = [r for r in ress if is_far(r)]
+        near_sups = [s for s in sups if not is_far(s)]
+        near_ress = [r for r in ress if not is_far(r)]
+
+        # ограничиваем количество ближних зон
+        if len(near_sups) + len(near_ress) > 3:
             combined = sorted(
-                [(lvl, "sup") for lvl in sups] + [(lvl, "res") for lvl in ress],
+                [(lvl, "sup") for lvl in near_sups]
+                + [(lvl, "res") for lvl in near_ress],
                 key=lambda x: prio(x[0]),
                 reverse=True,
             )
-            sups, ress = [], []
+            near_sups, near_ress = [], []
             for lvl, typ in combined:
-                if typ == "sup" and len(sups) < 2:
-                    sups.append(lvl)
-                elif typ == "res" and len(ress) < 2:
-                    ress.append(lvl)
-                if len(sups) + len(ress) == 3:
+                if typ == "sup" and len(near_sups) < 2:
+                    near_sups.append(lvl)
+                elif typ == "res" and len(near_ress) < 2:
+                    near_ress.append(lvl)
+                if len(near_sups) + len(near_ress) == 3:
                     break
+
+        near_sups.sort(key=prio, reverse=True)
+        near_ress.sort(key=prio, reverse=True)
+        far_sups.sort(key=prio, reverse=True)
+        far_ress.sort(key=prio, reverse=True)
+
+        sups = near_sups + far_sups
+        ress = near_ress + far_ress
 
         return sups, ress
 
