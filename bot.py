@@ -4128,6 +4128,7 @@ async def _entry_exit_levels(
     else:
         step = 0.001
     top_lvl = round(top_high / step) * step
+    close_pct = 0.015 if interval == "D" else 0.005
 
     def _prepare_levels(swings: list[tuple[float, float]], arr: list[float]) -> list[dict]:
         levels: dict[float, dict] = {}
@@ -4163,12 +4164,12 @@ async def _entry_exit_levels(
             near_prev = (
                 pos > 0
                 and abs(lvl["level"] - prices[pos - 1]) / min(lvl["level"], prices[pos - 1])
-                < 0.005
+                < close_pct
             )
             near_next = (
                 pos < len(prices)
                 and abs(lvl["level"] - prices[pos]) / min(lvl["level"], prices[pos])
-                < 0.005
+                < close_pct
             )
             if near_prev or near_next:
                 continue
