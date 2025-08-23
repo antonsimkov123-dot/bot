@@ -4128,7 +4128,12 @@ async def _entry_exit_levels(
     else:
         step = 0.001
     top_lvl = round(top_high / step) * step
-    close_pct = 0.015 if interval == "D" else 0.005
+    if interval == "D":
+        close_pct = 0.03
+    elif interval == "240":
+        close_pct = 0.02
+    else:
+        close_pct = 0.015
 
     def _prepare_levels(swings: list[tuple[float, float]], arr: list[float]) -> list[dict]:
         levels: dict[float, dict] = {}
