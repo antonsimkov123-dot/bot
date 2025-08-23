@@ -4188,13 +4188,13 @@ async def _entry_exit_levels(
     def _select_zones(
         sups: list[dict], ress: list[dict]
     ) -> tuple[list[dict], list[dict]]:
-        """Return all detected support and resistance levels without filtering."""
+        """Return up to SR_MAX_ZONES support and resistance levels."""
 
         def prio(l: dict) -> tuple[int, float, float]:
             return (l["touches"], l["vol"], -l["dist"])
 
-        sups = sorted(sups, key=prio, reverse=True)
-        ress = sorted(ress, key=prio, reverse=True)
+        sups = sorted(sups, key=prio, reverse=True)[:SR_MAX_ZONES]
+        ress = sorted(ress, key=prio, reverse=True)[:SR_MAX_ZONES]
         return sups, ress
 
     sup_levels, res_levels = _select_zones(sup_levels, res_levels)
@@ -4304,7 +4304,7 @@ async def _generate_price_chart(
     volumes = [float(c[5]) for c in candles]
     cur_price = closes[-1]
 
-    band_pct = 0.006 if interval == "D" else 0.004
+    band_pct = 0.004
 
     n = len(candles)
     fig_width = 8 if n <= 120 else 8 * n / 120
