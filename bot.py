@@ -107,7 +107,7 @@ TREND_WINDOWS = {
 
 TREND_LEVELS = {"global": "Глобальный", "local": "Локальный", "scalp": "Скальп"}
 
-BAND_PCT = {"60": 0.004, "240": 0.006, "D": 0.008}
+BAND_PCT = {"60": 0.004, "240": 0.006, "D": 0.015}
 
 # ---------- DATABASE ----------
 def init_db() -> None:
@@ -4108,6 +4108,12 @@ async def _entry_exit_levels(
     top_reject = wick_ratio >= 0.006 or drop_ratio >= 0.01
     # всегда учитываем самый высокий экстремум как сопротивление, даже без повторных тестов
     swing_highs.append((top_high, top_vol))
+
+    bottom_idx = min(range(len(lows)), key=lambda i: lows[i])
+    bottom_low = lows[bottom_idx]
+    bottom_vol = vols[bottom_idx]
+    # всегда учитываем самый низкий экстремум как поддержку
+    swing_lows.append((bottom_low, bottom_vol))
     if not swing_highs and entry is not None:
         swing_highs = [(highs[i], vols[i]) for i in range(len(highs))]
     if not swing_lows and entry is not None:
@@ -4130,6 +4136,7 @@ async def _entry_exit_levels(
     else:
         step = 0.001
     top_lvl = round(top_high / step) * step
+    bottom_lvl = round(bottom_low / step) * step
     if interval == "D":
         # Daily charts cover a wide price range, so merge levels that fall within
         # roughly six percent of each other to avoid clutter.
@@ -4191,12 +4198,47 @@ async def _entry_exit_levels(
     if not res_levels or not sup_levels:
         msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
         return msg, [], []
+
+    top_found = False
     for lvl in res_levels:
         if abs(lvl["level"] - top_lvl) < step / 2:
+            top_found = True
             lvl["top"] = True
             if top_reject or lvl["vol"] >= 1.5:
                 lvl["reject"] = True
             break
+    if not top_found:
+        denom = top_lvl if top_lvl else step
+        touches = sum(1 for v in highs if abs(v - top_lvl) / denom < 0.004)
+        top_rec = {
+            "level": float(top_lvl),
+            "touches": touches,
+            "vol": top_vol / avg_vol if avg_vol else 0,
+            "dist": abs(cur_price - top_lvl),
+            "top": True,
+        }
+        if top_reject or top_rec["vol"] >= 1.5:
+            top_rec["reject"] = True
+        res_levels.append(top_rec)
+
+    bottom_found = False
+    for lvl in sup_levels:
+        if abs(lvl["level"] - bottom_lvl) < step / 2:
+            bottom_found = True
+            lvl["bottom"] = True
+            break
+    if not bottom_found:
+        denom = bottom_lvl if bottom_lvl else step
+        touches = sum(1 for v in lows if abs(v - bottom_lvl) / denom < 0.004)
+        sup_levels.append(
+            {
+                "level": float(bottom_lvl),
+                "touches": touches,
+                "vol": bottom_vol / avg_vol if avg_vol else 0,
+                "dist": abs(cur_price - bottom_lvl),
+                "bottom": True,
+            }
+        )
 
     def _select_zones(
         sups: list[dict], ress: list[dict]
@@ -4206,9 +4248,20 @@ async def _entry_exit_levels(
         def prio(l: dict) -> tuple[int, float, float]:
             return (l["touches"], l["vol"], -l["dist"])
 
-        sups = sorted(sups, key=prio, reverse=True)[:SR_MAX_ZONES]
-        ress = sorted(ress, key=prio, reverse=True)[:SR_MAX_ZONES]
-        return sups, ress
+        sups_sorted = sorted(sups, key=prio, reverse=True)
+        ress_sorted = sorted(ress, key=prio, reverse=True)
+
+        def ensure(levels: list[dict], flag: str) -> list[dict]:
+            selected = levels[:SR_MAX_ZONES]
+            ext = next((l for l in levels if l.get(flag)), None)
+            if ext and ext not in selected:
+                selected.append(ext)
+                selected = sorted(selected, key=prio, reverse=True)[:SR_MAX_ZONES]
+            return selected
+
+        sups_final = ensure(sups_sorted, "bottom")
+        ress_final = ensure(ress_sorted, "top")
+        return sups_final, ress_final
 
     sup_levels, res_levels = _select_zones(sup_levels, res_levels)
 
