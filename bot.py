@@ -4058,11 +4058,12 @@ async def _entry_exit_levels_old(
 async def _entry_exit_levels(
     symbol: str, entry: float | None = None, interval: str = "240",
 ) -> tuple[str, list[dict], list[dict]]:
-    candles = await _fetch_kline(symbol, interval, 60)
+    limit = 300 if interval == "D" else 200 if interval == "240" else 120
+    candles = await _fetch_kline(symbol, interval, limit)
     if not candles or len(candles) < 50:
         msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
         return msg, [], []
-    candles = sorted(candles, key=lambda c: int(c[0]))[-50:]
+    candles = sorted(candles, key=lambda c: int(c[0]))
     highs = [float(c[2]) for c in candles]
     lows = [float(c[3]) for c in candles]
     closes = [float(c[4]) for c in candles]
@@ -4218,7 +4219,7 @@ async def _entry_exit_levels(
                         overlap = True
                         break
                     gap = max(k_lo - hi, lo - k_hi, 0)
-                    if gap and gap / min(lvl["level"], k["level"]) < 0.02:
+                    if gap and gap / min(lvl["level"], k["level"]) < 0.015:
                         overlap = True
                         break
                 if overlap:
