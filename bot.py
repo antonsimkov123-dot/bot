@@ -107,6 +107,8 @@ TREND_WINDOWS = {
 
 TREND_LEVELS = {"global": "Глобальный", "local": "Локальный", "scalp": "Скальп"}
 
+BAND_PCT = {"60": 0.004, "240": 0.006, "D": 0.008}
+
 # ---------- DATABASE ----------
 def init_db() -> None:
     conn = sqlite3.connect(DB_PATH)
@@ -4315,7 +4317,7 @@ async def _generate_price_chart(
     volumes = [float(c[5]) for c in candles]
     cur_price = closes[-1]
 
-    band_pct = 0.004
+    band_pct = BAND_PCT.get(interval, 0.004)
 
     n = len(candles)
     fig_width = 8 if n <= 120 else 8 * n / 120
