@@ -4058,7 +4058,10 @@ async def _entry_exit_levels_old(
 async def _entry_exit_levels(
     symbol: str, entry: float | None = None, interval: str = "240",
 ) -> tuple[str, list[dict], list[dict]]:
-    limit = 300 if interval == "D" else 200 if interval == "240" else 120
+    # Use the same lookback window for daily and four-hour analyses so
+    # support/resistance logic behaves identically across timeframes.
+    # Hourly charts keep a shorter window to stay responsive.
+    limit = 200 if interval in ("D", "240") else 120
     candles = await _fetch_kline(symbol, interval, limit)
     if not candles or len(candles) < 50:
         msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
