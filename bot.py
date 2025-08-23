@@ -4129,7 +4129,9 @@ async def _entry_exit_levels(
         step = 0.001
     top_lvl = round(top_high / step) * step
     if interval == "D":
-        close_pct = 0.03
+        # Daily charts cover a wide price range, so merge levels that fall within
+        # roughly six percent of each other to avoid clutter.
+        close_pct = 0.06
     elif interval == "240":
         close_pct = 0.02
     else:
