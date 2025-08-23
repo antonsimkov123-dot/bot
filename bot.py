@@ -4322,6 +4322,24 @@ async def _entry_exit_levels(
     for lvl in res_levels:
         lvl["importance"] = _importance(lvl)
 
+    sup_levels = [
+        lvl
+        for lvl in sup_levels
+        if lvl["importance"] != "weak" and lvl["touches"] > 2 and lvl["vol"] >= 1.5
+    ]
+    res_levels = [
+        lvl
+        for lvl in res_levels
+        if lvl["importance"] != "weak" and lvl["touches"] > 2 and lvl["vol"] >= 1.5
+    ]
+
+    if not sup_levels or not res_levels:
+        msg = (
+            "📊 Уровни входа/выхода:\n"
+            "❌ Не удалось построить уровни: нет подходящих зон поддержки/сопротивления"
+        )
+        return msg, [], []
+
     if not MULTI_SR_MODE:
         res_levels = res_levels[:1]
         sup_levels = sup_levels[:1]
