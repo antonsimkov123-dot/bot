@@ -66,6 +66,7 @@ def add_labels(ax: plt.Axes, fmt: str = "{:.1f}") -> None:
 BOT_TOKEN = "8205192350:AAHUEmqDQK37-5D7dpcTUeMdpA6WpDACMkc"  # поменяй после теста!
 DB_PATH = "trades.db"
 MULTI_SR_MODE = True  # переключатель множественных уровней поддержки/сопротивления
+SR_MAX_ZONES = 7  # максимум зон поддержки/сопротивления на график для каждой стороны
 
 MONTHS_RU = [
     "",
@@ -4192,25 +4193,24 @@ async def _entry_exit_levels(
         The routine always terminates because each level is inspected only
         once and comparisons are limited to already accepted zones.
         """
+        band_pct = 0.006 if interval == "D" else 0.004
 
         def prio(l: dict) -> tuple[int, float, float]:
             """Priority helper: more touches, then higher volume, then closer price."""
             return (l["touches"], l["vol"], -l["dist"])
 
         def is_far(l: dict) -> bool:
-            return l["dist"] >= 0.2 * cur_price and (
-                l["touches"] >= 2 or l["vol"] >= 1.5
-            )
+            return l["dist"] >= 0.2 * cur_price
 
         def _filter(levels: list[dict]) -> list[dict]:
             kept: list[dict] = []
             for lvl in sorted(levels, key=prio, reverse=True):
-                band = min(lvl["level"] * 0.004, cur_price * 0.015)
+                band = min(lvl["level"] * band_pct, cur_price * 0.015)
                 lo = lvl["level"] - band
                 hi = lvl["level"] + band
                 overlap = False
                 for k in kept:
-                    k_band = min(k["level"] * 0.004, cur_price * 0.015)
+                    k_band = min(k["level"] * band_pct, cur_price * 0.015)
                     k_lo = k["level"] - k_band
                     k_hi = k["level"] + k_band
                     inter = min(hi, k_hi) - max(lo, k_lo)
@@ -4224,10 +4224,11 @@ async def _entry_exit_levels(
                 if overlap:
                     continue
                 kept.append(lvl)
-                if len(kept) == 5:
+                if len(kept) == SR_MAX_ZONES:
                     break
             return kept
 
+        raw_sups = list(sups)
         raw_ress = list(ress)
         sups = _filter(sups)
         ress = _filter(ress)
@@ -4237,8 +4238,8 @@ async def _entry_exit_levels(
         near_sups = [s for s in sups if not is_far(s)]
         near_ress = [r for r in ress if not is_far(r)]
 
-        all_sups = sorted(near_sups + far_sups, key=prio, reverse=True)[:5]
-        all_ress = sorted(near_ress + far_ress, key=prio, reverse=True)[:5]
+        all_sups = sorted(near_sups + far_sups, key=prio, reverse=True)[:SR_MAX_ZONES]
+        all_ress = sorted(near_ress + far_ress, key=prio, reverse=True)[:SR_MAX_ZONES]
 
         sups = all_sups
         ress = all_ress
@@ -4247,12 +4248,12 @@ async def _entry_exit_levels(
         if raw_ress:
             top = max(raw_ress, key=lambda x: x["level"])
             if top not in ress:
-                band = min(top["level"] * 0.004, cur_price * 0.015)
+                band = min(top["level"] * band_pct, cur_price * 0.015)
                 lo = top["level"] - band
                 hi = top["level"] + band
                 overlap = False
                 for r in ress:
-                    k_band = min(r["level"] * 0.004, cur_price * 0.015)
+                    k_band = min(r["level"] * band_pct, cur_price * 0.015)
                     k_lo = r["level"] - k_band
                     k_hi = r["level"] + k_band
                     inter = min(hi, k_hi) - max(lo, k_lo)
@@ -4262,7 +4263,28 @@ async def _entry_exit_levels(
                 if not overlap:
                     ress.append(top)
                     ress.sort(key=prio, reverse=True)
-                    ress = ress[:5]
+                    ress = ress[:SR_MAX_ZONES]
+
+        # аналогично сохраняем самый низкий экстремум как поддержку
+        if raw_sups:
+            bottom = min(raw_sups, key=lambda x: x["level"])
+            if bottom not in sups:
+                band = min(bottom["level"] * band_pct, cur_price * 0.015)
+                lo = bottom["level"] - band
+                hi = bottom["level"] + band
+                overlap = False
+                for s in sups:
+                    k_band = min(s["level"] * band_pct, cur_price * 0.015)
+                    k_lo = s["level"] - k_band
+                    k_hi = s["level"] + k_band
+                    inter = min(hi, k_hi) - max(lo, k_lo)
+                    if inter > 0 and inter >= 0.6 * min(hi - lo, k_hi - k_lo):
+                        overlap = True
+                        break
+                if not overlap:
+                    sups.append(bottom)
+                    sups.sort(key=prio, reverse=True)
+                    sups = sups[:SR_MAX_ZONES]
 
         return sups, ress
 
@@ -4373,6 +4395,8 @@ async def _generate_price_chart(
     volumes = [float(c[5]) for c in candles]
     cur_price = closes[-1]
 
+    band_pct = 0.006 if interval == "D" else 0.004
+
     n = len(candles)
     fig_width = 8 if n <= 120 else 8 * n / 120
     fig, (ax, ax_v) = plt.subplots(
@@ -4440,7 +4464,7 @@ async def _generate_price_chart(
             if lvl["vol"] >= 1.5 or lvl["touches"] >= 3:
                 base_alpha += 0.15
             alpha = min(base_alpha, 0.7)
-            band = min(lvl["level"] * 0.004, cur_price * 0.015)
+            band = min(lvl["level"] * band_pct, cur_price * 0.015)
             lo_zone = lvl["level"] - band
             hi_zone = lvl["level"] + band
             ax.axhspan(lo_zone, hi_zone, color=color, alpha=alpha)
@@ -4504,8 +4528,8 @@ async def _send_sr_charts(
         file = await _generate_price_chart(symbol, interval, sup_list, res_list, label, 300)
         if not file:
             continue
-        sup_vals = ", ".join(f"{lvl['level']:.2f}" for lvl in sup_list[:5])
-        res_vals = ", ".join(f"{lvl['level']:.2f}" for lvl in res_list[:5])
+        sup_vals = ", ".join(f"{lvl['level']:.2f}" for lvl in sup_list[:SR_MAX_ZONES])
+        res_vals = ", ".join(f"{lvl['level']:.2f}" for lvl in res_list[:SR_MAX_ZONES])
         caption = (
             f"{label}:\n"
             f"🟩 Поддержка {label}: {sup_vals}\n"
