@@ -3570,7 +3570,17 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
             trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype, vol_short)
             rec_block, verdict_line, trend_bias = format_trend_recommendations(d_res, h_res)
             levels_block, supports, resistances = await _entry_exit_levels(symbol)
-            zone_reco = await _sr_trade_reco(symbol, supports, resistances, bias=trend_bias)
+            zone_reco, zone_dir = await _sr_trade_reco(symbol, supports, resistances, bias=trend_bias)
+            if zone_dir and trend_bias and (
+                (zone_dir == "Short" and trend_bias == "up")
+                or (zone_dir == "Long" and trend_bias == "down")
+            ):
+                zone_word = "сопротивления" if zone_dir == "Short" else "поддержки"
+                trend_word = "восходящие" if trend_bias == "up" else "нисходящие"
+                verdict_line = (
+                    f"⚠️ Вердикт: Цена у {zone_word}. Несмотря на {trend_word} тренды, "
+                    f"лучше ждать разворота и искать вход в {zone_dir}."
+                )
             vol_block = "\n".join(filter(None, [vol_line, vol_note]))
             reco_block = ""
             if vol_block:
@@ -4383,10 +4393,14 @@ async def _sr_trade_reco(
     resistances: list[dict],
     bias: str | None = None,
     interval: str = "240",
-) -> str:
-    """Form recommendation based on nearest support/resistance zone."""
+) -> tuple[str, str | None]:
+    """Form recommendation based on nearest support/resistance zone.
+
+    Returns text message and dominant side ("Long"/"Short") if price
+    trades near a strong zone.
+    """
     if not supports and not resistances:
-        return ""
+        return "", None
     candles = await _fetch_kline(symbol, interval, 60)
     if not candles:
         return ""
@@ -4450,28 +4464,34 @@ async def _sr_trade_reco(
     band = (z["high"] - z["low"]) / 2
     near = abs(cur_price - midpoint) <= band
     bias_note = ""
-    if bias == "up" and z["type"] == "S" and near and z["strength"] >= 3:
+    note_has_zone = False
+    if z["type"] == "R" and near and z["strength"] >= 2:
         details = []
         if z.get("touches"):
             details.append(f"{z['touches']} касаний")
         if z.get("vol"):
             details.append(f"объём {z['vol']:.1f}x")
         extra = f" ({', '.join(details)})" if details else ""
-        bias_note = (
-            f"Цена подошла к сильной поддержке {zone_txt}{extra} — "
-            "ищи вход в Long при развороте. "
-        )
-    elif bias == "down" and z["type"] == "R" and near and z["strength"] >= 3:
+        bias_note = f"Цена у зоны сопротивления {zone_txt}{extra}. "
+        if bias == "up" and cur_vol >= vol_thresh:
+            bias_note += (
+                "Рост ослабевает у зоны сопротивления. Возможен откат вниз. "
+                "Не спеши с Long, жди разворотного паттерна. "
+            )
+        note_has_zone = True
+    elif z["type"] == "S" and near and z["strength"] >= 2:
         details = []
         if z.get("touches"):
             details.append(f"{z['touches']} касаний")
         if z.get("vol"):
             details.append(f"объём {z['vol']:.1f}x")
         extra = f" ({', '.join(details)})" if details else ""
-        bias_note = (
-            f"Цена тестирует зону сопротивления {zone_txt}{extra} — "
-            "возможен Short при подтверждении. "
-        )
+        bias_note = f"Цена у сильной поддержки {zone_txt}{extra}. "
+        if bias == "down" and cur_vol >= vol_thresh:
+            bias_note += (
+                "Падение ослабевает у зоны. Не спеши с Short, жди разворотного паттерна. "
+            )
+        note_has_zone = True
 
     state = ""
     if z["low"] <= cur_price <= z["high"]:
@@ -4500,11 +4520,13 @@ async def _sr_trade_reco(
     rr = abs(target - midpoint) / abs(midpoint - stop) if stop and target else 0
 
     side = "Long" if z["type"] == "S" else "Short"
+    zone_dir = side if near and z["strength"] >= 2 else None
     if state == "inside_zone":
+        base = "" if note_has_zone else f"Цена пилит внутри сильной зоны {zone_txt}. "
         msg = (
             bias_note
-            + f"Цена пилит внутри сильной зоны {zone_txt}. Нейтрально. "
-            "Торгуем только пробой/ретест с подтверждением. Без сигнала — пропуск."
+            + base
+            + "Нейтрально. Торгуем только пробой/ретест с подтверждением. Без сигнала — пропуск."
         )
     elif state == "breakout_up":
         msg = (
@@ -4519,10 +4541,10 @@ async def _sr_trade_reco(
             f"План: Short по ретесту зоны, стоп за серединой зоны. TP: {target:.2f}. RR ≈ {rr:.2f}"
         )
     else:
-        msg = (
-            bias_note
-            + f"Зона {('S' if z['type']=='S' else 'R')} {zone_txt}. Подходим {'снизу' if z['type']=='R' else 'сверху'}. "
+        base = (
+            "" if note_has_zone else f"Зона {('S' if z['type']=='S' else 'R')} {zone_txt}. Подходим {'снизу' if z['type']=='R' else 'сверху'}. "
         )
+        msg = bias_note + base
         if z["type"] == "R":
             msg += (
                 "Жди подтверждения Short: медвежий отказ сверху, close ниже середины зоны, объём ↑. "
@@ -4547,7 +4569,7 @@ async def _sr_trade_reco(
         f"📊 Резюме: цена находится у {zone_label}, {trend_phrase}, {vol_phrase} — "
         f"жди разворотного паттерна для входа в {side}."
     )
-    return msg + "\n\n" + summary
+    return msg + "\n\n" + summary, zone_dir
 
 
 async def _generate_price_chart(
@@ -4979,7 +5001,17 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
     trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype, vol_short)
     rec_block, verdict_line, trend_bias = format_trend_recommendations(d_res, h_res)
     levels_block, supports, resistances = await _entry_exit_levels(symbol)
-    zone_reco = await _sr_trade_reco(symbol, supports, resistances, bias=trend_bias)
+    zone_reco, zone_dir = await _sr_trade_reco(symbol, supports, resistances, bias=trend_bias)
+    if zone_dir and trend_bias and (
+        (zone_dir == "Short" and trend_bias == "up")
+        or (zone_dir == "Long" and trend_bias == "down")
+    ):
+        zone_word = "сопротивления" if zone_dir == "Short" else "поддержки"
+        trend_word = "восходящие" if trend_bias == "up" else "нисходящие"
+        verdict_line = (
+            f"⚠️ Вердикт: Цена у {zone_word}. Несмотря на {trend_word} тренды, "
+            f"лучше ждать разворота и искать вход в {zone_dir}."
+        )
     vol_block = "\n".join(filter(None, [vol_line, vol_note]))
     trend_block = trend_text
     if vol_block:
@@ -5689,7 +5721,17 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
         trend_text, d_res, h_res = await _analyze_micro_trend(base, "LONG", vol_short)
         rec_block, verdict_line, trend_bias = format_trend_recommendations(d_res, h_res)
         levels_block, supports, resistances = await _entry_exit_levels(base, price)
-        zone_reco = await _sr_trade_reco(base, supports, resistances, bias=trend_bias)
+        zone_reco, zone_dir = await _sr_trade_reco(base, supports, resistances, bias=trend_bias)
+        if zone_dir and trend_bias and (
+            (zone_dir == "Short" and trend_bias == "up")
+            or (zone_dir == "Long" and trend_bias == "down")
+        ):
+            zone_word = "сопротивления" if zone_dir == "Short" else "поддержки"
+            trend_word = "восходящие" if trend_bias == "up" else "нисходящие"
+            verdict_line = (
+                f"⚠️ Вердикт: Цена у {zone_word}. Несмотря на {trend_word} тренды, "
+                f"лучше ждать разворота и искать вход в {zone_dir}."
+            )
         vol_block = "\n".join(filter(None, [vol_line, vol_note]))
         trend_block = trend_text
         if vol_block:
@@ -5785,7 +5827,17 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
         trend_text, d_res, h_res = await _analyze_micro_trend(symbol, t_type, vol_short)
         rec_block, verdict_line, trend_bias = format_trend_recommendations(d_res, h_res)
         levels_block, supports, resistances = await _entry_exit_levels(symbol)
-        zone_reco = await _sr_trade_reco(symbol, supports, resistances, bias=trend_bias)
+        zone_reco, zone_dir = await _sr_trade_reco(symbol, supports, resistances, bias=trend_bias)
+        if zone_dir and trend_bias and (
+            (zone_dir == "Short" and trend_bias == "up")
+            or (zone_dir == "Long" and trend_bias == "down")
+        ):
+            zone_word = "сопротивления" if zone_dir == "Short" else "поддержки"
+            trend_word = "восходящие" if trend_bias == "up" else "нисходящие"
+            verdict_line = (
+                f"⚠️ Вердикт: Цена у {zone_word}. Несмотря на {trend_word} тренды, "
+                f"лучше ждать разворота и искать вход в {zone_dir}."
+            )
         vol_block = "\n".join(filter(None, [vol_line, vol_note]))
         trend_block = trend_text
         if vol_block:
