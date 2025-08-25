@@ -5765,7 +5765,8 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
                 f"лучше ждать разворота и искать вход в {zone_dir}."
             )
         vol_block = "\n".join(filter(None, [vol_line, vol_note]))
-        trend_block = trend_text
+        price_line = f"💰 Текущая цена: {fmt_price(price)}"
+        trend_block = price_line + "\n\n" + trend_text
         if vol_block:
             trend_block += f"\n\n{vol_block}"
         trend_block += f"\n\n{rec_block}\n{verdict_line}"
@@ -5848,7 +5849,9 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
     async with ChatActionSender.typing(bot, cb.message.chat.id):
         total, strong, medium, weak = signal_stats(sig_list)
         risk = float(risk)
+        price = await fetch_price(symbol)
         parts = [
+            f"💰 Текущая цена: {fmt_price(price)}" if price else "",
             f"⭐️ Звёзд: {total}",
             f"🔥 Сильных сигналов: {strong}",
             f"🟡 Средние: {medium}",
@@ -5858,7 +5861,7 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
         vol_line, vol_note, vol_short = await _volume_24h(symbol)
         trend_text, d_res, h_res = await _analyze_micro_trend(symbol, t_type, vol_short)
         rec_block, verdict_line, trend_bias = format_trend_recommendations(d_res, h_res)
-        levels_block, supports, resistances = await _entry_exit_levels(symbol)
+        levels_block, supports, resistances = await _entry_exit_levels(symbol, price)
         zone_reco, zone_dir = await _sr_trade_reco(symbol, supports, resistances, bias=trend_bias)
         if zone_dir and trend_bias and (
             (zone_dir == "Short" and trend_bias == "up")
@@ -5896,7 +5899,7 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
         )
         await cb.message.answer(text, reply_markup=kb)
         if supports and resistances:
-            await _send_sr_charts(cb.message.chat.id, symbol)
+            await _send_sr_charts(cb.message.chat.id, symbol, entry=price)
 
 
 @dp.callback_query(F.data == "ai_habits")
