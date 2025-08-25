@@ -3568,9 +3568,9 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
         if symbol and ttype:
             vol_line, vol_note, vol_short = await _volume_24h(symbol)
             trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype, vol_short)
-            rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
+            rec_block, verdict_line, trend_bias = format_trend_recommendations(d_res, h_res)
             levels_block, supports, resistances = await _entry_exit_levels(symbol)
-            zone_reco = await _sr_trade_reco(symbol, supports, resistances)
+            zone_reco = await _sr_trade_reco(symbol, supports, resistances, bias=trend_bias)
             vol_block = "\n".join(filter(None, [vol_line, vol_note]))
             reco_block = ""
             if vol_block:
@@ -3937,7 +3937,7 @@ async def _analyze_micro_trend(symbol: str, ttype: str, vol_short: str = "") -> 
     return text, d_res, h_res
 
 
-def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str]:
+def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str, str | None]:
     LEVEL_EMOJI = {"global": "🔵", "local": "🟢", "scalp": "🟣"}
     LEVEL_NAME = {
         "global": "Глобальный тренд",
@@ -3996,7 +3996,15 @@ def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str]:
     else:
         verdict = "⚠️ Вердикт: Тренды неопределены — наблюдай"
 
-    return "\n".join(lines), verdict
+    up_count = dirs.count("up")
+    down_count = dirs.count("down")
+    bias_dir: str | None = None
+    if up_count > down_count:
+        bias_dir = "up"
+    elif down_count > up_count:
+        bias_dir = "down"
+
+    return "\n".join(lines), verdict, bias_dir
 
 
 async def _entry_exit_levels_old(
@@ -4431,6 +4439,14 @@ async def _sr_trade_reco(
     z = zones[0]
     zone_txt = f"{z['low']:.2f}–{z['high']:.2f}"
     midpoint = z["mid"]
+    band = (z["high"] - z["low"]) / 2
+    near = abs(cur_price - midpoint) <= band
+    bias_note = ""
+    if bias == "up" and z["type"] == "S" and near and z["strength"] >= 3:
+        bias_note = f"Цена у ключевой поддержки {zone_txt} — возможен вход в Long от уровня. "
+    elif bias == "down" and z["type"] == "R" and near and z["strength"] >= 3:
+        bias_note = f"Цена у зоны сопротивления {zone_txt} — возможен вход в Short от уровня. "
+
     state = ""
     if z["low"] <= cur_price <= z["high"]:
         state = "inside_zone"
@@ -4460,22 +4476,26 @@ async def _sr_trade_reco(
     side = "Long" if z["type"] == "S" else "Short"
     if state == "inside_zone":
         return (
-            f"Цена пилит внутри сильной зоны {zone_txt}. Нейтрально. "
+            bias_note
+            + f"Цена пилит внутри сильной зоны {zone_txt}. Нейтрально. "
             "Торгуем только пробой/ретест с подтверждением. Без сигнала — пропуск."
         )
     if state == "breakout_up":
         return (
-            f"Пробили R {zone_txt} телом ≥0.25 ATR на повышенном объёме. "
+            bias_note
+            + f"Пробили R {zone_txt} телом ≥0.25 ATR на повышенном объёме. "
             f"План: Long по ретесту зоны, стоп за серединой зоны. TP: {target:.2f}. RR ≈ {rr:.2f}"
         )
     if state == "breakout_down":
         return (
-            f"Пробили S {zone_txt} телом ≥0.25 ATR на повышенном объёме. "
+            bias_note
+            + f"Пробили S {zone_txt} телом ≥0.25 ATR на повышенном объёме. "
             f"План: Short по ретесту зоны, стоп за серединой зоны. TP: {target:.2f}. RR ≈ {rr:.2f}"
         )
     # approach cases
     msg = (
-        f"Зона {('S' if z['type']=='S' else 'R')} {zone_txt}. Подходим {'снизу' if z['type']=='R' else 'сверху'}. "
+        bias_note
+        + f"Зона {('S' if z['type']=='S' else 'R')} {zone_txt}. Подходим {'снизу' if z['type']=='R' else 'сверху'}. "
     )
     if z["type"] == "R":
         msg += (
@@ -4919,9 +4939,9 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
     risk = float(risk)
     vol_line, vol_note, vol_short = await _volume_24h(symbol)
     trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype, vol_short)
-    rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
+    rec_block, verdict_line, trend_bias = format_trend_recommendations(d_res, h_res)
     levels_block, supports, resistances = await _entry_exit_levels(symbol)
-    zone_reco = await _sr_trade_reco(symbol, supports, resistances)
+    zone_reco = await _sr_trade_reco(symbol, supports, resistances, bias=trend_bias)
     vol_block = "\n".join(filter(None, [vol_line, vol_note]))
     trend_block = trend_text
     if vol_block:
@@ -5629,9 +5649,9 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
     async with ChatActionSender.typing(bot, msg.chat.id):
         vol_line, vol_note, vol_short = await _volume_24h(base)
         trend_text, d_res, h_res = await _analyze_micro_trend(base, "LONG", vol_short)
-        rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
+        rec_block, verdict_line, trend_bias = format_trend_recommendations(d_res, h_res)
         levels_block, supports, resistances = await _entry_exit_levels(base, price)
-        zone_reco = await _sr_trade_reco(base, supports, resistances)
+        zone_reco = await _sr_trade_reco(base, supports, resistances, bias=trend_bias)
         vol_block = "\n".join(filter(None, [vol_line, vol_note]))
         trend_block = trend_text
         if vol_block:
@@ -5725,9 +5745,9 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
         ]
         vol_line, vol_note, vol_short = await _volume_24h(symbol)
         trend_text, d_res, h_res = await _analyze_micro_trend(symbol, t_type, vol_short)
-        rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
+        rec_block, verdict_line, trend_bias = format_trend_recommendations(d_res, h_res)
         levels_block, supports, resistances = await _entry_exit_levels(symbol)
-        zone_reco = await _sr_trade_reco(symbol, supports, resistances)
+        zone_reco = await _sr_trade_reco(symbol, supports, resistances, bias=trend_bias)
         vol_block = "\n".join(filter(None, [vol_line, vol_note]))
         trend_block = trend_text
         if vol_block:
