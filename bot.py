@@ -626,7 +626,13 @@ def calc_risk(entry: float, stop: float, pct: float, t_type: str, leverage: floa
 
 
 def fmt_price(val: float) -> str:
-    return f"{val:.2f}".rstrip("0").rstrip(".")
+    if val < 1:
+        fmt = f"{val:.4f}"
+    elif val < 10:
+        fmt = f"{val:.3f}"
+    else:
+        fmt = f"{val:.2f}"
+    return fmt.rstrip("0").rstrip(".")
 
 
 def fmt_targets(val: str | None) -> str:
@@ -4343,7 +4349,10 @@ async def _entry_exit_levels(
         return msg, [], []
 
     lines: list[str] = []
-    desc = f"Следи за зоной {int(lo_lvl)}–{int(hi_lvl)}. Пробой вверх — можно входить."
+    desc = (
+        "Следи за зоной "
+        f"{fmt_price(lo_lvl)}–{fmt_price(hi_lvl)}. Пробой вверх — можно входить."
+    )
     notes = []
     if res_levels[0]["vol"] >= 1.5:
         notes.append("сопротивление усилено объёмом")
@@ -4358,8 +4367,12 @@ async def _entry_exit_levels(
     if notes:
         desc += " " + ", ".join(notes) + "."
     lines.append("— " + desc)
-    lines.append(f"— Жди закрепа выше {int(hi_lvl)} — для уверенного входа.")
-    lines.append(f"— Пробой вниз ниже {int(lo_lvl)} — лучше не входить (риск усилится).")
+    lines.append(
+        f"— Жди закрепа выше {fmt_price(hi_lvl)} — для уверенного входа."
+    )
+    lines.append(
+        f"— Пробой вниз ниже {fmt_price(lo_lvl)} — лучше не входить (риск усилится)."
+    )
     msg = "📊 Уровни входа/выхода:\n" + "\n".join(lines)
 
     if MULTI_SR_MODE:
@@ -4370,7 +4383,9 @@ async def _entry_exit_levels(
                 vol_txt = (
                     f", объём {s['vol']:.1f}×" if s["vol"] >= 1.5 else ", слабый объём"
                 )
-                tbl.append(f"— {s['level']:.2f} ({s['touches']} теста{vol_txt})")
+                tbl.append(
+                    f"— {fmt_price(s['level'])} ({s['touches']} теста{vol_txt})"
+                )
         if res_levels:
             tbl.append(f"Сопротивления ({'1D' if interval == 'D' else '4H'}):")
             for r in res_levels:
@@ -4379,7 +4394,7 @@ async def _entry_exit_levels(
                 )
                 extra = ", верхний экстремум" if r.get("top") else ""
                 tbl.append(
-                    f"— {r['level']:.2f} ({r['touches']} касания{vol_txt}{extra})"
+                    f"— {fmt_price(r['level'])} ({r['touches']} касания{vol_txt}{extra})"
                 )
         if tbl:
             msg += "\n\n" + "\n".join(tbl)
@@ -4459,7 +4474,7 @@ async def _sr_trade_reco(
         )
     zones.sort(key=lambda z: (abs(cur_price - z["mid"]), -z["strength"]))
     z = zones[0]
-    zone_txt = f"{z['low']:.2f}–{z['high']:.2f}"
+    zone_txt = f"{fmt_price(z['low'])}–{fmt_price(z['high'])}"
     midpoint = z["mid"]
     band = (z["high"] - z["low"]) / 2
     near = abs(cur_price - midpoint) <= band
@@ -4534,7 +4549,9 @@ async def _sr_trade_reco(
                 bias_note
                 + f"Тренды совпадают. Ищи вход в {side} при появлении сигнала ("
                 + f"{pattern_txt}). Стоп: {('под' if side=='Long' else 'за')} "
-                + (f"{z['low']:.2f}-0.3 ATR" if side == 'Long' else f"{z['high']:.2f}+0.3 ATR")
+                + (
+                    f"{fmt_price(z['low'])}-0.3 ATR" if side == "Long" else f"{fmt_price(z['high'])}+0.3 ATR"
+                )
                 + ". Цели: ближайшее сопротивление / следующая зона."
             )
         else:
@@ -4548,13 +4565,13 @@ async def _sr_trade_reco(
         msg = (
             bias_note
             + f"Пробили R {zone_txt} телом ≥0.25 ATR на повышенном объёме. "
-            f"План: Long по ретесту зоны, стоп за серединой зоны. TP: {target:.2f}. RR ≈ {rr:.2f}"
+            f"План: Long по ретесту зоны, стоп за серединой зоны. TP: {fmt_price(target)}. RR ≈ {rr:.2f}"
         )
     elif state == "breakout_down":
         msg = (
             bias_note
             + f"Пробили S {zone_txt} телом ≥0.25 ATR на повышенном объёме. "
-            f"План: Short по ретесту зоны, стоп за серединой зоны. TP: {target:.2f}. RR ≈ {rr:.2f}"
+            f"План: Short по ретесту зоны, стоп за серединой зоны. TP: {fmt_price(target)}. RR ≈ {rr:.2f}"
         )
     else:
         base = (
@@ -4565,21 +4582,21 @@ async def _sr_trade_reco(
             msg += (
                 f"Тренды совпадают. Ищи вход в {side} при появлении сигнала ({pattern_txt}). "
                 + (
-                    f"Стоп: под {z['low']:.2f}-0.3 ATR. Цели: ближайшее сопротивление / следующая зона."
+                    f"Стоп: под {fmt_price(z['low'])}-0.3 ATR. Цели: ближайшее сопротивление / следующая зона."
                     if side == "Long"
-                    else f"Стоп: за {z['high']:.2f}+0.3 ATR. Цели: ближайшая поддержка / следующая зона."
+                    else f"Стоп: за {fmt_price(z['high'])}+0.3 ATR. Цели: ближайшая поддержка / следующая зона."
                 )
             )
         else:
             if z["type"] == "R":
                 msg += (
                     "Жди подтверждения Short: медвежий отказ сверху, close ниже середины зоны, объём ↑. "
-                    f"Стоп: за {z['high']:.2f}+0.3 ATR. Цели: ближайшая поддержка / следующая зона."
+                    f"Стоп: за {fmt_price(z['high'])}+0.3 ATR. Цели: ближайшая поддержка / следующая зона."
                 )
             else:
                 msg += (
                     "Жди подтверждения Long: бычий отказ снизу, close выше середины зоны, объём ↑. "
-                    f"Стоп: под {z['low']:.2f}-0.3 ATR. Цели: ближайшее сопротивление / следующая зона."
+                    f"Стоп: под {fmt_price(z['low'])}-0.3 ATR. Цели: ближайшее сопротивление / следующая зона."
                 )
         if rr and rr < MIN_RR:
             msg += f" RR ≈ {rr:.2f} — сделка невыгодна, пропуск."
@@ -4697,7 +4714,7 @@ async def _generate_price_chart(
             hi_zone = lvl["level"] + band
             ax.axhspan(lo_zone, hi_zone, color=color, alpha=alpha)
             name = "Поддержка" if is_support else "Сопротивление"
-            text = f"{icon} {name}: {lo_zone:.2f}–{hi_zone:.2f}"
+            text = f"{icon} {name}: {fmt_price(lo_zone)}–{fmt_price(hi_zone)}"
             info: list[str] = []
             if lvl["touches"] > 1:
                 info.append(f"{lvl['touches']} касания")
@@ -4756,8 +4773,8 @@ async def _send_sr_charts(
         file = await _generate_price_chart(symbol, interval, sup_list, res_list, label, 300)
         if not file:
             continue
-        sup_vals = ", ".join(f"{lvl['level']:.2f}" for lvl in sup_list)
-        res_vals = ", ".join(f"{lvl['level']:.2f}" for lvl in res_list)
+        sup_vals = ", ".join(fmt_price(lvl["level"]) for lvl in sup_list)
+        res_vals = ", ".join(fmt_price(lvl["level"]) for lvl in res_list)
         caption = (
             f"{label}:\n"
             f"🟩 Поддержка {label}: {sup_vals}\n"
