@@ -109,6 +109,12 @@ TREND_LEVELS = {"global": "Глобальный", "local": "Локальный",
 
 BAND_PCT = {"60": 0.004, "240": 0.006, "D": 0.015}
 
+# -- Recommendation thresholds
+MIN_CLOSE_OUTSIDE_ATR = 0.25  # пробой, если закрытие за зоной на долю ATR
+RETEST_WINDOW_BARS = 5        # количество свечей для поиска ретеста
+VOL_CONFIRM_PERCENTILE = 60   # перцентиль объёма для подтверждения
+MIN_RR = 1.5                  # минимально допустимое соотношение риск/профит
+
 # ---------- DATABASE ----------
 def init_db() -> None:
     conn = sqlite3.connect(DB_PATH)
@@ -3563,7 +3569,8 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
             vol_line, vol_note, vol_short = await _volume_24h(symbol)
             trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype, vol_short)
             rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
-            levels_block, _, _ = await _entry_exit_levels(symbol)
+            levels_block, supports, resistances = await _entry_exit_levels(symbol)
+            zone_reco = await _sr_trade_reco(symbol, supports, resistances)
             vol_block = "\n".join(filter(None, [vol_line, vol_note]))
             reco_block = ""
             if vol_block:
@@ -3571,6 +3578,8 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
             reco_block += f"\n\n{rec_block}\n{verdict_line}"
             if levels_block:
                 reco_block += f"\n\n{levels_block}"
+            if zone_reco:
+                reco_block += f"\n\n{zone_reco}"
         if trend_text:
             text += "\n\n" + trend_text + reco_block
         text += "\n\n" + await _build_ai_advice(uid, signals, strong, total, float(risk or 0), symbol)
@@ -4356,6 +4365,133 @@ async def _entry_exit_levels(
     return msg, sup_levels, res_levels
 
 
+async def _sr_trade_reco(
+    symbol: str,
+    supports: list[dict],
+    resistances: list[dict],
+    bias: str | None = None,
+    interval: str = "240",
+) -> str:
+    """Form recommendation based on nearest support/resistance zone."""
+    if not supports and not resistances:
+        return ""
+    candles = await _fetch_kline(symbol, interval, 60)
+    if not candles:
+        return ""
+    candles = sorted(candles, key=lambda c: int(c[0]))
+    highs = [float(c[2]) for c in candles]
+    lows = [float(c[3]) for c in candles]
+    closes = [float(c[4]) for c in candles]
+    volumes = [float(c[5]) for c in candles]
+    cur_price = closes[-1]
+
+    def _atr() -> float:
+        if len(highs) < 2:
+            return 0.0
+        trs = []
+        for i in range(1, len(highs)):
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            )
+            trs.append(tr)
+        period = min(14, len(trs))
+        return sum(trs[-period:]) / period if period else 0.0
+
+    atr = _atr()
+    vol_thresh = np.percentile(volumes, VOL_CONFIRM_PERCENTILE)
+    cur_vol = volumes[-1]
+    band_pct = BAND_PCT.get(interval, 0.004)
+
+    zones: list[dict] = []
+    for s in supports:
+        band = s["level"] * band_pct
+        zones.append(
+            {
+                "type": "S",
+                "low": s["level"] - band,
+                "high": s["level"] + band,
+                "mid": s["level"],
+                "strength": s.get("touches", 0) + (1 if s.get("vol", 0) >= 1.5 else 0),
+            }
+        )
+    for r in resistances:
+        band = r["level"] * band_pct
+        zones.append(
+            {
+                "type": "R",
+                "low": r["level"] - band,
+                "high": r["level"] + band,
+                "mid": r["level"],
+                "strength": r.get("touches", 0) + (1 if r.get("vol", 0) >= 1.5 else 0),
+            }
+        )
+    zones.sort(key=lambda z: (abs(cur_price - z["mid"]), -z["strength"]))
+    z = zones[0]
+    zone_txt = f"{z['low']:.2f}–{z['high']:.2f}"
+    midpoint = z["mid"]
+    state = ""
+    if z["low"] <= cur_price <= z["high"]:
+        state = "inside_zone"
+    elif z["type"] == "R":
+        if cur_price > z["high"] and cur_price - z["high"] > MIN_CLOSE_OUTSIDE_ATR * atr and cur_vol >= vol_thresh:
+            state = "breakout_up"
+        else:
+            state = "approach_to_R" if cur_price < z["high"] else "approach_to_R"
+    else:  # support
+        if cur_price < z["low"] and z["low"] - cur_price > MIN_CLOSE_OUTSIDE_ATR * atr and cur_vol >= vol_thresh:
+            state = "breakout_down"
+        else:
+            state = "approach_to_S" if cur_price > z["low"] else "approach_to_S"
+
+    stop = None
+    target = None
+    if z["type"] == "R":
+        stop = z["high"] + 0.3 * atr
+        opp = [s["level"] for s in supports if s["level"] < midpoint]
+        target = opp[0] if opp else midpoint - 1.5 * atr
+    else:
+        stop = z["low"] - 0.3 * atr
+        opp = [r["level"] for r in resistances if r["level"] > midpoint]
+        target = opp[0] if opp else midpoint + 1.5 * atr
+    rr = abs(target - midpoint) / abs(midpoint - stop) if stop and target else 0
+
+    side = "Long" if z["type"] == "S" else "Short"
+    if state == "inside_zone":
+        return (
+            f"Цена пилит внутри сильной зоны {zone_txt}. Нейтрально. "
+            "Торгуем только пробой/ретест с подтверждением. Без сигнала — пропуск."
+        )
+    if state == "breakout_up":
+        return (
+            f"Пробили R {zone_txt} телом ≥0.25 ATR на повышенном объёме. "
+            f"План: Long по ретесту зоны, стоп за серединой зоны. TP: {target:.2f}. RR ≈ {rr:.2f}"
+        )
+    if state == "breakout_down":
+        return (
+            f"Пробили S {zone_txt} телом ≥0.25 ATR на повышенном объёме. "
+            f"План: Short по ретесту зоны, стоп за серединой зоны. TP: {target:.2f}. RR ≈ {rr:.2f}"
+        )
+    # approach cases
+    msg = (
+        f"Зона {('S' if z['type']=='S' else 'R')} {zone_txt}. Подходим {'снизу' if z['type']=='R' else 'сверху'}. "
+    )
+    if z["type"] == "R":
+        msg += (
+            "Жди подтверждения Short: медвежий отказ сверху, close ниже середины зоны, объём ↑. "
+            f"Стоп: за {z['high']:.2f}+0.3 ATR. Цели: ближайшая поддержка / следующая зона."
+        )
+    else:
+        msg += (
+            "Жди подтверждения Long: бычий отказ снизу, close выше середины зоны, объём ↑. "
+            f"Стоп: под {z['low']:.2f}-0.3 ATR. Цели: ближайшее сопротивление / следующая зона."
+        )
+    if rr and rr < MIN_RR:
+        msg += f" RR ≈ {rr:.2f} — сделка невыгодна, пропуск."
+    return msg
+
+
 async def _generate_price_chart(
     symbol: str,
     interval: str,
@@ -4785,6 +4921,7 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
     trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype, vol_short)
     rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
     levels_block, supports, resistances = await _entry_exit_levels(symbol)
+    zone_reco = await _sr_trade_reco(symbol, supports, resistances)
     vol_block = "\n".join(filter(None, [vol_line, vol_note]))
     trend_block = trend_text
     if vol_block:
@@ -4792,6 +4929,8 @@ async def maybe_send_ai_advice(uid: int, tid: int) -> None:
     trend_block += f"\n\n{rec_block}\n{verdict_line}"
     if levels_block:
         trend_block += f"\n\n{levels_block}"
+    if zone_reco:
+        trend_block += f"\n\n{zone_reco}"
     text = "💡 Сетап оценён!\n\n" + trend_block + "\n\n" + await _build_ai_advice(uid, sig_list, strong, total, risk, symbol)
     await bot.send_message(uid, text)
     if supports and resistances:
@@ -5492,6 +5631,7 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
         trend_text, d_res, h_res = await _analyze_micro_trend(base, "LONG", vol_short)
         rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
         levels_block, supports, resistances = await _entry_exit_levels(base, price)
+        zone_reco = await _sr_trade_reco(base, supports, resistances)
         vol_block = "\n".join(filter(None, [vol_line, vol_note]))
         trend_block = trend_text
         if vol_block:
@@ -5499,6 +5639,8 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
         trend_block += f"\n\n{rec_block}\n{verdict_line}"
         if levels_block:
             trend_block += f"\n\n{levels_block}"
+        if zone_reco:
+            trend_block += f"\n\n{zone_reco}"
         advice = await _build_ai_advice(msg.from_user.id, [], 0, 0, 0, base)
         await msg.answer(trend_block + "\n\n" + advice, reply_markup=with_back(kb))
         if supports and resistances:
@@ -5585,6 +5727,7 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
         trend_text, d_res, h_res = await _analyze_micro_trend(symbol, t_type, vol_short)
         rec_block, verdict_line = format_trend_recommendations(d_res, h_res)
         levels_block, supports, resistances = await _entry_exit_levels(symbol)
+        zone_reco = await _sr_trade_reco(symbol, supports, resistances)
         vol_block = "\n".join(filter(None, [vol_line, vol_note]))
         trend_block = trend_text
         if vol_block:
@@ -5592,6 +5735,8 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
         trend_block += f"\n\n{rec_block}\n{verdict_line}"
         if levels_block:
             trend_block += f"\n\n{levels_block}"
+        if zone_reco:
+            trend_block += f"\n\n{zone_reco}"
         text = (
             "\n".join(parts)
             + "\n\n"
