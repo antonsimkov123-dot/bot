@@ -3961,7 +3961,11 @@ def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str]:
             else:
                 action = "🔴 Ищи вход на Short — возможно вершина"
         else:
-            action = "Жди подтверждения"
+            action = (
+                "Жди подтверждения для входа в Long"
+                if trend == "up"
+                else "Жди подтверждения для входа в Short"
+            )
         return f"{LEVEL_EMOJI[lvl]} {LEVEL_NAME[lvl]} ({tf}): {arrow} — {action}"
 
     lines = ["📊 Рекомендации по трендам:"]
@@ -3977,8 +3981,9 @@ def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str]:
                 dirs.append(tr)
     if "up" in dirs and "down" in dirs:
         verdict = "⚠️ Вердикт: Тренды противоречат — жди подтверждения"
-    elif dirs and (set(dirs) == {"up"} or set(dirs) == {"down"}):
-        verdict = "✅ Вердикт: Тренды совпадают — возможен уверенный вход"
+    elif dirs and len(set(dirs)) == 1:
+        direction = "Long" if dirs[0] == "up" else "Short"
+        verdict = f"✅ Вердикт: Тренды совпадают — возможен уверенный вход в {direction}"
     else:
         verdict = "⚠️ Вердикт: Тренды неопределены — наблюдай"
 
