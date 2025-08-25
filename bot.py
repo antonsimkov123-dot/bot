@@ -4463,6 +4463,14 @@ async def _sr_trade_reco(
     midpoint = z["mid"]
     band = (z["high"] - z["low"]) / 2
     near = abs(cur_price - midpoint) <= band
+    side = "Long" if z["type"] == "S" else "Short"
+    strong_zone = z.get("touches", 0) >= 4 and z.get("vol", 0) >= 2 and z.get("strength", 0) >= 4
+    trends_align = (bias == "up" and side == "Long") or (bias == "down" and side == "Short")
+    pattern_txt = (
+        "бычий паттерн, close выше середины зоны, объём ↑"
+        if side == "Long"
+        else "медвежий паттерн, close ниже середины зоны, объём ↑"
+    )
     bias_note = ""
     note_has_zone = False
     if z["type"] == "R" and near and z["strength"] >= 2:
@@ -4519,15 +4527,23 @@ async def _sr_trade_reco(
         target = opp[0] if opp else midpoint + 1.5 * atr
     rr = abs(target - midpoint) / abs(midpoint - stop) if stop and target else 0
 
-    side = "Long" if z["type"] == "S" else "Short"
     zone_dir = side if near and z["strength"] >= 2 else None
     if state == "inside_zone":
-        base = "" if note_has_zone else f"Цена пилит внутри сильной зоны {zone_txt}. "
-        msg = (
-            bias_note
-            + base
-            + "Нейтрально. Торгуем только пробой/ретест с подтверждением. Без сигнала — пропуск."
-        )
+        if strong_zone and trends_align:
+            msg = (
+                bias_note
+                + f"Тренды совпадают. Ищи вход в {side} при появлении сигнала ("
+                + f"{pattern_txt}). Стоп: {('под' if side=='Long' else 'за')} "
+                + (f"{z['low']:.2f}-0.3 ATR" if side == 'Long' else f"{z['high']:.2f}+0.3 ATR")
+                + ". Цели: ближайшее сопротивление / следующая зона."
+            )
+        else:
+            base = "" if note_has_zone else f"Цена пилит внутри сильной зоны {zone_txt}. "
+            msg = (
+                bias_note
+                + base
+                + "Нейтрально. Торгуем только пробой/ретест с подтверждением. Без сигнала — пропуск."
+            )
     elif state == "breakout_up":
         msg = (
             bias_note
@@ -4545,16 +4561,26 @@ async def _sr_trade_reco(
             "" if note_has_zone else f"Зона {('S' if z['type']=='S' else 'R')} {zone_txt}. Подходим {'снизу' if z['type']=='R' else 'сверху'}. "
         )
         msg = bias_note + base
-        if z["type"] == "R":
+        if strong_zone and trends_align:
             msg += (
-                "Жди подтверждения Short: медвежий отказ сверху, close ниже середины зоны, объём ↑. "
-                f"Стоп: за {z['high']:.2f}+0.3 ATR. Цели: ближайшая поддержка / следующая зона."
+                f"Тренды совпадают. Ищи вход в {side} при появлении сигнала ({pattern_txt}). "
+                + (
+                    f"Стоп: под {z['low']:.2f}-0.3 ATR. Цели: ближайшее сопротивление / следующая зона."
+                    if side == "Long"
+                    else f"Стоп: за {z['high']:.2f}+0.3 ATR. Цели: ближайшая поддержка / следующая зона."
+                )
             )
         else:
-            msg += (
-                "Жди подтверждения Long: бычий отказ снизу, close выше середины зоны, объём ↑. "
-                f"Стоп: под {z['low']:.2f}-0.3 ATR. Цели: ближайшее сопротивление / следующая зона."
-            )
+            if z["type"] == "R":
+                msg += (
+                    "Жди подтверждения Short: медвежий отказ сверху, close ниже середины зоны, объём ↑. "
+                    f"Стоп: за {z['high']:.2f}+0.3 ATR. Цели: ближайшая поддержка / следующая зона."
+                )
+            else:
+                msg += (
+                    "Жди подтверждения Long: бычий отказ снизу, close выше середины зоны, объём ↑. "
+                    f"Стоп: под {z['low']:.2f}-0.3 ATR. Цели: ближайшее сопротивление / следующая зона."
+                )
         if rr and rr < MIN_RR:
             msg += f" RR ≈ {rr:.2f} — сделка невыгодна, пропуск."
 
@@ -4565,10 +4591,16 @@ async def _sr_trade_reco(
         if bias == "up"
         else "тренды глобально падающие" if bias == "down" else "тренды неопределённые"
     )
-    summary = (
-        f"📊 Резюме: цена находится у {zone_label}, {trend_phrase}, {vol_phrase} — "
-        f"жди разворотного паттерна для входа в {side}."
-    )
+    if strong_zone and trends_align:
+        summary = (
+            f"📊 Резюме: цена находится у {zone_label} {zone_txt}, тренды совпадают, {vol_phrase} — "
+            f"ищи вход в {side} при сигнале ({pattern_txt})."
+        )
+    else:
+        summary = (
+            f"📊 Резюме: цена находится у {zone_label}, {trend_phrase}, {vol_phrase} — "
+            f"жди разворотного паттерна для входа в {side}."
+        )
     return msg + "\n\n" + summary, zone_dir
 
 
