@@ -3585,7 +3585,8 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
                 trend_word = "восходящие" if trend_bias == "up" else "нисходящие"
                 verdict_line = (
                     f"⚠️ Вердикт: Цена у {zone_word}. Несмотря на {trend_word} тренды, "
-                    f"лучше ждать разворота и искать вход в {zone_dir}."
+                    "текущая зона может стать как точкой разворота, так и пробоя. "
+                    "Работай только по подтверждённому сигналу."
                 )
             vol_block = "\n".join(filter(None, [vol_line, vol_note]))
             reco_block = ""
@@ -4007,11 +4008,10 @@ def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str, st
     up_count = dirs.count("up")
     down_count = dirs.count("down")
     if up_count and down_count:
-        ver_dir = "Long" if up_count > down_count else "Short" if down_count > up_count else None
-        if ver_dir:
-            verdict = f"⚠️ Вердикт: Тренды противоречат — жди подтверждения для входа в {ver_dir}"
-        else:
-            verdict = "⚠️ Вердикт: Тренды противоречат — жди подтверждения"
+        verdict = (
+            "⚠️ Вердикт: Тренды противоречат — текущая зона может стать как "
+            "точкой разворота, так и пробоя. Работай только по подтверждённому сигналу."
+        )
     elif dirs and len(set(dirs)) == 1:
         direction = "Long" if dirs[0] == "up" else "Short"
         verdict = f"✅ Вердикт: Тренды совпадают — возможен уверенный вход в {direction}"
@@ -4580,19 +4580,28 @@ async def _sr_trade_reco(
     zone_label = "поддержки" if z["type"] == "S" else "сопротивления"
     vol_phrase = "объёмы выше нормы" if cur_vol >= vol_thresh else "объёмы падают"
     trend_phrase = (
-        "тренды глобально растущие"
+        "тренды в целом растущие"
         if bias == "up"
-        else "тренды глобально падающие" if bias == "down" else "тренды неопределённые"
+        else "тренды в целом нисходящие" if bias == "down" else "тренды неопределённые"
     )
     if strong_zone and trends_align:
         summary = (
-            f"📊 Резюме: цена находится у {zone_label} {zone_txt}, тренды совпадают, {vol_phrase} — "
-            f"ищи вход в {side} при сигнале ({pattern_txt})."
+            f"📊 Резюме: цена у {zone_label} {zone_txt}, {trend_phrase}, {vol_phrase} — "
+            f"возможен вход в {side} при подтверждении ({pattern_txt})."
+        )
+    elif bias and zone_dir and (
+        (bias == "up" and side == "Short") or (bias == "down" and side == "Long")
+    ):
+        alt = "возможен отскок" if side == "Long" else "возможен откат"
+        summary = (
+            f"📊 Резюме: цена у {zone_label} {zone_txt}, {trend_phrase}, {vol_phrase} — "
+            f"{alt}, подтверждение обязательно ({pattern_txt})."
         )
     else:
         summary = (
-            f"📊 Резюме: цена находится у {zone_label}, {trend_phrase}, {vol_phrase} — "
-            f"жди разворотного паттерна для входа в {side}."
+            f"📊 Резюме: цена у {zone_label} {zone_txt}, тренды противоречат — "
+            "зона может стать как точкой разворота, так и пробоя. "
+            "Работай только по подтверждённому сигналу."
         )
     return msg + "\n\n" + summary, zone_dir
 
