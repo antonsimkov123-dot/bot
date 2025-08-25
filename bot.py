@@ -3971,9 +3971,9 @@ def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str, st
                 action = "🔴 Ищи вход на Short — возможно вершина"
         else:
             action = (
-                "Жди подтверждения для входа в Long"
+                "Жди подтверждения для входа в Long (ищи разворот у поддержки)"
                 if trend == "up"
-                else "Жди подтверждения для входа в Short"
+                else "Жди подтверждения для входа в Short (ищи разворот у сопротивления)"
             )
         return f"{LEVEL_EMOJI[lvl]} {LEVEL_NAME[lvl]} ({tf}): {arrow} — {action}"
 
@@ -3988,16 +3988,20 @@ def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str, st
             tr = res.get(lvl, {}).get("trend")
             if tr in {"up", "down"}:
                 dirs.append(tr)
-    if "up" in dirs and "down" in dirs:
-        verdict = "⚠️ Вердикт: Тренды противоречат — жди подтверждения"
+    up_count = dirs.count("up")
+    down_count = dirs.count("down")
+    if up_count and down_count:
+        ver_dir = "Long" if up_count > down_count else "Short" if down_count > up_count else None
+        if ver_dir:
+            verdict = f"⚠️ Вердикт: Тренды противоречат — жди подтверждения для входа в {ver_dir}"
+        else:
+            verdict = "⚠️ Вердикт: Тренды противоречат — жди подтверждения"
     elif dirs and len(set(dirs)) == 1:
         direction = "Long" if dirs[0] == "up" else "Short"
         verdict = f"✅ Вердикт: Тренды совпадают — возможен уверенный вход в {direction}"
     else:
         verdict = "⚠️ Вердикт: Тренды неопределены — наблюдай"
 
-    up_count = dirs.count("up")
-    down_count = dirs.count("down")
     bias_dir: str | None = None
     if up_count > down_count:
         bias_dir = "up"
@@ -4421,6 +4425,8 @@ async def _sr_trade_reco(
                 "low": s["level"] - band,
                 "high": s["level"] + band,
                 "mid": s["level"],
+                "touches": s.get("touches", 0),
+                "vol": s.get("vol", 0),
                 "strength": s.get("touches", 0) + (1 if s.get("vol", 0) >= 1.5 else 0),
             }
         )
@@ -4432,6 +4438,8 @@ async def _sr_trade_reco(
                 "low": r["level"] - band,
                 "high": r["level"] + band,
                 "mid": r["level"],
+                "touches": r.get("touches", 0),
+                "vol": r.get("vol", 0),
                 "strength": r.get("touches", 0) + (1 if r.get("vol", 0) >= 1.5 else 0),
             }
         )
@@ -4443,9 +4451,27 @@ async def _sr_trade_reco(
     near = abs(cur_price - midpoint) <= band
     bias_note = ""
     if bias == "up" and z["type"] == "S" and near and z["strength"] >= 3:
-        bias_note = f"Цена у ключевой поддержки {zone_txt} — возможен вход в Long от уровня. "
+        details = []
+        if z.get("touches"):
+            details.append(f"{z['touches']} касаний")
+        if z.get("vol"):
+            details.append(f"объём {z['vol']:.1f}x")
+        extra = f" ({', '.join(details)})" if details else ""
+        bias_note = (
+            f"Цена подошла к сильной поддержке {zone_txt}{extra} — "
+            "ищи вход в Long при развороте. "
+        )
     elif bias == "down" and z["type"] == "R" and near and z["strength"] >= 3:
-        bias_note = f"Цена у зоны сопротивления {zone_txt} — возможен вход в Short от уровня. "
+        details = []
+        if z.get("touches"):
+            details.append(f"{z['touches']} касаний")
+        if z.get("vol"):
+            details.append(f"объём {z['vol']:.1f}x")
+        extra = f" ({', '.join(details)})" if details else ""
+        bias_note = (
+            f"Цена тестирует зону сопротивления {zone_txt}{extra} — "
+            "возможен Short при подтверждении. "
+        )
 
     state = ""
     if z["low"] <= cur_price <= z["high"]:
@@ -4475,41 +4501,53 @@ async def _sr_trade_reco(
 
     side = "Long" if z["type"] == "S" else "Short"
     if state == "inside_zone":
-        return (
+        msg = (
             bias_note
             + f"Цена пилит внутри сильной зоны {zone_txt}. Нейтрально. "
             "Торгуем только пробой/ретест с подтверждением. Без сигнала — пропуск."
         )
-    if state == "breakout_up":
-        return (
+    elif state == "breakout_up":
+        msg = (
             bias_note
             + f"Пробили R {zone_txt} телом ≥0.25 ATR на повышенном объёме. "
             f"План: Long по ретесту зоны, стоп за серединой зоны. TP: {target:.2f}. RR ≈ {rr:.2f}"
         )
-    if state == "breakout_down":
-        return (
+    elif state == "breakout_down":
+        msg = (
             bias_note
             + f"Пробили S {zone_txt} телом ≥0.25 ATR на повышенном объёме. "
             f"План: Short по ретесту зоны, стоп за серединой зоны. TP: {target:.2f}. RR ≈ {rr:.2f}"
         )
-    # approach cases
-    msg = (
-        bias_note
-        + f"Зона {('S' if z['type']=='S' else 'R')} {zone_txt}. Подходим {'снизу' if z['type']=='R' else 'сверху'}. "
-    )
-    if z["type"] == "R":
-        msg += (
-            "Жди подтверждения Short: медвежий отказ сверху, close ниже середины зоны, объём ↑. "
-            f"Стоп: за {z['high']:.2f}+0.3 ATR. Цели: ближайшая поддержка / следующая зона."
-        )
     else:
-        msg += (
-            "Жди подтверждения Long: бычий отказ снизу, close выше середины зоны, объём ↑. "
-            f"Стоп: под {z['low']:.2f}-0.3 ATR. Цели: ближайшее сопротивление / следующая зона."
+        msg = (
+            bias_note
+            + f"Зона {('S' if z['type']=='S' else 'R')} {zone_txt}. Подходим {'снизу' if z['type']=='R' else 'сверху'}. "
         )
-    if rr and rr < MIN_RR:
-        msg += f" RR ≈ {rr:.2f} — сделка невыгодна, пропуск."
-    return msg
+        if z["type"] == "R":
+            msg += (
+                "Жди подтверждения Short: медвежий отказ сверху, close ниже середины зоны, объём ↑. "
+                f"Стоп: за {z['high']:.2f}+0.3 ATR. Цели: ближайшая поддержка / следующая зона."
+            )
+        else:
+            msg += (
+                "Жди подтверждения Long: бычий отказ снизу, close выше середины зоны, объём ↑. "
+                f"Стоп: под {z['low']:.2f}-0.3 ATR. Цели: ближайшее сопротивление / следующая зона."
+            )
+        if rr and rr < MIN_RR:
+            msg += f" RR ≈ {rr:.2f} — сделка невыгодна, пропуск."
+
+    zone_label = "поддержки" if z["type"] == "S" else "сопротивления"
+    vol_phrase = "объёмы выше нормы" if cur_vol >= vol_thresh else "объёмы падают"
+    trend_phrase = (
+        "тренды глобально растущие"
+        if bias == "up"
+        else "тренды глобально падающие" if bias == "down" else "тренды неопределённые"
+    )
+    summary = (
+        f"📊 Резюме: цена находится у {zone_label}, {trend_phrase}, {vol_phrase} — "
+        f"жди разворотного паттерна для входа в {side}."
+    )
+    return msg + "\n\n" + summary
 
 
 async def _generate_price_chart(
