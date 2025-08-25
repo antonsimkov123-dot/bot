@@ -4375,30 +4375,6 @@ async def _entry_exit_levels(
     )
     msg = "📊 Уровни входа/выхода:\n" + "\n".join(lines)
 
-    if MULTI_SR_MODE:
-        tbl: list[str] = []
-        if sup_levels:
-            tbl.append(f"Поддержки ({'1D' if interval == 'D' else '4H'}):")
-            for s in sup_levels:
-                vol_txt = (
-                    f", объём {s['vol']:.1f}×" if s["vol"] >= 1.5 else ", слабый объём"
-                )
-                tbl.append(
-                    f"— {fmt_price(s['level'])} ({s['touches']} теста{vol_txt})"
-                )
-        if res_levels:
-            tbl.append(f"Сопротивления ({'1D' if interval == 'D' else '4H'}):")
-            for r in res_levels:
-                vol_txt = (
-                    f", объём {r['vol']:.1f}×" if r["vol"] >= 1.5 else ", слабый объём"
-                )
-                extra = ", верхний экстремум" if r.get("top") else ""
-                tbl.append(
-                    f"— {fmt_price(r['level'])} ({r['touches']} касания{vol_txt}{extra})"
-                )
-        if tbl:
-            msg += "\n\n" + "\n".join(tbl)
-
     return msg, sup_levels, res_levels
 
 
