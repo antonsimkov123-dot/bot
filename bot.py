@@ -3987,11 +3987,14 @@ def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str, st
             else:
                 action = "🔴 Ищи вход на Short — возможно вершина"
         else:
-            action = (
-                "Жди подтверждения для входа в Long (ищи разворот у поддержки)"
-                if trend == "up"
-                else "Жди подтверждения для входа в Short (ищи разворот у сопротивления)"
-            )
+            if trend == "up" and vol == "down":
+                action = "Рост идёт на падающих объёмах — слабый импульс. Жди подтверждения для входа в Long"
+            elif trend == "down" and vol == "up":
+                action = "Падение усиливается на объёмах — возможен Short, подтверждение желательно"
+            elif trend == "up":
+                action = "Жди подтверждения для входа в Long (ищи разворот у поддержки)"
+            else:
+                action = "Жди подтверждения для входа в Short (ищи разворот у сопротивления)"
         return f"{LEVEL_EMOJI[lvl]} {LEVEL_NAME[lvl]} ({tf}): {arrow} — {action}"
 
     lines = ["📊 Рекомендации по трендам:"]
@@ -4008,21 +4011,31 @@ def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str, st
     up_count = dirs.count("up")
     down_count = dirs.count("down")
     if up_count and down_count:
-        verdict = (
-            "⚠️ Вердикт: Тренды противоречат — текущая зона может стать как "
-            "точкой разворота, так и пробоя. Работай только по подтверждённому сигналу."
-        )
+        if up_count > down_count:
+            verdict = (
+                "⚠️ Вердикт: Краткосрочный откат вниз возможен. "
+                "Лонг — только при подтверждении от зоны."
+            )
+            bias_dir = "up"
+        elif down_count > up_count:
+            verdict = (
+                "⚠️ Вердикт: Краткосрочный откат вверх возможен. "
+                "Шорт — только при подтверждении от зоны."
+            )
+            bias_dir = "down"
+        else:
+            verdict = (
+                "⚠️ Вердикт: Тренды противоречат — текущая зона может стать как "
+                "точкой разворота, так и пробоя. Работай только по подтверждённому сигналу."
+            )
+            bias_dir = None
     elif dirs and len(set(dirs)) == 1:
         direction = "Long" if dirs[0] == "up" else "Short"
         verdict = f"✅ Вердикт: Тренды совпадают — возможен уверенный вход в {direction}"
+        bias_dir = "up" if dirs[0] == "up" else "down"
     else:
         verdict = "⚠️ Вердикт: Тренды неопределены — наблюдай"
-
-    bias_dir: str | None = None
-    if up_count > down_count:
-        bias_dir = "up"
-    elif down_count > up_count:
-        bias_dir = "down"
+        bias_dir = None
 
     return "\n".join(lines), verdict, bias_dir
 
@@ -4462,8 +4475,26 @@ async def _sr_trade_reco(
         if side == "Long"
         else "медвежий паттерн, close ниже середины зоны, объём ↑"
     )
+    dist_pct = abs(cur_price - midpoint) / cur_price if cur_price else 1
+    critical = z.get("touches", 0) >= 10 and z.get("vol", 0) >= 2 and dist_pct <= 0.01
+    def _zone_mark(level: dict) -> str:
+        if level.get("touches", 0) >= 10 and level.get("vol", 0) >= 2:
+            return (
+                f"🔴 Сильное сопротивление (тесты: {level['touches']}+, объём: высокий)"
+                if level["type"] == "R"
+                else f"🟢 Поддержка с подтверждённым объёмом (тесты: {level['touches']}+, объём: высокий)"
+            )
+        if level.get("touches", 0) < 2 and level.get("vol", 0) < 1.5:
+            return "⚠️ Слабая зона — касаний мало, объём низкий"
+        if level["type"] == "R":
+            return f"🟥 Сопротивление ({level['touches']} кас., объём {level['vol']:.1f}x)"
+        return f"🟩 Поддержка ({level['touches']} кас., объём {level['vol']:.1f}x)"
+
+    mark_line = _zone_mark(z)
+
     bias_note = ""
     note_has_zone = False
+    force_wait = False
     if z["type"] == "R" and near and z["strength"] >= 2:
         details = []
         if z.get("touches"):
@@ -4471,12 +4502,20 @@ async def _sr_trade_reco(
         if z.get("vol"):
             details.append(f"объём {z['vol']:.1f}x")
         extra = f" ({', '.join(details)})" if details else ""
-        bias_note = f"Цена у зоны сопротивления {zone_txt}{extra}. "
-        if bias == "up" and cur_vol >= vol_thresh:
-            bias_note += (
-                "Рост ослабевает у зоны сопротивления. Возможен откат вниз. "
-                "Не спеши с Long, жди разворотного паттерна. "
-            )
+        if critical:
+            bias_note = f"Цена вплотную к зоне сопротивления {zone_txt}{extra}. Возможен откат — жди подтверждения."
+            force_wait = True
+        else:
+            bias_note = f"Цена у зоны сопротивления {zone_txt}{extra}. "
+            if cur_vol < vol_thresh:
+                bias_note += "Не входи в Long без сигнала. Цена упёрлась в зону, а объёмы падают. "
+            elif bias == "up" and cur_vol >= vol_thresh:
+                bias_note += (
+                    "Рост ослабевает у зоны сопротивления. Возможен откат вниз. "
+                    "Не спеши с Long, жди разворотного паттерна. "
+                )
+        if z.get("vol", 0) >= 2:
+            bias_note += " Уровень подтверждён объёмом — сильная зона."
         note_has_zone = True
     elif z["type"] == "S" and near and z["strength"] >= 2:
         details = []
@@ -4485,11 +4524,19 @@ async def _sr_trade_reco(
         if z.get("vol"):
             details.append(f"объём {z['vol']:.1f}x")
         extra = f" ({', '.join(details)})" if details else ""
-        bias_note = f"Цена у сильной поддержки {zone_txt}{extra}. "
-        if bias == "down" and cur_vol >= vol_thresh:
-            bias_note += (
-                "Падение ослабевает у зоны. Не спеши с Short, жди разворотного паттерна. "
-            )
+        if critical:
+            bias_note = f"Поддержка {zone_txt}{extra} тестировалась много раз — возможен отскок. Жди подтверждения."
+            force_wait = True
+        else:
+            bias_note = f"Цена у сильной поддержки {zone_txt}{extra}. "
+            if cur_vol < vol_thresh:
+                bias_note += "Жди подтверждения отскока — возможен ложный пробой. "
+            elif bias == "down" and cur_vol >= vol_thresh:
+                bias_note += (
+                    "Падение ослабевает у зоны. Не спеши с Short, жди разворотного паттерна. "
+                )
+        if z.get("vol", 0) >= 2:
+            bias_note += " Уровень подтверждён объёмом — сильная зона."
         note_has_zone = True
 
     state = ""
@@ -4518,8 +4565,10 @@ async def _sr_trade_reco(
         target = opp[0] if opp else midpoint + 1.5 * atr
     rr = abs(target - midpoint) / abs(midpoint - stop) if stop and target else 0
 
-    zone_dir = side if near and z["strength"] >= 2 else None
-    if state == "inside_zone":
+    zone_dir = side if near and z["strength"] >= 2 and not force_wait else None
+    if force_wait:
+        msg = bias_note
+    elif state == "inside_zone":
         if strong_zone and trends_align:
             msg = (
                 bias_note
@@ -4584,7 +4633,11 @@ async def _sr_trade_reco(
         if bias == "up"
         else "тренды в целом нисходящие" if bias == "down" else "тренды неопределённые"
     )
-    if strong_zone and trends_align:
+    if force_wait:
+        summary = (
+            f"📊 Резюме: цена у {zone_label} {zone_txt}, {trend_phrase}, {vol_phrase} — подтверждение обязательно ({pattern_txt})."
+        )
+    elif strong_zone and trends_align:
         summary = (
             f"📊 Резюме: цена у {zone_label} {zone_txt}, {trend_phrase}, {vol_phrase} — "
             f"возможен вход в {side} при подтверждении ({pattern_txt})."
@@ -4603,7 +4656,7 @@ async def _sr_trade_reco(
             "зона может стать как точкой разворота, так и пробоя. "
             "Работай только по подтверждённому сигналу."
         )
-    return msg + "\n\n" + summary, zone_dir
+    return mark_line + "\n" + msg + "\n\n" + summary, zone_dir
 
 
 async def _generate_price_chart(
@@ -4962,10 +5015,10 @@ async def _market_signal_balance() -> str:
     long_pct = long_count / total * 100
     short_pct = short_count / total * 100
     line = f"📊 Рыночный баланс: {long_pct:.0f}% Long / {short_pct:.0f}% Short"
-    if long_pct >= 65:
-        line += " — Толпа в лонгах. Возможен откат вниз."
-    elif short_pct >= 65:
-        line += " — Толпа в шортах. Возможен отскок вверх."
+    if long_pct >= 80:
+        line += " — Толпа в лонгах. Возможен откат."
+    elif short_pct >= 80:
+        line += " — Толпа в шортах. Возможен рост на squeeze."
     else:
         line += " — Баланс нейтральный."
     return line
