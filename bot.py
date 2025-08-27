@@ -4535,6 +4535,10 @@ async def _sr_trade_reco(
         bias_note = _vol_comment(z["type"], zone_important, vol_dir)
         note_has_zone = True
 
+    last_move = closes[-1] - closes[-2] if len(closes) >= 2 else 0
+    move_dir = "up" if last_move > 0 else "down" if last_move < 0 else ""
+    last_range = highs[-1] - lows[-1]
+
     # calculate bounce/break probabilities when approaching a zone
     bounce_prob = break_prob = None
     zweak = z.get("touches", 0) <= 3 and z.get("vol", 0) < 1
@@ -4648,10 +4652,48 @@ async def _sr_trade_reco(
         prob_txt = (
             "\n📊 Вероятность сценариев:\n"
             f"– Отскок от {zone_noun} {zone_txt}: {int(bounce_prob)}%\n"
-            f"– Пробой этой зоны: {int(break_prob)}%"
+            f"– Пробой этой зоны: {int(break_prob)}%\n"
+            "Оценка основана на текущих сигналах и объёмах."
         )
     else:
-        prob_txt = "\nНедостаточно данных для точной оценки вероятности"
+        cont_prob = rev_prob = None
+        if move_dir:
+            cont_prob = 50
+            if move_dir == "up":
+                cont_prob += 15 if vol_dir == "up" else -15
+                if bias == "up":
+                    cont_prob += 10
+                elif bias == "down":
+                    cont_prob -= 10
+            else:
+                cont_prob += 15 if vol_dir == "up" else -15
+                if bias == "down":
+                    cont_prob += 10
+                elif bias == "up":
+                    cont_prob -= 10
+            if atr:
+                if last_range > atr * 1.5:
+                    cont_prob += 10
+                elif last_range < atr * 0.5:
+                    cont_prob -= 10
+            cont_prob = max(0, min(100, cont_prob))
+            rev_prob = 100 - cont_prob
+            if move_dir == "up":
+                prob_txt = (
+                    "\n📊 Вероятность сценариев:\n"
+                    f"– Продолжение роста: {int(cont_prob)}%\n"
+                    f"– Разворот вниз: {int(rev_prob)}%\n"
+                    "Оценка основана на текущих сигналах и объёмах."
+                )
+            else:
+                prob_txt = (
+                    "\n📊 Вероятность сценариев:\n"
+                    f"– Продолжение падения: {int(cont_prob)}%\n"
+                    f"– Отскок вверх: {int(rev_prob)}%\n"
+                    "Оценка основана на текущих сигналах и объёмах."
+                )
+        else:
+            prob_txt = "\nНедостаточно данных для точной оценки вероятности"
 
     zone_label = "поддержки" if z["type"] == "S" else "сопротивления"
     vol_phrase = "объёмы выше нормы" if cur_vol >= vol_thresh else "объёмы падают"
