@@ -4534,6 +4534,33 @@ async def _sr_trade_reco(
         bias_note = _vol_comment(z["type"], zone_important, vol_dir)
         note_has_zone = True
 
+    # calculate bounce/break probabilities when approaching a zone
+    bounce_prob = break_prob = None
+    zweak = z.get("touches", 0) <= 3 and z.get("vol", 0) < 1.5
+    if state in ("approach_to_R", "approach_to_S", "inside_zone"):
+        # default neutral probabilities
+        bounce_prob = 50
+        if z["type"] == "S":
+            if zone_important and vol_dir == "down":
+                bounce_prob = 75
+            elif zone_important and vol_dir == "up":
+                bounce_prob = 30
+            elif zweak and vol_dir == "up":
+                bounce_prob = 30
+            elif zweak and vol_dir == "down":
+                bounce_prob = 60
+        else:  # resistance
+            if zone_important and vol_dir == "down":
+                bounce_prob = 70
+            elif zone_important and vol_dir == "up":
+                bounce_prob = 30
+            elif zweak and vol_dir == "up":
+                bounce_prob = 30
+            elif zweak and vol_dir == "down":
+                bounce_prob = 60
+        bounce_prob = max(0, min(100, bounce_prob))
+        break_prob = 100 - bounce_prob
+
     stop = None
     target = None
     if z["type"] == "R":
@@ -4606,6 +4633,15 @@ async def _sr_trade_reco(
                 )
         if rr and rr < MIN_RR:
             msg += f" RR ≈ {rr:.2f} — сделка невыгодна, пропуск."
+    prob_txt = ""
+    if bounce_prob is not None:
+        def _prob_mark(p: float) -> str:
+            return "🟢" if p > 60 else ("🟡" if p >= 40 else "🔴")
+
+        prob_txt = (
+            f"\n{_prob_mark(bounce_prob)} Вероятность отскока: {int(bounce_prob)}%\n"
+            f"{_prob_mark(break_prob)} Вероятность пробоя: {int(break_prob)}%"
+        )
 
     zone_label = "поддержки" if z["type"] == "S" else "сопротивления"
     vol_phrase = "объёмы выше нормы" if cur_vol >= vol_thresh else "объёмы падают"
@@ -4637,7 +4673,7 @@ async def _sr_trade_reco(
             "зона может стать как точкой разворота, так и пробоя. "
             "Работай только по подтверждённому сигналу."
         )
-    return mark_line + "\n" + msg + "\n\n" + summary, zone_dir
+    return mark_line + "\n" + msg + prob_txt + "\n\n" + summary, zone_dir
 
 
 async def _generate_price_chart(
