@@ -4377,6 +4377,7 @@ async def _sr_trade_reco(
     if not candles:
         return ""
     candles = sorted(candles, key=lambda c: int(c[0]))
+    opens = [float(c[1]) for c in candles]
     highs = [float(c[2]) for c in candles]
     lows = [float(c[3]) for c in candles]
     closes = [float(c[4]) for c in candles]
@@ -4536,28 +4537,36 @@ async def _sr_trade_reco(
 
     # calculate bounce/break probabilities when approaching a zone
     bounce_prob = break_prob = None
-    zweak = z.get("touches", 0) <= 3 and z.get("vol", 0) < 1.5
+    zweak = z.get("touches", 0) <= 3 and z.get("vol", 0) < 1
     if state in ("approach_to_R", "approach_to_S", "inside_zone"):
-        # default neutral probabilities
         bounce_prob = 50
-        if z["type"] == "S":
-            if zone_important and vol_dir == "down":
-                bounce_prob = 75
-            elif zone_important and vol_dir == "up":
-                bounce_prob = 30
-            elif zweak and vol_dir == "up":
-                bounce_prob = 30
-            elif zweak and vol_dir == "down":
-                bounce_prob = 60
-        else:  # resistance
-            if zone_important and vol_dir == "down":
-                bounce_prob = 70
-            elif zone_important and vol_dir == "up":
-                bounce_prob = 30
-            elif zweak and vol_dir == "up":
-                bounce_prob = 30
-            elif zweak and vol_dir == "down":
-                bounce_prob = 60
+        if state != "inside_zone":
+            if z["type"] == "S":
+                if vol_dir == "down":
+                    bounce_prob += 15
+                elif vol_dir == "up":
+                    bounce_prob -= 15
+            else:  # resistance
+                if vol_dir == "down":
+                    bounce_prob += 15
+                elif vol_dir == "up":
+                    bounce_prob -= 15
+            move_dir = "down" if state == "approach_to_S" else "up"
+            if bias:
+                if (move_dir == "down" and bias == "up") or (move_dir == "up" and bias == "down"):
+                    bounce_prob += 10
+                elif (move_dir == "down" and bias == "down") or (move_dir == "up" and bias == "up"):
+                    bounce_prob -= 10
+            if zone_important:
+                bounce_prob += 10
+            elif zweak:
+                bounce_prob -= 10
+            last_range = highs[-1] - lows[-1]
+            if atr:
+                if last_range > atr * 1.5:
+                    bounce_prob -= 10
+                elif last_range < atr * 0.5:
+                    bounce_prob += 10
         bounce_prob = max(0, min(100, bounce_prob))
         break_prob = 100 - bounce_prob
 
@@ -4635,13 +4644,14 @@ async def _sr_trade_reco(
             msg += f" RR ≈ {rr:.2f} — сделка невыгодна, пропуск."
     prob_txt = ""
     if bounce_prob is not None:
-        def _prob_mark(p: float) -> str:
-            return "🟢" if p > 60 else ("🟡" if p >= 40 else "🔴")
-
+        zone_noun = "поддержки" if z["type"] == "S" else "сопротивления"
         prob_txt = (
-            f"\n{_prob_mark(bounce_prob)} Вероятность отскока: {int(bounce_prob)}%\n"
-            f"{_prob_mark(break_prob)} Вероятность пробоя: {int(break_prob)}%"
+            "\n📊 Вероятность сценариев:\n"
+            f"– Отскок от {zone_noun} {zone_txt}: {int(bounce_prob)}%\n"
+            f"– Пробой этой зоны: {int(break_prob)}%"
         )
+    else:
+        prob_txt = "\nНедостаточно данных для точной оценки вероятности"
 
     zone_label = "поддержки" if z["type"] == "S" else "сопротивления"
     vol_phrase = "объёмы выше нормы" if cur_vol >= vol_thresh else "объёмы падают"
