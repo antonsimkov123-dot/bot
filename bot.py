@@ -4492,52 +4492,12 @@ async def _sr_trade_reco(
 
     mark_line = _zone_mark(z)
 
-    bias_note = ""
-    note_has_zone = False
-    force_wait = False
-    if z["type"] == "R" and near and z["strength"] >= 2:
-        details = []
-        if z.get("touches"):
-            details.append(f"{z['touches']} касаний")
-        if z.get("vol"):
-            details.append(f"объём {z['vol']:.1f}x")
-        extra = f" ({', '.join(details)})" if details else ""
-        if critical:
-            bias_note = f"Цена вплотную к зоне сопротивления {zone_txt}{extra}. Возможен откат — жди подтверждения."
-            force_wait = True
-        else:
-            bias_note = f"Цена у зоны сопротивления {zone_txt}{extra}. "
-            if cur_vol < vol_thresh:
-                bias_note += "Не входи в Long без сигнала. Цена упёрлась в зону, а объёмы падают. "
-            elif bias == "up" and cur_vol >= vol_thresh:
-                bias_note += (
-                    "Рост ослабевает у зоны сопротивления. Возможен откат вниз. "
-                    "Не спеши с Long, жди разворотного паттерна. "
-                )
-        if z.get("vol", 0) >= 2:
-            bias_note += " Уровень подтверждён объёмом — сильная зона."
-        note_has_zone = True
-    elif z["type"] == "S" and near and z["strength"] >= 2:
-        details = []
-        if z.get("touches"):
-            details.append(f"{z['touches']} касаний")
-        if z.get("vol"):
-            details.append(f"объём {z['vol']:.1f}x")
-        extra = f" ({', '.join(details)})" if details else ""
-        if critical:
-            bias_note = f"Поддержка {zone_txt}{extra} тестировалась много раз — возможен отскок. Жди подтверждения."
-            force_wait = True
-        else:
-            bias_note = f"Цена у сильной поддержки {zone_txt}{extra}. "
-            if cur_vol < vol_thresh:
-                bias_note += "Жди подтверждения отскока — возможен ложный пробой. "
-            elif bias == "down" and cur_vol >= vol_thresh:
-                bias_note += (
-                    "Падение ослабевает у зоны. Не спеши с Short, жди разворотного паттерна. "
-                )
-        if z.get("vol", 0) >= 2:
-            bias_note += " Уровень подтверждён объёмом — сильная зона."
-        note_has_zone = True
+    recent = volumes[-5:]
+    prev = volumes[-10:-5] if len(volumes) >= 10 else volumes[:-5]
+    avg_recent = sum(recent) / len(recent) if recent else 0
+    avg_prev = sum(prev) / len(prev) if prev else avg_recent
+    vol_dir = "up" if avg_recent > avg_prev * 1.1 else "down"
+    zone_important = z.get("touches", 0) >= 7 and z.get("vol", 0) >= 2
 
     state = ""
     if z["low"] <= cur_price <= z["high"]:
@@ -4546,12 +4506,65 @@ async def _sr_trade_reco(
         if cur_price > z["high"] and cur_price - z["high"] > MIN_CLOSE_OUTSIDE_ATR * atr and cur_vol >= vol_thresh:
             state = "breakout_up"
         else:
-            state = "approach_to_R" if cur_price < z["high"] else "approach_to_R"
-    else:  # support
+            state = "approach_to_R"
+    else:
         if cur_price < z["low"] and z["low"] - cur_price > MIN_CLOSE_OUTSIDE_ATR * atr and cur_vol >= vol_thresh:
             state = "breakout_down"
         else:
-            state = "approach_to_S" if cur_price > z["low"] else "approach_to_S"
+            state = "approach_to_S"
+
+    def _vol_comment(z_type: str, important: bool, trend: str) -> str:
+        if z_type == "S":
+            if important:
+                if trend == "down":
+                    return (
+                        f"🟢 Цена приближается к важной зоне поддержки {zone_txt} на падающих объёмах — возможен отскок. "
+                        "Жди подтверждения (паттерн, close выше середины зоны, объём)."
+                    )
+                else:
+                    return (
+                        f"🔴 Снижение к сильной поддержке {zone_txt} сопровождается ростом объёмов — возможен пробой вниз. "
+                        "Подтверждение желательно."
+                    )
+            else:
+                if trend == "up":
+                    return (
+                        f"🔴 Падение сопровождается ростом объёмов у слабой поддержки {zone_txt} — возможен пробой."
+                    )
+                else:
+                    return (
+                        f"🟢 Цена у неважной поддержки {zone_txt}, объёмы снижаются — возможен краткосрочный отскок, но зона слабая. "
+                        "Подтверждение обязательно."
+                    )
+        else:  # resistance
+            if important:
+                if trend == "up":
+                    return (
+                        f"🔴 Цена растёт к сильному сопротивлению {zone_txt} на повышенных объёмах — возможен пробой. "
+                        "Следи за закрепом выше уровня."
+                    )
+                else:
+                    return (
+                        f"🟢 Рост на падающих объёмах у важного сопротивления {zone_txt} — возможен откат. "
+                        "Жди подтверждения разворота (паттерн, объём)."
+                    )
+            else:
+                if trend == "up":
+                    return (
+                        f"🔴 Рост на повышенных объёмах у слабого сопротивления {zone_txt} — возможно пробитие зоны."
+                    )
+                else:
+                    return (
+                        f"🟢 Цена у неважного сопротивления {zone_txt}, объёмы падают — возможен откат, но зона слабая. "
+                        "Жди подтверждений."
+                    )
+
+    bias_note = ""
+    note_has_zone = False
+    force_wait = False
+    if state in ("approach_to_R", "approach_to_S", "inside_zone"):
+        bias_note = _vol_comment(z["type"], zone_important, vol_dir)
+        note_has_zone = True
 
     stop = None
     target = None
