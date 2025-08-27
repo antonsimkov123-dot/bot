@@ -2281,10 +2281,6 @@ def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="📈 Профиль", callback_data="profile")],
         [InlineKeyboardButton(text="🏆 Рейтинг трейдеров", callback_data="rating")],
         [
-            InlineKeyboardButton(text="📚 Codex", callback_data="codex"),
-            InlineKeyboardButton(text="❓ Помощь", callback_data="help"),
-        ],
-        [
             InlineKeyboardButton(text="📦 Сделки", callback_data="trades_menu"),
             InlineKeyboardButton(text="📊 Отчёты", callback_data="reports"),
         ],
@@ -2726,34 +2722,6 @@ async def rating_detail(cb: types.CallbackQuery):
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="rating")]]
     )
     await cb.message.answer(text, reply_markup=with_back(kb))
-
-
-def dev_placeholder_kb(back_cb: str) -> InlineKeyboardMarkup:
-    return with_back(
-        InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data=back_cb)]]
-        )
-    )
-
-
-async def send_dev_placeholder(message: types.Message, back_cb: str) -> None:
-    await message.answer(
-        "🚧 Функция в разработке.", reply_markup=dev_placeholder_kb(back_cb)
-    )
-
-
-@dp.callback_query(F.data == "codex")
-async def show_codex(cb: types.CallbackQuery):
-    await cb.answer()
-    await send_dev_placeholder(cb.message, "main_menu")
-
-
-@dp.callback_query(F.data == "help")
-async def show_help(cb: types.CallbackQuery):
-    await cb.answer()
-    await send_dev_placeholder(cb.message, "main_menu")
-
-
 @dp.callback_query(F.data == "trades_menu")
 async def trades_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
