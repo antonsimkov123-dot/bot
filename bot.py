@@ -4649,10 +4649,12 @@ async def _sr_trade_reco(
     prob_txt = ""
     if bounce_prob is not None:
         zone_noun = "поддержки" if z["type"] == "S" else "сопротивления"
+        bounce_emoji = "🟢" if z["type"] == "S" else "🔴"
+        break_emoji = "🔴" if z["type"] == "S" else "🟢"
         prob_txt = (
             "\n📊 Вероятность сценариев:\n"
-            f"– Отскок от {zone_noun} {zone_txt}: {int(bounce_prob)}%\n"
-            f"– Пробой этой зоны: {int(break_prob)}%\n"
+            f"{bounce_emoji} Отскок от {zone_noun} {zone_txt}: {int(bounce_prob)}%\n"
+            f"{break_emoji} Пробой этой зоны: {int(break_prob)}%\n"
             "Оценка основана на текущих сигналах и объёмах."
         )
     else:
@@ -4681,15 +4683,15 @@ async def _sr_trade_reco(
             if move_dir == "up":
                 prob_txt = (
                     "\n📊 Вероятность сценариев:\n"
-                    f"– Продолжение роста: {int(cont_prob)}%\n"
-                    f"– Разворот вниз: {int(rev_prob)}%\n"
+                    f"🟢 Продолжение роста: {int(cont_prob)}%\n"
+                    f"🔴 Разворот вниз: {int(rev_prob)}%\n"
                     "Оценка основана на текущих сигналах и объёмах."
                 )
             else:
                 prob_txt = (
                     "\n📊 Вероятность сценариев:\n"
-                    f"– Продолжение падения: {int(cont_prob)}%\n"
-                    f"– Отскок вверх: {int(rev_prob)}%\n"
+                    f"🔴 Продолжение падения: {int(cont_prob)}%\n"
+                    f"🟢 Отскок вверх: {int(rev_prob)}%\n"
                     "Оценка основана на текущих сигналах и объёмах."
                 )
         else:
