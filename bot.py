@@ -10,20 +10,25 @@ import aiohttp
 from datetime import datetime, timedelta
 import calendar
 from dotenv import load_dotenv
-from collections import defaultdict
+from collections import defaultdict, Counter
 from itertools import combinations
 load_dotenv()
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
-from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile, BufferedInputFile
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
+from aiogram.utils.chat_action import ChatActionSender
+from io import BytesIO
 
 import pandas as pd
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
+import numpy as np
+from matplotlib.patches import Rectangle
+import matplotlib.patheffects as pe
 
 plt.rcParams.update({
     "font.family": "sans-serif",
@@ -60,6 +65,8 @@ def add_labels(ax: plt.Axes, fmt: str = "{:.1f}") -> None:
 # ---------- CONFIG ----------
 BOT_TOKEN = "8205192350:AAHUEmqDQK37-5D7dpcTUeMdpA6WpDACMkc"  # поменяй после теста!
 DB_PATH = "trades.db"
+MULTI_SR_MODE = True  # переключатель множественных уровней поддержки/сопротивления
+SR_MAX_ZONES = 7  # максимум зон поддержки/сопротивления на график для каждой стороны
 
 MONTHS_RU = [
     "",
@@ -92,6 +99,21 @@ MONTHS_RU_GEN = [
     "ноября",
     "декабря",
 ]
+
+TREND_WINDOWS = {
+    "D": {"global": 50, "local": 20, "scalp": 10},
+    "240": {"global": 50, "local": 20, "scalp": 10},
+}
+
+TREND_LEVELS = {"global": "Глобальный", "local": "Локальный", "scalp": "Скальп"}
+
+BAND_PCT = {"60": 0.004, "240": 0.006, "D": 0.015}
+
+# -- Recommendation thresholds
+MIN_CLOSE_OUTSIDE_ATR = 0.25  # пробой, если закрытие за зоной на долю ATR
+RETEST_WINDOW_BARS = 5        # количество свечей для поиска ретеста
+VOL_CONFIRM_PERCENTILE = 60   # перцентиль объёма для подтверждения
+MIN_RR = 1.5                  # минимально допустимое соотношение риск/профит
 
 # ---------- DATABASE ----------
 def init_db() -> None:
@@ -192,7 +214,10 @@ def init_db() -> None:
             subscription TEXT DEFAULT 'none',
             notify_stagnation INTEGER DEFAULT 1,
             notify_targets INTEGER DEFAULT 1,
-            notify_risk INTEGER DEFAULT 1
+            notify_risk INTEGER DEFAULT 1,
+            habit_report_enabled INTEGER DEFAULT 0,
+            habit_report_time TEXT DEFAULT '21:00',
+            habit_comment_enabled INTEGER DEFAULT 0
         )
         """
     )
@@ -289,6 +314,15 @@ def add_missing_columns() -> None:
             conn.commit()
         if "notify_risk" not in us_cols:
             cur.execute("ALTER TABLE user_settings ADD COLUMN notify_risk INTEGER DEFAULT 1")
+            conn.commit()
+        if "habit_report_enabled" not in us_cols:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN habit_report_enabled INTEGER DEFAULT 0")
+            conn.commit()
+        if "habit_report_time" not in us_cols:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN habit_report_time TEXT DEFAULT '21:00'")
+            conn.commit()
+        if "habit_comment_enabled" not in us_cols:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN habit_comment_enabled INTEGER DEFAULT 0")
             conn.commit()
 
         cur.execute("PRAGMA table_info(price_alerts)")
@@ -550,6 +584,14 @@ class NotifyState(StatesGroup):
     confirm = State()
 
 
+class HabitNotifyState(StatesGroup):
+    time = State()
+
+
+class AICoinState(StatesGroup):
+    enter_symbol = State()
+
+
 class PriceAlertState(StatesGroup):
     enter_symbol = State()
     waiting_price = State()
@@ -584,7 +626,13 @@ def calc_risk(entry: float, stop: float, pct: float, t_type: str, leverage: floa
 
 
 def fmt_price(val: float) -> str:
-    return f"{val:.2f}".rstrip("0").rstrip(".")
+    if val < 1:
+        fmt = f"{val:.4f}"
+    elif val < 10:
+        fmt = f"{val:.3f}"
+    else:
+        fmt = f"{val:.2f}"
+    return fmt.rstrip("0").rstrip(".")
 
 
 def fmt_targets(val: str | None) -> str:
@@ -983,8 +1031,7 @@ async def get_usd_rub_rate() -> float:
 def save_imported_trade(uid: int, pos: dict) -> int:
     t_type = "Long" if pos.get("side") in {"Buy", "Long"} else "Short"
     sym = pos.get("symbol", "")
-    if sym.endswith("USDT"):
-        sym = sym[:-4]
+    sym = _base_from_symbol(sym)
     entry = float(pos.get("entryPrice") or pos.get("avgPrice") or 0)
     size = float(pos.get("size") or 0)
     lev = float(pos.get("leverage") or 0)
@@ -1039,11 +1086,8 @@ def process_spot_history(uid: int, orders: list[dict]) -> None:
     orders = sorted(orders, key=lambda o: int(o.get("execTime", 0)))
     for o in orders:
         sym = o.get("symbol", "")
-        if sym.endswith("USDT"):
-            base = sym[:-4]
-        elif sym.endswith("USDC"):
-            base = sym[:-4]
-        else:
+        base = _base_from_symbol(sym)
+        if not (sym.endswith("USDT") or sym.endswith("USDC")):
             continue
         if base in stable:
             continue
@@ -1164,9 +1208,15 @@ def process_spot_history(uid: int, orders: list[dict]) -> None:
 
 async def get_spot_entry_price(api_key: str, api_secret: str, coin: str) -> float | None:
     """Calculate average entry price for a spot coin based on trade history."""
+    resolved = await _resolve_symbol(coin, prefer="spot")
+    if not resolved:
+        return None
+    symbol, category = resolved
+    if category != "spot":
+        return None
     ts = str(int(time.time() * 1000))
     recv = "5000"
-    params = {"category": "spot", "symbol": f"{coin}USDT", "limit": "50"}
+    params = {"category": "spot", "symbol": symbol, "limit": "50"}
     query = urlencode(params)
     sign_payload = ts + api_key + recv + query
     sign = hmac.new(api_secret.encode(), sign_payload.encode(), hashlib.sha256).hexdigest()
@@ -1366,9 +1416,7 @@ async def sync_futures_positions(uid: int, positions: list[dict]) -> list[dict]:
     seen: set[tuple[str, str]] = set()
     new_positions: list[dict] = []
     for pos in positions:
-        sym = pos.get("symbol", "")
-        if sym.endswith("USDT"):
-            sym = sym[:-4]
+        sym = _base_from_symbol(pos.get("symbol", ""))
         side = "Long" if pos.get("side") in {"Buy", "Long"} else "Short"
         size = float(pos.get("size") or 0)
         entry = float(pos.get("entryPrice") or pos.get("avgPrice") or 0)
@@ -1490,22 +1538,61 @@ async def sync_futures_positions(uid: int, positions: list[dict]) -> list[dict]:
     return new_positions
 
 
-async def fetch_price(symbol: str) -> float | None:
-    url = "https://api.bybit.com/v5/market/tickers"
-    for category in ("linear", "spot"):
-        params = {"category": category, "symbol": f"{symbol}USDT"}
+_symbol_cache: dict[str, tuple[str, str]] = {}
+
+
+def _base_from_symbol(sym: str) -> str:
+    if sym.endswith("USDT") or sym.endswith("USDC"):
+        sym = sym[:-4]
+    return sym.lstrip("0123456789")
+
+
+async def _resolve_symbol(base: str, prefer: str | None = None) -> tuple[str, str] | None:
+    base = base.upper()
+    if base in _symbol_cache:
+        return _symbol_cache[base]
+    categories = ["linear", "spot"]
+    if prefer and prefer in categories:
+        categories.remove(prefer)
+        categories.insert(0, prefer)
+    url = "https://api.bybit.com/v5/market/instruments-info"
+    for category in categories:
+        params = {"category": category, "baseCoin": base}
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.get(url, params=params) as resp:
                     data = await resp.json()
         except Exception:
-            return None
-        try:
-            price = float(data.get("result", {}).get("list", [{}])[0].get("lastPrice"))
-            if price:
-                return price
-        except Exception:
             continue
+        items = data.get("result", {}).get("list") or []
+        for item in items:
+            if item.get("quoteCoin") == "USDT":
+                symbol = item.get("symbol")
+                if symbol:
+                    _symbol_cache[base] = (symbol, category)
+                    return symbol, category
+    return None
+
+
+async def fetch_price(symbol: str) -> float | None:
+    resolved = await _resolve_symbol(symbol)
+    if not resolved:
+        return None
+    real, category = resolved
+    url = "https://api.bybit.com/v5/market/tickers"
+    params = {"category": category, "symbol": real}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as resp:
+                data = await resp.json()
+    except Exception:
+        return None
+    try:
+        price = float(data.get("result", {}).get("list", [{}])[0].get("lastPrice"))
+        if price:
+            return price
+    except Exception:
+        return None
     return None
 
 
@@ -1529,47 +1616,88 @@ def describe_reminder(t: str, period: int, next_run: str) -> str:
 
 # ---------- SIGNALS ----------
 SIGNAL_OPTIONS = [
-    ("Закреп 2–3 свечей", 6),
-    ("Дивергенция RSI или MACD на дневке", 6),
-    ("Поглощение на дневке", 5),
-    ("0.618 FIBO (пробой/отработка)", 5),
-    ("Пробой канала или трендовой", 5),
-    ("Ретест пробитого уровня на объёмах", 5),
-    ("MACD пересекает сигнальную / 0", 3),
-    ("Рост объёмов", 3),
-    ("Поддержка от мувингов (50/200)", 2),
-    ("Боллинджер: выход за границу", 2),
-    ("Формация ГиП / инверсная", 2),
+    ("Дивергенция RSI на дневке", 6),
+    ("Дивергенция MACD на дневке", 5),
+    ("Дивергенция на объёмах (дневка)", 5),
+    ("0.618 уровень FIBO (пробой / отработка)", 4),
+    ("Ретест пробитого уровня на объёмах", 4),
+    ("Закреп 2–3 свечей на дневке", 4),
+    ("Двойное дно / вершина у зоны", 4),
+    ("Пробитие треугольника (4H/D)", 4),
+    ("Важная поддержка / сопротивление (D)", 4),
+    ("Объёмный кластер на уровне", 4),
+    ("Мелкая дивергенция RSI на 1H", 4),
+    ("Мелкая дивергенция MACD на 1H", 4),
+    ("Пробой уровня с увеличением объёма", 3),
+    ("Рост объёмов на пробое", 3),
+    ("Пробой канала или трендовой", 3),
+    ("ГИП / инверсия", 3),
+    ("Закрытие свечи за границей Боллинджера (4H/D)", 3),
+    ("RSI пересекает 30 или 70 (дневка)", 3),
+    ("Важная поддержка / сопротивление (1H/4H)", 3),
+    ("Треугольник (4H/D)", 3),
+    ("Клин / расходящийся треугольник", 3),
+    ("Дивергенция на объёмах (1H/4H)", 3),
+    ("Консолидация на уровне (3+ свечи)", 3),
+    ("Поддержка от мувингов (200 EMA/SMA)", 3),
+    ("MACD пересекает сигнальную / 0 (4H/D)", 2),
+    ("Поддержка от мувингов (50 / 100 EMA/SMA)", 2),
+    ("Додж-свеча", 2),
+    ("Стагнация объёмов", 2),
     ("Сигналы только на 1H", 1),
-    ("Мелкая дивергенция RSI на 1H", 1),
-    ("Стагнация объёмов", 1),
     ("Локальные уровни без объёма", 1),
+    ("Поглощение на дневке", 1),
 ]
 
 SIGNAL_STARS = {name: stars for name, stars in SIGNAL_OPTIONS}
 
 SIGNALS_TEXT = (
+    "⸻\n\n"
     "📍 Укажи сигналы, по которым ты входишь в сделку.\n"
     "🔻 Нажимай по одному, сколько нужно.\n\n"
-    "🔥 Очень важные (⭐️⭐️⭐️⭐️⭐️ и ⭐️⭐️⭐️⭐️):\n"
-    "• Закреп 2–3 свечей — ⭐️⭐️⭐️⭐️⭐️⭐️\n"
-    "• Дивергенция RSI или MACD на дневке — ⭐️⭐️⭐️⭐️⭐️⭐️\n"
-    "• Поглощение на дневке — ⭐️⭐️⭐️⭐️⭐️\n"
-    "• 0.618 FIBO (пробой/отработка) — ⭐️⭐️⭐️⭐️⭐️\n"
-    "• Пробой канала или трендовой — ⭐️⭐️⭐️⭐️⭐️\n"
-    "• Ретест пробитого уровня на объёмах — ⭐️⭐️⭐️⭐️⭐️\n\n"
-    "🟡 Средние (⭐️⭐️⭐️ и ⭐️⭐️):\n"
-    "• MACD пересекает сигнальную / 0 — ⭐️⭐️⭐️\n"
-    "• Рост объёмов — ⭐️⭐️⭐️\n"
-    "• Поддержка от мувингов (50/200) — ⭐️⭐️\n"
-    "• Боллинджер: выход за границу — ⭐️⭐️\n"
-    "• Формация ГиП / инверсная — ⭐️⭐️\n\n"
-    "⚪️ Слабые (⭐️):\n"
+    "⸻\n\n"
+    "🔥 Очень важные сигналы:\n"
+    "• Дивергенция RSI на дневке — ⭐️⭐️⭐️⭐️⭐️⭐️\n"
+    "• Дивергенция MACD на дневке — ⭐️⭐️⭐️⭐️⭐️\n"
+    "• Дивергенция на объёмах (дневка) — ⭐️⭐️⭐️⭐️⭐️\n"
+    "• 0.618 уровень FIBO (пробой / отработка) — ⭐️⭐️⭐️⭐️\n"
+    "• Ретест пробитого уровня на объёмах — ⭐️⭐️⭐️⭐️\n"
+    "• Закреп 2–3 свечей на дневке — ⭐️⭐️⭐️⭐️\n"
+    "• Двойное дно / вершина у зоны — ⭐️⭐️⭐️⭐️\n"
+    "• Пробитие треугольника (4H/D) — ⭐️⭐️⭐️⭐️\n"
+    "• Важная поддержка / сопротивление (D) — ⭐️⭐️⭐️⭐️\n"
+    "• Объёмный кластер на уровне — ⭐️⭐️⭐️⭐️\n"
+    "⸻\n\n"
+    "🟡 Средние сигналы:\n"
+    "• Мелкая дивергенция RSI на 1H — ⭐️⭐️⭐️⭐️\n"
+    "• Мелкая дивергенция MACD на 1H — ⭐️⭐️⭐️⭐️\n"
+    "• Пробой уровня с увеличением объёма — ⭐️⭐️⭐️\n"
+    "• Рост объёмов на пробое — ⭐️⭐️⭐️\n"
+    "• Пробой канала или трендовой — ⭐️⭐️⭐️\n"
+    "• ГИП / инверсия — ⭐️⭐️⭐️\n"
+    "• Закрытие свечи за границей Боллинджера (4H/D) — ⭐️⭐️⭐️\n"
+    "• RSI пересекает 30 или 70 (дневка) — ⭐️⭐️⭐️\n"
+    "• Важная поддержка / сопротивление (1H/4H) — ⭐️⭐️⭐️\n"
+    "• Треугольник (4H/D) — ⭐️⭐️⭐️\n"
+    "• Клин / расходящийся треугольник — ⭐️⭐️⭐️\n"
+    "• Дивергенция на объёмах (1H/4H) — ⭐️⭐️⭐️\n"
+    "• Консолидация на уровне (3+ свечи) — ⭐️⭐️⭐️\n"
+    "• Поддержка от мувингов (200 EMA/SMA) — ⭐️⭐️⭐️\n"
+    "⸻\n\n"
+    "⚪️ Слабые сигналы:\n"
+    "• MACD пересекает сигнальную / 0 (4H/D) — ⭐️⭐️\n"
+    "• Поддержка от мувингов (50 / 100 EMA/SMA) — ⭐️⭐️\n"
+    "• Додж-свеча — ⭐️⭐️\n"
+    "• Стагнация объёмов — ⭐️⭐️\n"
     "• Сигналы только на 1H — ⭐️\n"
-    "• Мелкая дивергенция RSI на 1H — ⭐️\n"
-    "• Стагнация объёмов — ⭐️\n"
-    "• Локальные уровни без объёма — ⭐️"
-    "\nШкала силы: ≤4 слабая • 5–7 умеренная • 8–11 сильная • 12+ очень сильная"
+    "• Локальные уровни без объёма — ⭐️\n"
+    "• Поглощение на дневке — ⭐️\n"
+    "⸻\n\n"
+    "📏 Шкала силы сигналов:\n"
+    "1–2 ⭐ — слабый\n"
+    "3–4 ⭐ — средний\n"
+    "5–6 ⭐ — сильный\n"
+    "⸻"
 )
 
 # ---------- MISTAKE REASONS ----------
@@ -1579,6 +1707,8 @@ MISTAKE_OPTIONS = [
     ("🤯 Эмоциональный вход", "Эмоциональный вход"),
     ("🔁 Перезаход", "Перезаход"),
     ("📉 Против тренда", "Против тренда"),
+    ("📊 Игнор объёма", "Игнор объёма"),
+    ("📈 Вход на хаях", "Вход на хаях"),
     ("🧠 Не по системе", "Не по системе"),
     ("🕒 Передержал", "Передержал"),
 ]
@@ -2161,6 +2291,29 @@ async def notification_scheduler():
             await process_notifications(uid)
         await asyncio.sleep(60)
 
+
+async def habit_scheduler():
+    while True:
+        now = datetime.now()
+        with sqlite3.connect(DB_PATH) as conn:
+            rows = conn.execute(
+                "SELECT user_id, habit_report_time FROM user_settings WHERE habit_report_enabled=1",
+            ).fetchall()
+        for uid, t in rows:
+            try:
+                h, m = map(int, (t or "21:00").split(":"))
+            except Exception:
+                h, m = 21, 0
+            if now.hour == h and now.minute == m:
+                if get_subscription(uid) not in {"basic", "pro"}:
+                    continue
+                text = build_habits_report(uid)
+                try:
+                    await bot.send_message(uid, text)
+                except Exception:
+                    pass
+        await asyncio.sleep(60)
+
 def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
     opt_text = (
         "🔧 Оптимизация 🟢" if is_automation_enabled(uid) else "🔧 Оптимизация 🔴"
@@ -2610,8 +2763,6 @@ async def rating_detail(cb: types.CallbackQuery):
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="rating")]]
     )
     await cb.message.answer(text, reply_markup=with_back(kb))
-
-
 @dp.callback_query(F.data == "trades_menu")
 async def trades_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -3408,8 +3559,7 @@ async def show_trade_summary(uid: int, state: FSMContext):
 @dp.callback_query(TradeState.confirming, F.data == "signals_eval")
 async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_subscription(cb.message, cb.from_user.id):
-        return
+    uid = cb.from_user.id
     data = await state.get_data()
     signals = data.get("signals", [])
     total, strong, medium, weak = signal_stats(signals)
@@ -3422,18 +3572,45 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
     ]
     if risk is not None:
         parts.append(f"🛑 Риск по стопу: {risk:.1f}%")
-    text = "\n".join(parts) + "\n\n"
-    if strong < 2 or total < 6:
-        text += (
-            f"⚠️ Внимание: Мало сильных сигналов ({strong} из 3).\n"
-            f"Всего {total} звёзд — сделка выглядит слабой.\n"
-            "Уверен, что хочешь продолжать?"
-        )
+    text = "\n".join(parts)
+    sub = get_subscription(uid)
+    if sub in {"basic", "pro"}:
+        symbol = data.get("symbol")
+        ttype = data.get("trade_type")
+        trend_text = ""
+        reco_block = ""
+        levels_block = ""
+        if symbol and ttype:
+            vol_line, vol_note, vol_short = await _volume_24h(symbol)
+            trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype, vol_short)
+            rec_block, verdict_line, trend_bias = format_trend_recommendations(d_res, h_res)
+            levels_block, supports, resistances = await _entry_exit_levels(symbol)
+            zone_reco, zone_dir = await _sr_trade_reco(symbol, supports, resistances, bias=trend_bias)
+            if zone_dir and trend_bias and (
+                (zone_dir == "Short" and trend_bias == "up")
+                or (zone_dir == "Long" and trend_bias == "down")
+            ):
+                zone_word = "сопротивления" if zone_dir == "Short" else "поддержки"
+                trend_word = "восходящие" if trend_bias == "up" else "нисходящие"
+                verdict_line = (
+                    f"⚠️ Вердикт: Цена у {zone_word}. Несмотря на {trend_word} тренды, "
+                    "текущая зона может стать как точкой разворота, так и пробоя. "
+                    "Работай только по подтверждённому сигналу."
+                )
+            vol_block = "\n".join(filter(None, [vol_line, vol_note]))
+            reco_block = ""
+            if vol_block:
+                reco_block += f"\n\n{vol_block}"
+            reco_block += f"\n\n{rec_block}\n{verdict_line}"
+            if levels_block:
+                reco_block += f"\n\n{levels_block}"
+            if zone_reco:
+                reco_block += f"\n\n{zone_reco}"
+        if trend_text:
+            text += "\n\n" + trend_text + reco_block
+        text += "\n\n" + await _build_ai_advice(uid, signals, strong, total, float(risk or 0), symbol)
     else:
-        text += (
-            "💡 Отличная сделка: сильные сигналы + адекватный риск.\n"
-            "Совет: убедись, что нет сопротивления выше цели."
-        )
+        text += "\n\n🔐 Расширенный анализ доступен только с подпиской Basic. Сейчас отображён упрощённый анализ."
     await cb.message.answer(text)
 
 
@@ -3489,42 +3666,1564 @@ async def ask_notifications(uid: int, trade_id: int, state: FSMContext) -> None:
     await state.set_state(NotifyState.ask)
 
 
+def _analyze_trader_style(uid: int, risk: float, strong: int) -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT risk_percent, signal_stars FROM trades WHERE user_id=? AND COALESCE(is_deleted,0)=0",
+            (uid,),
+        ).fetchall()
+    if not rows:
+        return ""
+    total = len(rows)
+    high_risk = sum(1 for r, _ in rows if (r or 0) > 60)
+    weak_conf = sum(1 for r, s in rows if (s or 0) < 6)
+    parts = []
+    if total and high_risk / total > 0.4:
+        parts.append("высоким риском")
+    if total and weak_conf / total > 0.4:
+        parts.append("без подтверждений")
+    if parts and (risk > 60 or strong < 2):
+        joined = " и ".join(parts)
+        return (
+            "⚠️ Ты часто входишь с "
+            f"{joined}. Текущий сетап тоже рискованный — подумай, не повторяешь ли ты ту же ошибку?"
+        )
+    return ""
+
+
+def _analyze_signal_combos(uid: int, signals: list[str]) -> str:
+    if len(signals) < 2:
+        return ""
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT signals, profit_percent FROM trades "
+            "WHERE user_id=? AND signals!='' AND profit_percent IS NOT NULL",
+            (uid,),
+        ).fetchall()
+    stats: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
+    for sigs, prof in rows:
+        sig_list = [s for s in sigs.split(";") if s]
+        for combo in combinations(sorted(sig_list), 2):
+            if prof and prof > 0:
+                stats[combo][0] += 1
+            else:
+                stats[combo][1] += 1
+    messages = []
+    for combo in combinations(sorted(signals), 2):
+        wins, loses = stats.get(combo, (0, 0))
+        if wins >= 3 and wins > loses:
+            messages.append(
+                f"✅ Связка '{combo[0]} + {combo[1]}' у тебя {wins} раз отрабатывала на профит — это хороший знак."
+            )
+        elif loses >= 3 and loses >= wins:
+            messages.append(
+                f"❌ А вот '{combo[0]} + {combo[1]}' в {loses} сделках подряд дала минус. Будь осторожен."
+            )
+    return "\n".join(messages)
+
+
+def _recommend_setup(strong: int, risk: float) -> str:
+    if strong >= 3 and risk < 30:
+        return (
+            "📊 Сетап близок к сильному. Следи за объёмами, "
+            "стоп под локальным минимумом, тейк на 2 уровня выше."
+        )
+    if risk > 60 or strong < 2:
+        return (
+            "📊 Сетап пока сырой. Я бы дождался объёма или повторного теста. "
+            "Стоп держи коротким."
+        )
+    return (
+        "📊 Можно рассмотреть вход, но усили его объёмом или ретестом. "
+        "Стоп под локальным минимумом, тейк на 2 уровня выше."
+    )
+
+
+async def _fetch_kline(symbol: str, interval: str, limit: int = 7) -> list:
+    resolved = await _resolve_symbol(symbol)
+    if not resolved:
+        return []
+    real, category = resolved
+    url = "https://api.bybit.com/v5/market/kline"
+    params = {
+        "category": category,
+        "symbol": real,
+        "interval": interval,
+        "limit": limit,
+    }
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as resp:
+                data = await resp.json()
+    except Exception:
+        return []
+    res = data.get("result", {}).get("list")
+    return res or []
+
+
+async def _volume_24h(symbol: str) -> tuple[str, str, str]:
+    candles = await _fetch_kline(symbol, "D", 6)
+    if not candles:
+        return "", "", ""
+    candles = sorted(candles, key=lambda c: int(c[0]))[-6:]
+    vols = [float(c[5]) for c in candles]
+    cur = vols[-1]
+    prev = vols[:-1]
+    avg = sum(prev) / len(prev) if prev else 0
+
+    def fmt_vol(v: float) -> str:
+        if v >= 1e9:
+            return f"${v/1e9:.2f} млрд"
+        if v >= 1e6:
+            return f"${v/1e6:.2f} млн"
+        return f"${v:.0f}"
+
+    base = f"📊 Объём за 24ч: {fmt_vol(cur)}"
+    if avg:
+        diff = (cur - avg) / avg * 100
+        if diff >= 15:
+            note = f"🟢 Выше среднего на {diff:.0f}% — сигнал усиливается"
+            short = "объёмы выше среднего"
+        elif diff <= -15:
+            note = f"🔴 Ниже среднего на {abs(diff):.0f}% — возможная слабость сигнала"
+            short = "объёмы ниже среднего"
+        else:
+            note = "⚪ Объёмы на среднем уровне — нейтрально"
+            short = "объёмы на среднем уровне"
+    else:
+        note = "⚪ Объём на текущем уровне — нейтрально"
+        short = "объёмы на текущем уровне"
+    return base, note, short
+
+
+async def _micro_trend_tf(symbol: str, interval: str, limit: int = 50) -> dict:
+    candles = await _fetch_kline(symbol, interval, limit + 10)
+    if not candles:
+        return {"trend": "nodata", "used": 0}
+    # ensure chronological order and keep latest `limit` candles
+    candles = sorted(candles, key=lambda c: int(c[0]))[-limit:]
+    used = len(candles)
+    if used < limit:
+        return {"trend": "nodata", "used": used}
+
+    closes = [float(c[4]) for c in candles]
+    highs = [float(c[2]) for c in candles]
+    lows = [float(c[3]) for c in candles]
+    vols = [float(c[5]) for c in candles]
+    price = closes[-1]
+
+    # EMA-based slope to smooth noise
+    k = 2 / (limit + 1)
+    ema_vals: list[float] = []
+    ema = closes[0]
+    ema_vals.append(ema)
+    for c in closes[1:]:
+        ema = c * k + ema * (1 - k)
+        ema_vals.append(ema)
+    slope_pct = (ema_vals[-1] - ema_vals[0]) / ema_vals[0] * 100 if ema_vals[0] else 0
+
+    struct_thr = 0.003  # 0.3% difference threshold to filter noise
+    up_pairs = down_pairs = 0
+    for h1, h2, l1, l2 in zip(highs, highs[1:], lows, lows[1:]):
+        diff = max(
+            abs(h2 - h1) / h1 if h1 else 0,
+            abs(l2 - l1) / l1 if l1 else 0,
+        )
+        if diff < struct_thr:
+            continue
+        if h2 > h1 and l2 > l1:
+            up_pairs += 1
+        elif h2 < h1 and l2 < l1:
+            down_pairs += 1
+    total_pairs = up_pairs + down_pairs
+    if total_pairs == 0:
+        total_pairs = 1
+    range_ratio = (max(highs) - min(lows)) / price if price else 0
+
+    half = used // 2 or 1
+    recent = sum(vols[-half:]) / half
+    prev = sum(vols[:half]) / half
+    if recent > prev * 1.1:
+        vol_dir = "up"
+    elif recent < prev * 0.9:
+        vol_dir = "down"
+    else:
+        vol_dir = "flat"
+
+    slope_dir = "up" if slope_pct > 1 else "down" if slope_pct < -1 else "flat"
+    struct_raw = (
+        "up" if up_pairs > down_pairs else "down" if down_pairs > up_pairs else "mixed"
+    )
+    up_ratio = up_pairs / total_pairs
+    down_ratio = down_pairs / total_pairs
+    struct_major = "up" if up_ratio >= 0.6 else "down" if down_ratio >= 0.6 else "mixed"
+    # if structure and volume agree but slope contradicts slightly, align with trend
+    if struct_major in {"up", "down"} and vol_dir == struct_major:
+        if struct_major == "up" and slope_pct < 0:
+            slope_pct = abs(slope_pct)
+            slope_dir = "up" if slope_pct > 1 else "flat"
+        elif struct_major == "down" and slope_pct > 0:
+            slope_pct = -abs(slope_pct)
+            slope_dir = "down" if slope_pct < -1 else "flat"
+
+    if struct_major in {"up", "down"}:
+        trend = struct_major
+    else:
+        votes_up = (slope_dir == "up") + (struct_raw == "up") + (vol_dir == "up")
+        votes_down = (slope_dir == "down") + (struct_raw == "down") + (vol_dir == "down")
+        if votes_up >= 2 and votes_up > votes_down:
+            trend = "up"
+        elif votes_down >= 2 and votes_down > votes_up:
+            trend = "down"
+        elif abs(slope_pct) < 1 and range_ratio < 0.03:
+            trend = "flat"
+        else:
+            trend = "uncertain"
+
+    return {
+        "trend": trend,
+        "used": used,
+        "price": price,
+        "slope": slope_pct,
+        "up": up_pairs,
+        "down": down_pairs,
+        "pairs": total_pairs,
+        "vol": vol_dir,
+        "struct": struct_raw,
+        "struct_major": struct_major,
+        "slope_dir": slope_dir,
+    }
+
+
+def _trend_line(name: str, limit: int, data: dict, extra_vol: str = "") -> str:
+    trend = data.get("trend")
+    used = data.get("used", 0)
+    if trend == "nodata":
+        return f"🔵 {name} ({used}/{limit} свечей): ❓ Недостаточно данных"
+
+    price = data.get("price", 0)
+    slope = data.get("slope", 0)
+    up = data.get("up", 0)
+    down = data.get("down", 0)
+    vol_dir = data.get("vol", "flat")
+    struct = data.get("struct", "mixed")
+    total_pairs = data.get("pairs", max(used - 1, 1))
+
+    struct_phrase = (
+        f"структура: {up}/{total_pairs} HH/HL"
+        if struct == "up"
+        else f"структура: {down}/{total_pairs} LH/LL"
+        if struct == "down"
+        else f"структура: {up} HH/HL / {down} LH/LL"
+    )
+
+    vol_phrase = {
+        "up": "объёмы растут",
+        "down": "объёмы падают",
+        "flat": "объёмы стабильны",
+    }.get(vol_dir, "объёмы без изменений")
+    if extra_vol:
+        vol_phrase += f", {extra_vol}"
+
+    arrow = {
+        "up": "⬆️ Восходящий",
+        "down": "⬇️ Нисходящий",
+        "flat": "⏸️ Боковик",
+        "uncertain": "❓ Неопределённый",
+    }.get(trend, "❓ Неопределённый")
+
+    price_str = f"цена: {price:.4f}"
+    slope_str = f"наклон: {slope:+.1f}%"
+
+    return f"🔵 {name} ({limit} свечей): {arrow} ({price_str}, {slope_str}, {struct_phrase}, {vol_phrase})"
+
+
+async def _analyze_micro_trend(symbol: str, ttype: str, vol_short: str = "") -> tuple[str, dict, dict]:
+    d_res: dict[str, dict] = {}
+    for lvl, lim in TREND_WINDOWS["D"].items():
+        d_res[lvl] = await _micro_trend_tf(symbol, "D", lim)
+    h_res: dict[str, dict] = {}
+    for lvl, lim in TREND_WINDOWS["240"].items():
+        h_res[lvl] = await _micro_trend_tf(symbol, "240", lim)
+
+    d_lines = ["📈 Тренд по 1D:"]
+    for lvl, lim in TREND_WINDOWS["D"].items():
+        d_lines.append(_trend_line(TREND_LEVELS[lvl], lim, d_res[lvl], vol_short))
+
+    h_lines = ["📉 Тренд по 4H:"]
+    for lvl, lim in TREND_WINDOWS["240"].items():
+        h_lines.append(_trend_line(TREND_LEVELS[lvl], lim, h_res[lvl], vol_short))
+
+    if d_res["global"].get("trend") == "down" and h_res["global"].get("trend") == "up":
+        h_lines[1] = h_lines[1].replace("⬆️ Восходящий", "⬆️ Восходящий откат в нисходящем тренде")
+    elif d_res["global"].get("trend") == "up" and h_res["global"].get("trend") == "down":
+        h_lines[1] = h_lines[1].replace("⬇️ Нисходящий", "⬇️ Нисходящий откат в восходящем тренде")
+
+    text = "\n".join(d_lines) + "\n\n" + "\n".join(h_lines)
+    return text, d_res, h_res
+
+
+def format_trend_recommendations(d_res: dict, h_res: dict) -> tuple[str, str, str | None]:
+    LEVEL_EMOJI = {"global": "🔵", "local": "🟢", "scalp": "🟣"}
+    LEVEL_NAME = {
+        "global": "Глобальный тренд",
+        "local": "Локальный тренд",
+        "scalp": "Скальп",
+    }
+    DIR_TEXT = {
+        "up": "↗ Восходящий",
+        "down": "↘ Нисходящий",
+        "flat": "⏸ Боковик",
+        "uncertain": "🔄 Неопределённый",
+    }
+
+    def rec_line(tf: str, lvl: str, data: dict) -> str:
+        trend = data.get("trend", "uncertain")
+        vol = data.get("vol", "flat")
+        struct = data.get("struct_major", "mixed")
+        arrow = DIR_TEXT.get(trend, "🔄 Неопределённый")
+        if tf == "4H" and lvl == "global":
+            d_gl = d_res.get("global", {}).get("trend")
+            if trend in {"up", "down"} and d_gl in {"up", "down"} and trend != d_gl:
+                arrow = "↗ Откат" if trend == "up" else "↘ Откат"
+                action = "следи за разворотом вниз" if trend == "up" else "следи за разворотом вверх"
+                return f"{LEVEL_EMOJI[lvl]} {LEVEL_NAME[lvl]} ({tf}): {arrow} — {action}"
+        if trend not in {"up", "down"} or struct == "mixed":
+            action = "🟡 Тренд неопределён — наблюдай, жди подтверждений"
+        elif vol == trend:
+            if trend == "down":
+                action = "🟢 Ищи вход на Long — возможно дно, смотри уровни"
+            else:
+                action = "🔴 Ищи вход на Short — возможно вершина"
+        else:
+            if trend == "up" and vol == "down":
+                action = "Рост идёт на падающих объёмах — слабый импульс. Жди подтверждения для входа в Long"
+            elif trend == "down" and vol == "up":
+                action = "Падение усиливается на объёмах — возможен Short, подтверждение желательно"
+            elif trend == "up":
+                action = "Жди подтверждения для входа в Long (ищи разворот у поддержки)"
+            else:
+                action = "Жди подтверждения для входа в Short (ищи разворот у сопротивления)"
+        return f"{LEVEL_EMOJI[lvl]} {LEVEL_NAME[lvl]} ({tf}): {arrow} — {action}"
+
+    lines = ["📊 Рекомендации по трендам:"]
+    for tf, res in [("1D", d_res), ("4H", h_res)]:
+        for lvl in ("global", "local", "scalp"):
+            lines.append(rec_line(tf, lvl, res.get(lvl, {})))
+
+    dirs = []
+    for res in (d_res, h_res):
+        for lvl in ("global", "local", "scalp"):
+            tr = res.get(lvl, {}).get("trend")
+            if tr in {"up", "down"}:
+                dirs.append(tr)
+    up_count = dirs.count("up")
+    down_count = dirs.count("down")
+    if up_count and down_count:
+        if up_count > down_count:
+            verdict = (
+                "⚠️ Вердикт: Краткосрочный откат вниз возможен. "
+                "Лонг — только при подтверждении от зоны."
+            )
+            bias_dir = "up"
+        elif down_count > up_count:
+            verdict = (
+                "⚠️ Вердикт: Краткосрочный откат вверх возможен. "
+                "Шорт — только при подтверждении от зоны."
+            )
+            bias_dir = "down"
+        else:
+            verdict = (
+                "⚠️ Вердикт: Тренды противоречат — текущая зона может стать как "
+                "точкой разворота, так и пробоя. Работай только по подтверждённому сигналу."
+            )
+            bias_dir = None
+    elif dirs and len(set(dirs)) == 1:
+        direction = "Long" if dirs[0] == "up" else "Short"
+        verdict = f"✅ Вердикт: Тренды совпадают — возможен уверенный вход в {direction}"
+        bias_dir = "up" if dirs[0] == "up" else "down"
+    else:
+        verdict = "⚠️ Вердикт: Тренды неопределены — наблюдай"
+        bias_dir = None
+
+    return "\n".join(lines), verdict, bias_dir
+
+
+async def _entry_exit_levels_old(
+    symbol: str, entry: float | None = None, interval: str = "240"
+) -> tuple[str, float | None, float | None]:
+    candles = await _fetch_kline(symbol, interval, 60)
+    if not candles or len(candles) < 50:
+        msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        return msg, None, None
+    candles = sorted(candles, key=lambda c: int(c[0]))[-50:]
+    highs = [float(c[2]) for c in candles]
+    lows = [float(c[3]) for c in candles]
+    vols = [float(c[5]) for c in candles]
+    avg_vol = sum(vols) / len(vols) if vols else 0
+
+    swing_highs: list[tuple[float, float]] = []
+    swing_lows: list[tuple[float, float]] = []
+    for i in range(2, len(highs) - 2):
+        h = highs[i]
+        l = lows[i]
+        if (
+            h >= highs[i - 1]
+            and h >= highs[i - 2]
+            and h >= highs[i + 1]
+            and h >= highs[i + 2]
+            and (entry is None or h >= entry)
+        ):
+            swing_highs.append((h, vols[i]))
+        if (
+            l <= lows[i - 1]
+            and l <= lows[i - 2]
+            and l <= lows[i + 1]
+            and l <= lows[i + 2]
+            and (entry is None or l <= entry)
+        ):
+            swing_lows.append((l, vols[i]))
+    if not swing_highs and entry is not None:
+        swing_highs = [(highs[i], vols[i]) for i in range(len(highs))]
+    if not swing_lows and entry is not None:
+        swing_lows = [(lows[i], vols[i]) for i in range(len(lows))]
+    if not swing_highs or not swing_lows:
+        msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        return msg, None, None
+    high_val, high_vol = max(swing_highs, key=lambda x: x[0])
+    low_val, low_vol = min(swing_lows, key=lambda x: x[0])
+    high_touch = sum(1 for v in highs if abs(v - high_val) / high_val < 0.002)
+    low_touch = sum(1 for v in lows if abs(v - low_val) / low_val < 0.002)
+    basis = entry if entry is not None else max(high_val, low_val)
+    step = 10 if basis >= 1000 else 5
+    hi_lvl = int(round(high_val / step) * step)
+    lo_lvl = int(round(low_val / step) * step)
+    if hi_lvl <= lo_lvl:
+        msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        return msg, None, None
+    lines: list[str] = []
+    desc = f"Следи за зоной {lo_lvl}–{hi_lvl}. Пробой вверх — можно входить."
+    notes = []
+    if high_vol and high_vol >= avg_vol * 1.5:
+        notes.append("сопротивление усилено объёмом")
+    if low_vol and low_vol >= avg_vol * 1.5:
+        notes.append("поддержка подтверждена объёмом")
+    if high_touch > 1:
+        notes.append(f"верх тестировался {high_touch} раза")
+    if low_touch > 1:
+        notes.append(f"низ тестировался {low_touch} раза")
+    if notes:
+        desc += " " + ", ".join(notes) + "."
+    lines.append("— " + desc)
+    lines.append(f"— Жди закрепа выше {hi_lvl} — для уверенного входа.")
+    lines.append(f"— Пробой вниз ниже {lo_lvl} — лучше не входить (риск усилится).")
+    msg = "📊 Уровни входа/выхода:\n" + "\n".join(lines)
+    return msg, float(lo_lvl), float(hi_lvl)
+
+
+async def _entry_exit_levels(
+    symbol: str, entry: float | None = None, interval: str = "240",
+) -> tuple[str, list[dict], list[dict]]:
+    # Use the same lookback window for daily and four-hour analyses so
+    # support/resistance logic behaves identically across timeframes.
+    # Hourly charts keep a shorter window to stay responsive.
+    limit = 200 if interval in ("D", "240") else 120
+    candles = await _fetch_kline(symbol, interval, limit)
+    if not candles or len(candles) < 50:
+        msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        return msg, [], []
+    candles = sorted(candles, key=lambda c: int(c[0]))
+    highs = [float(c[2]) for c in candles]
+    lows = [float(c[3]) for c in candles]
+    closes = [float(c[4]) for c in candles]
+    vols = [float(c[5]) for c in candles]
+    avg_vol = sum(vols) / len(vols) if vols else 0
+    cur_price = closes[-1]
+
+    swing_highs: list[tuple[float, float]] = []
+    swing_lows: list[tuple[float, float]] = []
+    for i in range(2, len(highs) - 2):
+        h = highs[i]
+        l = lows[i]
+        if (
+            h >= highs[i - 1]
+            and h >= highs[i - 2]
+            and h >= highs[i + 1]
+            and h >= highs[i + 2]
+            and (entry is None or h >= entry)
+        ):
+            swing_highs.append((h, vols[i]))
+        if (
+            l <= lows[i - 1]
+            and l <= lows[i - 2]
+            and l <= lows[i + 1]
+            and l <= lows[i + 2]
+            and (entry is None or l <= entry)
+        ):
+            swing_lows.append((l, vols[i]))
+    top_idx = max(range(len(highs)), key=lambda i: highs[i])
+    top_high = highs[top_idx]
+    top_vol = vols[top_idx]
+    top_close = closes[top_idx]
+    future_slice = lows[top_idx + 1 : min(len(lows), top_idx + 3)]
+    future_low = min(future_slice) if future_slice else lows[top_idx]
+    wick_ratio = (top_high - top_close) / top_high
+    drop_ratio = (top_high - future_low) / top_high
+    top_reject = wick_ratio >= 0.006 or drop_ratio >= 0.01
+    # всегда учитываем самый высокий экстремум как сопротивление, даже без повторных тестов
+    swing_highs.append((top_high, top_vol))
+
+    bottom_idx = min(range(len(lows)), key=lambda i: lows[i])
+    bottom_low = lows[bottom_idx]
+    bottom_vol = vols[bottom_idx]
+    # всегда учитываем самый низкий экстремум как поддержку
+    swing_lows.append((bottom_low, bottom_vol))
+    if not swing_highs and entry is not None:
+        swing_highs = [(highs[i], vols[i]) for i in range(len(highs))]
+    if not swing_lows and entry is not None:
+        swing_lows = [(lows[i], vols[i]) for i in range(len(lows))]
+    if not swing_highs or not swing_lows:
+        msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        return msg, [], []
+
+    basis = entry if entry is not None else cur_price
+    if basis >= 1000:
+        step = 10
+    elif basis >= 100:
+        step = 5
+    elif basis >= 10:
+        step = 1
+    elif basis >= 1:
+        step = 0.1
+    elif basis >= 0.1:
+        step = 0.01
+    else:
+        step = 0.001
+    top_lvl = round(top_high / step) * step
+    bottom_lvl = round(bottom_low / step) * step
+    if interval == "D":
+        # Daily charts cover a wide price range, so merge levels that fall within
+        # roughly six percent of each other to avoid clutter.
+        close_pct = 0.06
+    elif interval == "240":
+        close_pct = 0.02
+    else:
+        close_pct = 0.015
+
+    def _prepare_levels(swings: list[tuple[float, float]], arr: list[float]) -> list[dict]:
+        levels: dict[float, dict] = {}
+        for val, vol in swings:
+            lvl = round(val / step) * step
+            rec = levels.setdefault(lvl, {"vol": 0.0})
+            rec["vol"] = max(rec["vol"], vol)
+        res: list[dict] = []
+        for lvl, rec in levels.items():
+            denom = lvl if lvl else step
+            touches = sum(1 for v in arr if abs(v - lvl) / denom < 0.004)
+            vol_ratio = rec["vol"] / avg_vol if avg_vol else 0
+            dist = abs(cur_price - lvl)
+            res.append(
+                {
+                    "level": float(lvl),
+                    "touches": touches,
+                    "vol": vol_ratio,
+                    "dist": dist,
+                }
+            )
+        # избегаем квадратичной фильтрации: уровни обрабатываются по приоритету,
+        # а проверки близости выполняются через двоичный поиск
+        from bisect import bisect_left
+
+        # приоритет: сначала число касаний, затем величина объёма,
+        # затем близость к текущей цене
+        res.sort(key=lambda x: (x["touches"], x["vol"], -x["dist"]), reverse=True)
+        kept: list[dict] = []
+        prices: list[float] = []
+        for lvl in res:
+            pos = bisect_left(prices, lvl["level"])
+            near_prev = (
+                pos > 0
+                and abs(lvl["level"] - prices[pos - 1]) / min(lvl["level"], prices[pos - 1])
+                < close_pct
+            )
+            near_next = (
+                pos < len(prices)
+                and abs(lvl["level"] - prices[pos]) / min(lvl["level"], prices[pos])
+                < close_pct
+            )
+            if near_prev or near_next:
+                continue
+            prices.insert(pos, lvl["level"])
+            kept.insert(pos, lvl)
+        return kept
+
+    res_levels = _prepare_levels(swing_highs, highs)
+    sup_levels = _prepare_levels(swing_lows, lows)
+    if not res_levels or not sup_levels:
+        msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        return msg, [], []
+
+    top_found = False
+    for lvl in res_levels:
+        if abs(lvl["level"] - top_lvl) < step / 2:
+            top_found = True
+            lvl["top"] = True
+            if top_reject or lvl["vol"] >= 1.5:
+                lvl["reject"] = True
+            break
+    if not top_found:
+        denom = top_lvl if top_lvl else step
+        touches = sum(1 for v in highs if abs(v - top_lvl) / denom < 0.004)
+        top_rec = {
+            "level": float(top_lvl),
+            "touches": touches,
+            "vol": top_vol / avg_vol if avg_vol else 0,
+            "dist": abs(cur_price - top_lvl),
+            "top": True,
+        }
+        if top_reject or top_rec["vol"] >= 1.5:
+            top_rec["reject"] = True
+        res_levels.append(top_rec)
+
+    bottom_found = False
+    for lvl in sup_levels:
+        if abs(lvl["level"] - bottom_lvl) < step / 2:
+            bottom_found = True
+            lvl["bottom"] = True
+            break
+    if not bottom_found:
+        denom = bottom_lvl if bottom_lvl else step
+        touches = sum(1 for v in lows if abs(v - bottom_lvl) / denom < 0.004)
+        sup_levels.append(
+            {
+                "level": float(bottom_lvl),
+                "touches": touches,
+                "vol": bottom_vol / avg_vol if avg_vol else 0,
+                "dist": abs(cur_price - bottom_lvl),
+                "bottom": True,
+            }
+        )
+
+    def _select_zones(
+        sups: list[dict], ress: list[dict]
+    ) -> tuple[list[dict], list[dict]]:
+        """Return up to SR_MAX_ZONES support and resistance levels."""
+
+        def prio(l: dict) -> tuple[int, float, float]:
+            return (l["touches"], l["vol"], -l["dist"])
+
+        sups_sorted = sorted(sups, key=prio, reverse=True)
+        ress_sorted = sorted(ress, key=prio, reverse=True)
+
+        def ensure(levels: list[dict], flag: str) -> list[dict]:
+            selected = levels[:SR_MAX_ZONES]
+            ext = next((l for l in levels if l.get(flag)), None)
+            if ext and ext not in selected:
+                selected.append(ext)
+                selected = sorted(selected, key=prio, reverse=True)[:SR_MAX_ZONES]
+            return selected
+
+        sups_final = ensure(sups_sorted, "bottom")
+        ress_final = ensure(ress_sorted, "top")
+        return sups_final, ress_final
+
+    sup_levels, res_levels = _select_zones(sup_levels, res_levels)
+
+    if not sup_levels or not res_levels:
+        msg = (
+            "📊 Уровни входа/выхода:\n"
+            "❌ Не удалось построить уровни: нет подходящих зон поддержки/сопротивления"
+        )
+        return msg, [], []
+
+    def _importance(level: dict) -> str:
+        score = 0
+        if level["touches"] >= 3:
+            score += 2
+        elif level["touches"] == 2:
+            score += 1
+        if level["vol"] >= 1.5:
+            score += 1
+        dist_pct = level["dist"] / cur_price if cur_price else 1
+        if dist_pct <= 0.02:
+            score += 2
+        elif dist_pct <= 0.05:
+            score += 1
+        if score >= 4:
+            return "strong"
+        if score >= 2:
+            return "medium"
+        return "weak"
+
+    for lvl in sup_levels:
+        lvl["importance"] = _importance(lvl)
+    for lvl in res_levels:
+        lvl["importance"] = _importance(lvl)
+
+    if not MULTI_SR_MODE:
+        res_levels = res_levels[:1]
+        sup_levels = sup_levels[:1]
+
+    hi_lvl = res_levels[0]["level"]
+    lo_lvl = sup_levels[0]["level"]
+    if hi_lvl <= lo_lvl:
+        msg = "📊 Уровни входа/выхода:\n— Недостаточно данных для уровней."
+        return msg, [], []
+
+    lines: list[str] = []
+    desc = (
+        "Следи за зоной "
+        f"{fmt_price(lo_lvl)}–{fmt_price(hi_lvl)}. Пробой вверх — можно входить."
+    )
+    notes = []
+    if res_levels[0]["vol"] >= 1.5:
+        notes.append("сопротивление усилено объёмом")
+    if sup_levels[0]["vol"] >= 1.5:
+        notes.append("поддержка подтверждена объёмом")
+    if res_levels[0]["touches"] > 1:
+        notes.append(f"верх тестировался {res_levels[0]['touches']} раза")
+    if res_levels[0].get("top"):
+        notes.append("верхний экстремум")
+    if sup_levels[0]["touches"] > 1:
+        notes.append(f"низ тестировался {sup_levels[0]['touches']} раза")
+    if notes:
+        desc += " " + ", ".join(notes) + "."
+    lines.append("— " + desc)
+    lines.append(
+        f"— Жди закрепа выше {fmt_price(hi_lvl)} — для уверенного входа."
+    )
+    lines.append(
+        f"— Пробой вниз ниже {fmt_price(lo_lvl)} — лучше не входить (риск усилится)."
+    )
+    msg = "📊 Уровни входа/выхода:\n" + "\n".join(lines)
+
+    return msg, sup_levels, res_levels
+
+
+async def _sr_trade_reco(
+    symbol: str,
+    supports: list[dict],
+    resistances: list[dict],
+    bias: str | None = None,
+    interval: str = "240",
+) -> tuple[str, str | None]:
+    """Form recommendation based on nearest support/resistance zone.
+
+    Returns text message and dominant side ("Long"/"Short") if price
+    trades near a strong zone.
+    """
+    if not supports and not resistances:
+        return "", None
+    candles = await _fetch_kline(symbol, interval, 60)
+    if not candles:
+        return ""
+    candles = sorted(candles, key=lambda c: int(c[0]))
+    opens = [float(c[1]) for c in candles]
+    highs = [float(c[2]) for c in candles]
+    lows = [float(c[3]) for c in candles]
+    closes = [float(c[4]) for c in candles]
+    volumes = [float(c[5]) for c in candles]
+    cur_price = closes[-1]
+
+    def _atr() -> float:
+        if len(highs) < 2:
+            return 0.0
+        trs = []
+        for i in range(1, len(highs)):
+            tr = max(
+                highs[i] - lows[i],
+                abs(highs[i] - closes[i - 1]),
+                abs(lows[i] - closes[i - 1]),
+            )
+            trs.append(tr)
+        period = min(14, len(trs))
+        return sum(trs[-period:]) / period if period else 0.0
+
+    atr = _atr()
+    vol_thresh = np.percentile(volumes, VOL_CONFIRM_PERCENTILE)
+    cur_vol = volumes[-1]
+    band_pct = BAND_PCT.get(interval, 0.004)
+
+    zones: list[dict] = []
+    for s in supports:
+        band = s["level"] * band_pct
+        zones.append(
+            {
+                "type": "S",
+                "low": s["level"] - band,
+                "high": s["level"] + band,
+                "mid": s["level"],
+                "touches": s.get("touches", 0),
+                "vol": s.get("vol", 0),
+                "strength": s.get("touches", 0) + (1 if s.get("vol", 0) >= 1.5 else 0),
+            }
+        )
+    for r in resistances:
+        band = r["level"] * band_pct
+        zones.append(
+            {
+                "type": "R",
+                "low": r["level"] - band,
+                "high": r["level"] + band,
+                "mid": r["level"],
+                "touches": r.get("touches", 0),
+                "vol": r.get("vol", 0),
+                "strength": r.get("touches", 0) + (1 if r.get("vol", 0) >= 1.5 else 0),
+            }
+        )
+    zones.sort(key=lambda z: (abs(cur_price - z["mid"]), -z["strength"]))
+    z = zones[0]
+    zone_txt = f"{fmt_price(z['low'])}–{fmt_price(z['high'])}"
+    midpoint = z["mid"]
+    band = (z["high"] - z["low"]) / 2
+    near = abs(cur_price - midpoint) <= band
+    side = "Long" if z["type"] == "S" else "Short"
+    strong_zone = z.get("touches", 0) >= 4 and z.get("vol", 0) >= 2 and z.get("strength", 0) >= 4
+    trends_align = (bias == "up" and side == "Long") or (bias == "down" and side == "Short")
+    pattern_txt = (
+        "бычий паттерн, close выше середины зоны, объём ↑"
+        if side == "Long"
+        else "медвежий паттерн, close ниже середины зоны, объём ↑"
+    )
+    dist_pct = abs(cur_price - midpoint) / cur_price if cur_price else 1
+    critical = z.get("touches", 0) >= 10 and z.get("vol", 0) >= 2 and dist_pct <= 0.01
+    def _zone_mark(level: dict) -> str:
+        if level.get("touches", 0) >= 10 and level.get("vol", 0) >= 2:
+            return (
+                f"🔴 Сильное сопротивление (тесты: {level['touches']}+, объём: высокий)"
+                if level["type"] == "R"
+                else f"🟢 Поддержка с подтверждённым объёмом (тесты: {level['touches']}+, объём: высокий)"
+            )
+        if level.get("touches", 0) < 2 and level.get("vol", 0) < 1.5:
+            return "⚠️ Слабая зона — касаний мало, объём низкий"
+        if level["type"] == "R":
+            return f"🟥 Сопротивление ({level['touches']} кас., объём {level['vol']:.1f}x)"
+        return f"🟩 Поддержка ({level['touches']} кас., объём {level['vol']:.1f}x)"
+
+    mark_line = _zone_mark(z)
+
+    recent = volumes[-5:]
+    prev = volumes[-10:-5] if len(volumes) >= 10 else volumes[:-5]
+    avg_recent = sum(recent) / len(recent) if recent else 0
+    avg_prev = sum(prev) / len(prev) if prev else avg_recent
+    vol_dir = "up" if avg_recent > avg_prev * 1.1 else "down"
+    zone_important = z.get("touches", 0) >= 7 and z.get("vol", 0) >= 2
+
+    state = ""
+    if z["low"] <= cur_price <= z["high"]:
+        state = "inside_zone"
+    elif z["type"] == "R":
+        if cur_price > z["high"] and cur_price - z["high"] > MIN_CLOSE_OUTSIDE_ATR * atr and cur_vol >= vol_thresh:
+            state = "breakout_up"
+        else:
+            state = "approach_to_R"
+    else:
+        if cur_price < z["low"] and z["low"] - cur_price > MIN_CLOSE_OUTSIDE_ATR * atr and cur_vol >= vol_thresh:
+            state = "breakout_down"
+        else:
+            state = "approach_to_S"
+
+    def _vol_comment(z_type: str, important: bool, trend: str) -> str:
+        if z_type == "S":
+            if important:
+                if trend == "down":
+                    return (
+                        f"🟢 Цена приближается к важной зоне поддержки {zone_txt} на падающих объёмах — возможен отскок. "
+                        "Жди подтверждения (паттерн, close выше середины зоны, объём)."
+                    )
+                else:
+                    return (
+                        f"🔴 Снижение к сильной поддержке {zone_txt} сопровождается ростом объёмов — возможен пробой вниз. "
+                        "Подтверждение желательно."
+                    )
+            else:
+                if trend == "up":
+                    return (
+                        f"🔴 Падение сопровождается ростом объёмов у слабой поддержки {zone_txt} — возможен пробой."
+                    )
+                else:
+                    return (
+                        f"🟢 Цена у неважной поддержки {zone_txt}, объёмы снижаются — возможен краткосрочный отскок, но зона слабая. "
+                        "Подтверждение обязательно."
+                    )
+        else:  # resistance
+            if important:
+                if trend == "up":
+                    return (
+                        f"🔴 Цена растёт к сильному сопротивлению {zone_txt} на повышенных объёмах — возможен пробой. "
+                        "Следи за закрепом выше уровня."
+                    )
+                else:
+                    return (
+                        f"🟢 Рост на падающих объёмах у важного сопротивления {zone_txt} — возможен откат. "
+                        "Жди подтверждения разворота (паттерн, объём)."
+                    )
+            else:
+                if trend == "up":
+                    return (
+                        f"🔴 Рост на повышенных объёмах у слабого сопротивления {zone_txt} — возможно пробитие зоны."
+                    )
+                else:
+                    return (
+                        f"🟢 Цена у неважного сопротивления {zone_txt}, объёмы падают — возможен откат, но зона слабая. "
+                        "Жди подтверждений."
+                    )
+
+    bias_note = ""
+    note_has_zone = False
+    force_wait = False
+    if state in ("approach_to_R", "approach_to_S", "inside_zone"):
+        bias_note = _vol_comment(z["type"], zone_important, vol_dir)
+        note_has_zone = True
+
+    last_move = closes[-1] - closes[-2] if len(closes) >= 2 else 0
+    move_dir = "up" if last_move > 0 else "down" if last_move < 0 else ""
+    last_range = highs[-1] - lows[-1]
+
+    # calculate bounce/break probabilities when approaching a zone
+    bounce_prob = break_prob = None
+    zweak = z.get("touches", 0) <= 3 and z.get("vol", 0) < 1
+    if state in ("approach_to_R", "approach_to_S", "inside_zone"):
+        bounce_prob = 50
+        if state != "inside_zone":
+            if z["type"] == "S":
+                if vol_dir == "down":
+                    bounce_prob += 15
+                elif vol_dir == "up":
+                    bounce_prob -= 15
+            else:  # resistance
+                if vol_dir == "down":
+                    bounce_prob += 15
+                elif vol_dir == "up":
+                    bounce_prob -= 15
+            move_dir = "down" if state == "approach_to_S" else "up"
+            if bias:
+                if (move_dir == "down" and bias == "up") or (move_dir == "up" and bias == "down"):
+                    bounce_prob += 10
+                elif (move_dir == "down" and bias == "down") or (move_dir == "up" and bias == "up"):
+                    bounce_prob -= 10
+            if zone_important:
+                bounce_prob += 10
+            elif zweak:
+                bounce_prob -= 10
+            last_range = highs[-1] - lows[-1]
+            if atr:
+                if last_range > atr * 1.5:
+                    bounce_prob -= 10
+                elif last_range < atr * 0.5:
+                    bounce_prob += 10
+        bounce_prob = max(0, min(100, bounce_prob))
+        break_prob = 100 - bounce_prob
+
+    stop = None
+    target = None
+    if z["type"] == "R":
+        stop = z["high"] + 0.3 * atr
+        opp = [s["level"] for s in supports if s["level"] < midpoint]
+        target = opp[0] if opp else midpoint - 1.5 * atr
+    else:
+        stop = z["low"] - 0.3 * atr
+        opp = [r["level"] for r in resistances if r["level"] > midpoint]
+        target = opp[0] if opp else midpoint + 1.5 * atr
+    rr = abs(target - midpoint) / abs(midpoint - stop) if stop and target else 0
+
+    zone_dir = side if near and z["strength"] >= 2 and not force_wait else None
+    if force_wait:
+        msg = bias_note
+    elif state == "inside_zone":
+        if strong_zone and trends_align:
+            msg = (
+                bias_note
+                + f"Тренды совпадают. Ищи вход в {side} при появлении сигнала ("
+                + f"{pattern_txt}). Стоп: {('под' if side=='Long' else 'за')} "
+                + (
+                    f"{fmt_price(z['low'])}-0.3 ATR" if side == "Long" else f"{fmt_price(z['high'])}+0.3 ATR"
+                )
+                + ". Цели: ближайшее сопротивление / следующая зона."
+            )
+        else:
+            base = "" if note_has_zone else f"Цена пилит внутри сильной зоны {zone_txt}. "
+            msg = (
+                bias_note
+                + base
+                + "Нейтрально. Торгуем только пробой/ретест с подтверждением. Без сигнала — пропуск."
+            )
+    elif state == "breakout_up":
+        msg = (
+            bias_note
+            + f"Пробили R {zone_txt} телом ≥0.25 ATR на повышенном объёме. "
+            f"План: Long по ретесту зоны, стоп за серединой зоны. TP: {fmt_price(target)}. RR ≈ {rr:.2f}"
+        )
+    elif state == "breakout_down":
+        msg = (
+            bias_note
+            + f"Пробили S {zone_txt} телом ≥0.25 ATR на повышенном объёме. "
+            f"План: Short по ретесту зоны, стоп за серединой зоны. TP: {fmt_price(target)}. RR ≈ {rr:.2f}"
+        )
+    else:
+        base = (
+            "" if note_has_zone else f"Зона {('S' if z['type']=='S' else 'R')} {zone_txt}. Подходим {'снизу' if z['type']=='R' else 'сверху'}. "
+        )
+        msg = bias_note + base
+        if strong_zone and trends_align:
+            msg += (
+                f"Тренды совпадают. Ищи вход в {side} при появлении сигнала ({pattern_txt}). "
+                + (
+                    f"Стоп: под {fmt_price(z['low'])}-0.3 ATR. Цели: ближайшее сопротивление / следующая зона."
+                    if side == "Long"
+                    else f"Стоп: за {fmt_price(z['high'])}+0.3 ATR. Цели: ближайшая поддержка / следующая зона."
+                )
+            )
+        else:
+            if z["type"] == "R":
+                msg += (
+                    "Жди подтверждения Short: медвежий отказ сверху, close ниже середины зоны, объём ↑. "
+                    f"Стоп: за {fmt_price(z['high'])}+0.3 ATR. Цели: ближайшая поддержка / следующая зона."
+                )
+            else:
+                msg += (
+                    "Жди подтверждения Long: бычий отказ снизу, close выше середины зоны, объём ↑. "
+                    f"Стоп: под {fmt_price(z['low'])}-0.3 ATR. Цели: ближайшее сопротивление / следующая зона."
+                )
+        if rr and rr < MIN_RR:
+            msg += f" RR ≈ {rr:.2f} — сделка невыгодна, пропуск."
+    prob_txt = ""
+    if bounce_prob is not None:
+        zone_noun = "поддержки" if z["type"] == "S" else "сопротивления"
+        bounce_emoji = "🟢" if z["type"] == "S" else "🔴"
+        break_emoji = "🔴" if z["type"] == "S" else "🟢"
+        prob_txt = (
+            "\n📊 Вероятность сценариев:\n"
+            f"{bounce_emoji} Отскок от {zone_noun} {zone_txt}: {int(bounce_prob)}%\n"
+            f"{break_emoji} Пробой этой зоны: {int(break_prob)}%\n"
+            "Оценка основана на текущих сигналах и объёмах."
+        )
+    else:
+        cont_prob = rev_prob = None
+        if move_dir:
+            cont_prob = 50
+            if move_dir == "up":
+                cont_prob += 15 if vol_dir == "up" else -15
+                if bias == "up":
+                    cont_prob += 10
+                elif bias == "down":
+                    cont_prob -= 10
+            else:
+                cont_prob += 15 if vol_dir == "up" else -15
+                if bias == "down":
+                    cont_prob += 10
+                elif bias == "up":
+                    cont_prob -= 10
+            if atr:
+                if last_range > atr * 1.5:
+                    cont_prob += 10
+                elif last_range < atr * 0.5:
+                    cont_prob -= 10
+            cont_prob = max(0, min(100, cont_prob))
+            rev_prob = 100 - cont_prob
+            if move_dir == "up":
+                prob_txt = (
+                    "\n📊 Вероятность сценариев:\n"
+                    f"🟢 Продолжение роста: {int(cont_prob)}%\n"
+                    f"🔴 Разворот вниз: {int(rev_prob)}%\n"
+                    "Оценка основана на текущих сигналах и объёмах."
+                )
+            else:
+                prob_txt = (
+                    "\n📊 Вероятность сценариев:\n"
+                    f"🔴 Продолжение падения: {int(cont_prob)}%\n"
+                    f"🟢 Отскок вверх: {int(rev_prob)}%\n"
+                    "Оценка основана на текущих сигналах и объёмах."
+                )
+        else:
+            prob_txt = "\nНедостаточно данных для точной оценки вероятности"
+
+    zone_label = "поддержки" if z["type"] == "S" else "сопротивления"
+    vol_phrase = "объёмы выше нормы" if cur_vol >= vol_thresh else "объёмы падают"
+    trend_phrase = (
+        "тренды в целом растущие"
+        if bias == "up"
+        else "тренды в целом нисходящие" if bias == "down" else "тренды неопределённые"
+    )
+    if force_wait:
+        summary = (
+            f"📊 Резюме: цена у {zone_label} {zone_txt}, {trend_phrase}, {vol_phrase} — подтверждение обязательно ({pattern_txt})."
+        )
+    elif strong_zone and trends_align:
+        summary = (
+            f"📊 Резюме: цена у {zone_label} {zone_txt}, {trend_phrase}, {vol_phrase} — "
+            f"возможен вход в {side} при подтверждении ({pattern_txt})."
+        )
+    elif bias and zone_dir and (
+        (bias == "up" and side == "Short") or (bias == "down" and side == "Long")
+    ):
+        alt = "возможен отскок" if side == "Long" else "возможен откат"
+        summary = (
+            f"📊 Резюме: цена у {zone_label} {zone_txt}, {trend_phrase}, {vol_phrase} — "
+            f"{alt}, подтверждение обязательно ({pattern_txt})."
+        )
+    else:
+        summary = (
+            f"📊 Резюме: цена у {zone_label} {zone_txt}, тренды противоречат — "
+            "зона может стать как точкой разворота, так и пробоя. "
+            "Работай только по подтверждённому сигналу."
+        )
+    return mark_line + "\n" + msg + prob_txt + "\n\n" + summary, zone_dir
+
+
+async def _generate_price_chart(
+    symbol: str,
+    interval: str,
+    supports: list[dict],
+    resistances: list[dict],
+    label: str,
+    limit: int = 120,
+) -> BufferedInputFile | None:
+    candles = await _fetch_kline(symbol, interval, limit)
+    if not candles:
+        return None
+    candles = sorted(candles, key=lambda c: int(c[0]))
+    opens = [float(c[1]) for c in candles]
+    highs = [float(c[2]) for c in candles]
+    lows = [float(c[3]) for c in candles]
+    closes = [float(c[4]) for c in candles]
+    volumes = [float(c[5]) for c in candles]
+    cur_price = closes[-1]
+
+    band_pct = BAND_PCT.get(interval, 0.004)
+
+    n = len(candles)
+    fig_width = 8 if n <= 120 else 8 * n / 120
+    fig, (ax, ax_v) = plt.subplots(
+        2,
+        1,
+        figsize=(fig_width, 6),
+        sharex=True,
+        gridspec_kw={"height_ratios": [3, 1]},
+        facecolor="#1e1e1e",
+    )
+    for a in (ax, ax_v):
+        a.set_facecolor("#1e1e1e")
+        a.grid(color="gray", linestyle="--", alpha=0.3)
+        a.tick_params(colors="white")
+        for spine in a.spines.values():
+            spine.set_color("white")
+
+    width = 0.6
+    for i, (o, h, l, c, v) in enumerate(zip(opens, highs, lows, closes, volumes)):
+        color = "#00e676" if c >= o else "#ff1744"
+        ax.plot([i, i], [l, h], color=color, linewidth=1, zorder=1)
+        rect = Rectangle(
+            (i - width / 2, min(o, c)),
+            width,
+            abs(c - o) or 0.001,
+            facecolor=color,
+            edgecolor=color,
+            alpha=0.9,
+            zorder=2,
+        )
+        rect.set_path_effects([
+            pe.withStroke(linewidth=2, foreground="black", alpha=0.3)
+        ])
+        ax.add_patch(rect)
+        ax_v.bar(i, v, width=width, color=color, alpha=0.5)
+
+    ax.set_xlim(-0.5, len(candles) - 0.5)
+
+    if not supports or not resistances:
+        return None
+    main_sup = supports[0]["level"]
+    main_res = resistances[0]["level"]
+    lo, hi = sorted([main_sup, main_res])
+    gradient = np.linspace(0, 1, 256).reshape(-1, 1)
+    ax.imshow(
+        gradient,
+        extent=[-0.5, len(candles) - 0.5, lo, hi],
+        cmap="Greys",
+        alpha=0.05,
+        aspect="auto",
+        zorder=0,
+    )
+    def _draw_levels(levels: list[dict], is_support: bool) -> None:
+        icon = "🟩" if is_support else "🟥"
+        colors = (
+            {"strong": "#00FF00", "medium": "#90EE90", "weak": "#00FFFF"}
+            if is_support
+            else {"strong": "#FF0000", "medium": "#FFA500", "weak": "#FFFF00"}
+        )
+        for idx, lvl in enumerate(levels):
+            color = colors.get(lvl.get("importance"), list(colors.values())[1])
+            base_alpha = 0.25 * (0.7 ** idx)
+            if lvl["importance"] == "weak":
+                base_alpha *= 0.6
+            if lvl["vol"] >= 1.5 or lvl["touches"] >= 3:
+                base_alpha += 0.15
+            alpha = min(base_alpha, 0.7)
+            band = min(lvl["level"] * band_pct, cur_price * 0.015)
+            lo_zone = lvl["level"] - band
+            hi_zone = lvl["level"] + band
+            ax.axhspan(lo_zone, hi_zone, color=color, alpha=alpha)
+            name = "Поддержка" if is_support else "Сопротивление"
+            text = f"{icon} {name}: {fmt_price(lo_zone)}–{fmt_price(hi_zone)}"
+            info: list[str] = []
+            if lvl["touches"] > 1:
+                info.append(f"{lvl['touches']} касания")
+            if lvl["vol"] >= 1.5:
+                info.append(f"объём {lvl['vol']:.1f}×")
+            if lvl.get("top"):
+                info.append("верхний экстремум")
+            importance_words = {
+                "strong": "сильная",
+                "medium": "средняя",
+                "weak": "слабая",
+            }
+            info.append(f"важность: {importance_words.get(lvl.get('importance'), 'средняя')}")
+            text += " • " + ", ".join(info)
+            ax.text(
+                len(candles) + 0.5,
+                (lo_zone + hi_zone) / 2,
+                text,
+                color=color,
+                va="center",
+                alpha=min(alpha + 0.2, 1),
+                fontsize=8,
+            )
+
+    _draw_levels(supports, True)
+    _draw_levels(resistances, False)
+
+    ax.set_title(f"{symbol} {interval}")
+    plt.setp(ax.get_xticklabels(), visible=False)
+    ax_v.tick_params(axis="x", colors="white")
+    ax_v.set_ylabel("Vol", color="white")
+
+    buf = BytesIO()
+    fig.tight_layout()
+    fig.savefig(buf, format="png", facecolor=fig.get_facecolor())
+    plt.close(fig)
+    buf.seek(0)
+    return BufferedInputFile(buf.getvalue(), filename=f"{symbol}_{interval}.png")
+
+
+async def _send_sr_charts(
+    chat_id: int,
+    symbol: str,
+    entry: float | None = None,
+) -> None:
+    _, sup_1d, res_1d = await _entry_exit_levels(symbol, entry, interval="D")
+    _, sup_4h, res_4h = await _entry_exit_levels(symbol, entry, interval="240")
+    _, sup_1h, res_1h = await _entry_exit_levels(symbol, entry, interval="60")
+    for label, interval, sup_list, res_list in (
+        ("1D", "D", sup_1d, res_1d),
+        ("4H", "240", sup_4h, res_4h),
+        ("1H", "60", sup_1h, res_1h),
+    ):
+        if not sup_list or not res_list:
+            continue
+        file = await _generate_price_chart(symbol, interval, sup_list, res_list, label, 300)
+        if not file:
+            continue
+        sup_vals = ", ".join(fmt_price(lvl["level"]) for lvl in sup_list)
+        res_vals = ", ".join(fmt_price(lvl["level"]) for lvl in res_list)
+        caption = (
+            f"{label}:\n"
+            f"🟩 Поддержка {label}: {sup_vals}\n"
+            f"🟥 Сопротивление {label}: {res_vals}"
+        )
+        await bot.send_photo(chat_id, file, caption=caption)
+
+
+def _similar_trades_summary(
+    uid: int,
+    symbol: str,
+    ttype: str,
+    lev: float | None,
+    stars: int,
+    cur_signals: list[str],
+    risk: float,
+) -> str:
+    lev_val = lev or 0
+    with sqlite3.connect(DB_PATH) as conn:
+        rows = conn.execute(
+            "SELECT profit_percent, signals, risk_percent FROM trades "
+            "WHERE user_id=? AND symbol=? AND trade_type=? "
+            "AND ABS(COALESCE(leverage,0)-?)<=2 "
+            "AND ABS(COALESCE(signal_stars,0)-?)<=2 "
+            "AND exit_price IS NOT NULL AND COALESCE(is_deleted,0)=0",
+            (uid, symbol, ttype, lev_val, stars),
+        ).fetchall()
+    if not rows:
+        return "Недостаточно похожих сделок для анализа. Собираем статистику…"
+
+    wins: list[float] = []
+    losses: list[float] = []
+    win_sigs: Counter[str] = Counter()
+    miss_sigs: Counter[str] = Counter()
+    high_risk_losses = 0
+    for pct, sigs, r in rows:
+        sig_list = [s for s in (sigs or "").split(";") if s]
+        if pct and pct > 0:
+            wins.append(pct)
+            for s in sig_list:
+                win_sigs[s] += 1
+        else:
+            losses.append(pct or 0)
+            if r and r > 30:
+                high_risk_losses += 1
+            for s in cur_signals:
+                if s not in sig_list:
+                    miss_sigs[s] += 1
+
+    parts = ["📊 История похожих сделок:"]
+    lev_str = fmt_leverage(lev_val)
+    base = f"{symbol} / {ttype.capitalize()}"
+    if lev_str:
+        base += f" / {lev_str}"
+    base += f" / {stars}⭐"
+    if wins:
+        avg_profit = sum(wins) / len(wins)
+        parts.append(
+            f"✅ {len(wins)} похожие сделки с {base} дали профит в среднем {avg_profit:+.1f}%"
+        )
+        for sig, cnt in win_sigs.most_common(2):
+            parts.append(f"— {cnt} из них были с сигналом {sig}")
+    if losses:
+        parts.append(f"❌ {len(losses)} сделки дали убыток")
+        if high_risk_losses:
+            parts.append(f"— {high_risk_losses} из них были с риском > 30%")
+        if miss_sigs:
+            msig, cnt = max(miss_sigs.items(), key=lambda kv: kv[1])
+            parts.append(f"— {cnt} из них были без сигнала {msig}")
+
+    if win_sigs:
+        top_sig, _ = win_sigs.most_common(1)[0]
+        if top_sig not in cur_signals:
+            parts.append(
+                f"\n📌 Сейчас: не хватает сигнала {top_sig}, риск {risk:.1f}%. Подумай, стоит ли входить."
+            )
+            return "\n".join(parts)
+
+    parts.append(
+        f"\n📌 Сейчас: риск {risk:.1f}%. Подумай, стоит ли входить."
+    )
+    return "\n".join(parts)
+
+
+def build_habits_report(uid: int) -> str:
+    now = datetime.now()
+    start_today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    start_week = now - timedelta(days=7)
+    with sqlite3.connect(DB_PATH) as conn:
+        today_rows = conn.execute(
+            "SELECT signal_stars, risk_percent FROM trades WHERE user_id=? AND entry_date>=? AND COALESCE(is_deleted,0)=0",
+            (uid, start_today.isoformat()),
+        ).fetchall()
+        week_rows = conn.execute(
+            "SELECT signal_stars, risk_percent, mistake_reason, targets FROM trades WHERE user_id=? AND entry_date>=? AND COALESCE(is_deleted,0)=0",
+            (uid, start_week.isoformat()),
+        ).fetchall()
+        combo_rows = conn.execute(
+            "SELECT signals, profit_percent FROM trades WHERE user_id=? AND exit_price IS NOT NULL AND COALESCE(is_deleted,0)=0",
+            (uid,),
+        ).fetchall()
+    today_no_conf = sum(1 for s, r in today_rows if (s or 0) < 6)
+    today_high_risk = sum(1 for s, r in today_rows if (r or 0) > 25)
+    week_no_conf = sum(1 for s, r, _, _ in week_rows if (s or 0) < 6)
+    week_high_risk = sum(1 for s, r, _, _ in week_rows if (r or 0) > 25)
+    err_counts = defaultdict(int)
+    for s, r, m, t in week_rows:
+        errs = set()
+        if (s or 0) < 6:
+            errs.add("Слабые сигналы")
+        if r and r > 50:
+            errs.add("Риск выше 50%")
+        if not t:
+            errs.add("Отсутствует тейк")
+        if m == "Не дождался ретеста":
+            errs.add("Вход без ретеста")
+        elif m == "Против тренда":
+            errs.add("Игнор тренда")
+        elif m == "Вход на хаях":
+            errs.add("Вход на хаях")
+        elif m == "Игнор объёма":
+            errs.add("Игнор объёма")
+        for e in errs:
+            err_counts[e] += 1
+    combo_stats: dict[tuple[str, str], list[int]] = defaultdict(lambda: [0, 0])
+    for sigs, prof in combo_rows:
+        if not sigs:
+            continue
+        sig_list = [s for s in sigs.split(";") if s]
+        for combo in combinations(sorted(sig_list), 2):
+            if prof and prof > 0:
+                combo_stats[combo][0] += 1
+            else:
+                combo_stats[combo][1] += 1
+    worst_combo = None
+    worst_diff = 0
+    for combo, (w, l) in combo_stats.items():
+        if w + l >= 3 and l > w and (l - w) > worst_diff:
+            worst_diff = l - w
+            worst_combo = (combo, l)
+    lines = [
+        f"📊 За сегодня: без подтверждений — {today_no_conf}, риск>25% — {today_high_risk}",
+        f"📉 За 7 дней: без подтверждений — {week_no_conf}, риск>25% — {week_high_risk}",
+    ]
+    if today_no_conf >= 2:
+        lines.append(
+            f"⚠️ Ты часто входишь без подтверждений — сегодня уже {today_no_conf} раза. Подумай, не повторяешь ли одну и ту же ошибку?"
+        )
+    if week_high_risk >= 3:
+        lines.append(
+            f"📉 Сделки с риском выше 25% — {week_high_risk} раза за неделю. Пересмотри управление рисками."
+        )
+    if worst_combo:
+        combo, losses = worst_combo
+        lines.append(
+            f"🔁 Повторяешь неудачную связку: '{combo[0]} + {combo[1]}' — уже {losses} убытков подряд."
+        )
+    if err_counts:
+        lines.append("❌ Повторяешь ошибки:")
+        for name, cnt in sorted(err_counts.items(), key=lambda x: x[1], reverse=True):
+            lines.append(f"– «{name}» — {cnt} раз{'' if cnt==1 else 'а'}")
+    else:
+        lines.append("✅ Ошибок не найдено — продолжаем в том же духе.")
+    return "\n".join(lines)
+
+
+async def _market_signal_balance() -> str:
+    url = "https://api.bybit.com/v5/market/tickers"
+    params = {"category": "linear"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, params=params) as resp:
+                data = await resp.json()
+        tickers = data.get("result", {}).get("list", [])
+    except Exception:
+        return ""
+
+    tickers.sort(key=lambda t: float(t.get("turnover24h", 0) or 0), reverse=True)
+    tickers = tickers[:30]
+
+    long_count = short_count = 0
+    for t in tickers:
+        sym = t.get("symbol", "")
+        if not sym.endswith("USDT"):
+            continue
+        base = _base_from_symbol(sym)
+        res = await _micro_trend_tf(base, "D", 50)
+        if res.get("trend") not in {"up", "down"}:
+            res = await _micro_trend_tf(base, "240", 50)
+        trend = res.get("trend")
+        vol_dir = res.get("vol")
+        if trend == "up" and vol_dir != "down":
+            long_count += 1
+        elif trend == "down" and vol_dir != "up":
+            short_count += 1
+
+    total = long_count + short_count
+    if total < 5:
+        return ""
+    long_pct = long_count / total * 100
+    short_pct = short_count / total * 100
+    line = f"📊 Рыночный баланс: {long_pct:.0f}% Long / {short_pct:.0f}% Short"
+    if long_pct >= 80:
+        line += " — Толпа в лонгах. Возможен откат."
+    elif short_pct >= 80:
+        line += " — Толпа в шортах. Возможен рост на squeeze."
+    else:
+        line += " — Баланс нейтральный."
+    return line
+
+
+async def _build_ai_advice(uid: int, signals: list[str], strong: int, total: int, risk: float, symbol: str | None = None) -> str:
+    sig_names = ", ".join(signals) if signals else "—"
+    header = (
+        f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
+        f"— Риск: {risk:.1f}%\n"
+        f"📍 Сигналы в сделке: {sig_names}\n\n"
+        "📊 Анализ:\n"
+    )
+    if risk > 60 and strong < 2:
+        body = "❌ Сетап опасный. Я бы не входил. Подожди подтверждений."
+    elif 30 <= risk <= 50 and strong >= 2:
+        body = (
+            "⚠️ Сетап нестабильный, но может выстрелить. "
+            "Входи только частично и со стопом."
+        )
+    elif risk < 30 and strong >= 3:
+        body = (
+            "✅ Сетап сильный. Хороший шанс на профит. "
+            "Следи за объёмами."
+        )
+    else:
+        body = (
+            "🤔 Пока выглядит слабо. Я бы подождал более "
+            "чётких сигналов."
+        )
+    parts = [header + body]
+    style = _analyze_trader_style(uid, risk, strong)
+    combos = _analyze_signal_combos(uid, signals)
+    rec = _recommend_setup(strong, risk)
+    market = await _market_signal_balance() if symbol else ""
+    for extra in (style, combos, rec, market):
+        if extra:
+            parts.append(extra)
+    return "\n\n".join(parts)
+
+
 async def maybe_send_ai_advice(uid: int, tid: int) -> None:
     if not is_automation_enabled(uid):
         return
+    if get_subscription(uid) not in {"basic", "pro"}:
+        return
     with sqlite3.connect(DB_PATH) as conn:
+        pref = conn.execute(
+            "SELECT habit_comment_enabled FROM user_settings WHERE user_id=?",
+            (uid,),
+        ).fetchone()
+        if not pref or not pref[0]:
+            return
         row = conn.execute(
-            "SELECT signals, signal_stars, risk_percent FROM trades WHERE id=? AND user_id=?",
+            "SELECT signals, signal_stars, risk_percent, symbol, trade_type FROM trades WHERE id=? AND user_id=?",
             (tid, uid),
         ).fetchone()
     if not row:
         return
-    signals, stars, risk = row
+    signals, stars, risk, symbol, ttype = row
     sig_list = [s for s in (signals or "").split(";") if s]
-    if not sig_list or not risk:
+    if not sig_list or not risk or not symbol or not ttype:
         return
     total, strong, _, _ = signal_stats(sig_list)
     risk = float(risk)
-    if strong >= 2 and risk <= 10:
-        text = (
-            "💡 Сетап оценён!\n\n"
-            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
-            f"— Риск: {risk:.1f}%\n\n"
-            "📊 Анализ:\n"
-            "✅ Отличное соотношение сигналов и риска.\n"
-            "💬 Совет: проверь объёмы на 4H, возможен откат."
+    vol_line, vol_note, vol_short = await _volume_24h(symbol)
+    trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype, vol_short)
+    rec_block, verdict_line, trend_bias = format_trend_recommendations(d_res, h_res)
+    levels_block, supports, resistances = await _entry_exit_levels(symbol)
+    zone_reco, zone_dir = await _sr_trade_reco(symbol, supports, resistances, bias=trend_bias)
+    if zone_dir and trend_bias and (
+        (zone_dir == "Short" and trend_bias == "up")
+        or (zone_dir == "Long" and trend_bias == "down")
+    ):
+        zone_word = "сопротивления" if zone_dir == "Short" else "поддержки"
+        trend_word = "восходящие" if trend_bias == "up" else "нисходящие"
+        verdict_line = (
+            f"⚠️ Вердикт: Цена у {zone_word}. Несмотря на {trend_word} тренды, "
+            f"лучше ждать разворота и искать вход в {zone_dir}."
         )
-    else:
-        text = (
-            "⚠️ Осторожно: слабый сетап\n\n"
-            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
-            f"— Риск: {risk:.1f}%\n\n"
-            "📊 Анализ:\n"
-            "❌ Недостаточно подтверждающих сигналов.\n"
-            "🔺 Повышенный риск.\n"
-            "💬 Совет: дождись ретеста или усиливающего сигнала."
-        )
+    vol_block = "\n".join(filter(None, [vol_line, vol_note]))
+    trend_block = trend_text
+    if vol_block:
+        trend_block += f"\n\n{vol_block}"
+    trend_block += f"\n\n{rec_block}\n{verdict_line}"
+    if levels_block:
+        trend_block += f"\n\n{levels_block}"
+    if zone_reco:
+        trend_block += f"\n\n{zone_reco}"
+    text = "💡 Сетап оценён!\n\n" + trend_block + "\n\n" + await _build_ai_advice(uid, sig_list, strong, total, risk, symbol)
     await bot.send_message(uid, text)
+    if supports and resistances:
+        await _send_sr_charts(uid, symbol)
 
 
 @dp.callback_query(TradeState.confirming, lambda c: c.data == "confirm_add")
@@ -4043,9 +5742,7 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
     buttons = []
     for idx, p in enumerate(positions):
         side = "LONG" if p.get("side") == "Buy" else "SHORT"
-        sym = p.get("symbol", "")
-        if sym.endswith("USDT"):
-            sym = sym[:-4]
+        sym = _base_from_symbol(p.get("symbol", ""))
         lev = p.get("leverage")
         entry = p.get("entryPrice") or p.get("avgPrice")
         text = f"{side} {sym}"
@@ -4178,6 +5875,80 @@ async def auto_stop_save(cb: types.CallbackQuery, state: FSMContext):
 
 
 @dp.callback_query(F.data == "opt_ai")
+async def ai_menu(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🧠 AI-Советник", callback_data="ai_trades")],
+            [InlineKeyboardButton(text="📊 Мои привычки", callback_data="ai_habits")],
+            [InlineKeyboardButton(text="🔔 Уведомления", callback_data="ai_notif")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")],
+        ]
+    )
+    await cb.message.answer("Что тебя интересует?", reply_markup=with_back(kb))
+
+
+@dp.callback_query(F.data == "ai_coin")
+async def ai_coin_prompt(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    await cb.message.answer("Введи тикер монеты (например, BTC):")
+    await state.set_state(AICoinState.enter_symbol)
+
+
+@dp.message(AICoinState.enter_symbol)
+async def ai_coin_analyze(msg: types.Message, state: FSMContext):
+    raw = (msg.text or "").strip().upper()
+    base = _base_from_symbol(raw)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
+    )
+    price = await fetch_price(base)
+    if price is None:
+        await msg.answer(
+            f"❌ Монета {base} не найдена. Убедитесь, что она торгуется на Bybit и введите корректный тикер.",
+            reply_markup=with_back(kb),
+        )
+        await state.clear()
+        return
+    await msg.answer("💬 Идёт анализ…")
+    async with ChatActionSender.typing(bot, msg.chat.id):
+        vol_line, vol_note, vol_short = await _volume_24h(base)
+        trend_text, d_res, h_res = await _analyze_micro_trend(base, "LONG", vol_short)
+        rec_block, verdict_line, trend_bias = format_trend_recommendations(d_res, h_res)
+        levels_block, supports, resistances = await _entry_exit_levels(base, price)
+        zone_reco, zone_dir = await _sr_trade_reco(base, supports, resistances, bias=trend_bias)
+        if zone_dir and trend_bias and (
+            (zone_dir == "Short" and trend_bias == "up")
+            or (zone_dir == "Long" and trend_bias == "down")
+        ):
+            zone_word = "сопротивления" if zone_dir == "Short" else "поддержки"
+            trend_word = "восходящие" if trend_bias == "up" else "нисходящие"
+            verdict_line = (
+                f"⚠️ Вердикт: Цена у {zone_word}. Несмотря на {trend_word} тренды, "
+                f"лучше ждать разворота и искать вход в {zone_dir}."
+            )
+        vol_block = "\n".join(filter(None, [vol_line, vol_note]))
+        price_line = f"💰 Текущая цена: {fmt_price(price)}"
+        trend_block = price_line + "\n\n" + trend_text
+        if vol_block:
+            trend_block += f"\n\n{vol_block}"
+        trend_block += f"\n\n{rec_block}\n{verdict_line}"
+        if levels_block:
+            trend_block += f"\n\n{levels_block}"
+        if zone_reco:
+            trend_block += f"\n\n{zone_reco}"
+        advice = await _build_ai_advice(msg.from_user.id, [], 0, 0, 0, base)
+        await msg.answer(trend_block + "\n\n" + advice, reply_markup=with_back(kb))
+        if supports and resistances:
+            await _send_sr_charts(msg.chat.id, base, entry=price)
+    await state.clear()
+
+
+@dp.callback_query(F.data == "ai_trades")
 async def ai_advisor_list(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     if not await require_basic(cb.message, cb.from_user.id):
@@ -4190,26 +5961,34 @@ async def ai_advisor_list(cb: types.CallbackQuery, state: FSMContext):
             (uid,),
         ).fetchall()
     if not rows:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")]])
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="🤖 Проанализировать монету", callback_data="ai_coin")],
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")],
+            ]
+        )
         await cb.message.answer("У тебя нет активных сделок.", reply_markup=with_back(kb))
         return
     buttons = []
     for i, (tid, sym, t_type, sigs, stars, lev) in enumerate(rows, 1):
-        total = stars if stars is not None else sum(SIGNAL_STARS.get(s, 0) for s in (sigs or "").split(";") if s)
+        total = stars if stars is not None else sum(
+            SIGNAL_STARS.get(s, 0) for s in (sigs or "").split(";") if s
+        )
         lev_str = fmt_leverage(lev) if t_type.lower() != "spot" else ""
         label = f"{i}. {sym} / {t_type.capitalize()}"
         if lev_str:
             label += f" / {lev_str}"
         label += f" / +{total}⭐️"
         buttons.append([
-            InlineKeyboardButton(text=label, callback_data=f"ai_{tid}")
+            InlineKeyboardButton(text=label, callback_data=f"aix_{tid}")
         ])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")])
+    buttons.append([InlineKeyboardButton(text="🤖 Проанализировать монету", callback_data="ai_coin")])
+    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")])
     kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
     await cb.message.answer("Выбери сделку для анализа:", reply_markup=kb)
 
 
-@dp.callback_query(lambda c: c.data.startswith("ai_"))
+@dp.callback_query(lambda c: c.data.startswith("aix_"))
 async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     if not await require_basic(cb.message, cb.from_user.id):
@@ -4218,14 +5997,14 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT signals, signal_stars, risk_percent FROM trades "
+            "SELECT symbol, trade_type, leverage, signals, signal_stars, risk_percent FROM trades "
             "WHERE id=? AND user_id=? AND exit_price IS NULL AND COALESCE(is_deleted,0)=0",
             (tid, uid),
         ).fetchone()
     if not row:
         await cb.message.answer("Сделка не найдена.")
         return
-    signals, stars, risk = row
+    symbol, t_type, lev, signals, stars, risk = row
     sig_list = [s for s in (signals or "").split(";") if s]
     if not sig_list or not risk:
         await cb.message.answer(
@@ -4233,33 +6012,186 @@ async def ai_advisor_run(cb: types.CallbackQuery, state: FSMContext):
         )
         await open_edit_trade(cb, tid, state)
         return
-    total, strong, _, _ = signal_stats(sig_list)
-    risk = float(risk)
-    if strong >= 2 and risk <= 10:
+    await cb.message.answer("💬 Идёт анализ…")
+    async with ChatActionSender.typing(bot, cb.message.chat.id):
+        total, strong, medium, weak = signal_stats(sig_list)
+        risk = float(risk)
+        price = await fetch_price(symbol)
+        parts = [
+            f"💰 Текущая цена: {fmt_price(price)}" if price else "",
+            f"⭐️ Звёзд: {total}",
+            f"🔥 Сильных сигналов: {strong}",
+            f"🟡 Средние: {medium}",
+            f"⚪️ Слабые: {weak}",
+            f"🛑 Риск по стопу: {risk:.1f}%",
+        ]
+        vol_line, vol_note, vol_short = await _volume_24h(symbol)
+        trend_text, d_res, h_res = await _analyze_micro_trend(symbol, t_type, vol_short)
+        rec_block, verdict_line, trend_bias = format_trend_recommendations(d_res, h_res)
+        levels_block, supports, resistances = await _entry_exit_levels(symbol, price)
+        zone_reco, zone_dir = await _sr_trade_reco(symbol, supports, resistances, bias=trend_bias)
+        if zone_dir and trend_bias and (
+            (zone_dir == "Short" and trend_bias == "up")
+            or (zone_dir == "Long" and trend_bias == "down")
+        ):
+            zone_word = "сопротивления" if zone_dir == "Short" else "поддержки"
+            trend_word = "восходящие" if trend_bias == "up" else "нисходящие"
+            verdict_line = (
+                f"⚠️ Вердикт: Цена у {zone_word}. Несмотря на {trend_word} тренды, "
+                f"лучше ждать разворота и искать вход в {zone_dir}."
+            )
+        vol_block = "\n".join(filter(None, [vol_line, vol_note]))
+        trend_block = trend_text
+        if vol_block:
+            trend_block += f"\n\n{vol_block}"
+        trend_block += f"\n\n{rec_block}\n{verdict_line}"
+        if levels_block:
+            trend_block += f"\n\n{levels_block}"
+        if zone_reco:
+            trend_block += f"\n\n{zone_reco}"
         text = (
-            "💡 Сетап оценён!\n\n"
-            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
-            f"— Риск: {risk:.1f}%\n\n"
-            "📊 Анализ:\n"
-            "✅ Отличное соотношение сигналов и риска.\n"
-            "💬 Совет: проверь объёмы на 4H, возможен откат."
+            "\n".join(parts)
+            + "\n\n"
+            + trend_block
+            + "\n\n"
+            + await _build_ai_advice(uid, sig_list, strong, total, risk, symbol)
         )
-    else:
-        text = (
-            "⚠️ Осторожно: слабый сетап\n\n"
-            f"— Сигналы: {strong} сильных | Общий рейтинг: {total}⭐️\n"
-            f"— Риск: {risk:.1f}%\n\n"
-            "📊 Анализ:\n"
-            "❌ Недостаточно подтверждающих сигналов.\n"
-            "🔺 Повышенный риск.\n"
-            "💬 Совет: дождись ретеста или усиливающего сигнала."
+        text += "\n\n" + _similar_trades_summary(
+            uid, symbol, t_type, lev, total, sig_list, risk
         )
-    kb = with_back(
-        InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
+        kb = with_back(
+            InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="ai_trades")]]
+            )
         )
+        await cb.message.answer(text, reply_markup=kb)
+        if supports and resistances:
+            await _send_sr_charts(cb.message.chat.id, symbol, entry=price)
+
+
+@dp.callback_query(F.data == "ai_habits")
+async def ai_habits(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    uid = cb.from_user.id
+    text = build_habits_report(uid)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
     )
-    await cb.message.answer(text, reply_markup=kb)
+    await cb.message.answer(text, reply_markup=with_back(kb))
+
+
+@dp.callback_query(F.data == "ai_notif")
+async def ai_notif_menu(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    await _show_ai_notif(cb)
+
+
+async def _show_ai_notif(cb: types.CallbackQuery) -> None:
+    uid = cb.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT habit_report_enabled, habit_report_time, habit_comment_enabled FROM user_settings WHERE user_id=?",
+            (uid,),
+        ).fetchone()
+    rep, time_str, comm = row if row else (0, "21:00", 0)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=("⏰ Автоотчёт о привычках: вкл" if rep else "⏰ Автоотчёт о привычках: выкл"),
+                    callback_data="ai_notif_toggle",
+                )
+            ],
+            [InlineKeyboardButton(text=f"⏱ Время отправки: {time_str}", callback_data="ai_notif_time")],
+            [
+                InlineKeyboardButton(
+                    text=("💬 Комментарии: вкл" if comm else "💬 Комментарии: выкл"),
+                    callback_data="ai_notif_comments",
+                )
+            ],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")],
+        ]
+    )
+    await cb.message.answer("Настройки уведомлений:", reply_markup=with_back(kb))
+
+
+@dp.callback_query(F.data == "ai_notif_toggle")
+async def ai_notif_toggle(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    uid = cb.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)", (uid,))
+        row = conn.execute(
+            "SELECT habit_report_enabled FROM user_settings WHERE user_id=?", (uid,)
+        ).fetchone()
+        enabled = row[0] if row else 0
+        conn.execute(
+            "UPDATE user_settings SET habit_report_enabled=? WHERE user_id=?",
+            (0 if enabled else 1, uid),
+        )
+        conn.commit()
+    await _show_ai_notif(cb)
+
+
+@dp.callback_query(F.data == "ai_notif_comments")
+async def ai_notif_comments(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    uid = cb.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)", (uid,))
+        row = conn.execute(
+            "SELECT habit_comment_enabled FROM user_settings WHERE user_id=?", (uid,)
+        ).fetchone()
+        enabled = row[0] if row else 0
+        conn.execute(
+            "UPDATE user_settings SET habit_comment_enabled=? WHERE user_id=?",
+            (0 if enabled else 1, uid),
+        )
+        conn.commit()
+    await _show_ai_notif(cb)
+
+
+@dp.callback_query(F.data == "ai_notif_time")
+async def ai_notif_time(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    await state.set_state(HabitNotifyState.time)
+    await cb.message.answer("Отправь время в формате ЧЧ:ММ")
+
+
+@dp.message(HabitNotifyState.time)
+async def ai_notif_set_time(msg: types.Message, state: FSMContext):
+    if not await require_basic(msg, msg.from_user.id):
+        await state.clear()
+        return
+    text = msg.text.strip()
+    try:
+        datetime.strptime(text, "%H:%M")
+    except ValueError:
+        await msg.answer("Введи время в формате ЧЧ:ММ.")
+        return
+    uid = msg.from_user.id
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("INSERT OR IGNORE INTO user_settings (user_id) VALUES (?)", (uid,))
+        conn.execute(
+            "UPDATE user_settings SET habit_report_time=? WHERE user_id=?",
+            (text, uid),
+        )
+        conn.commit()
+    await state.clear()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="ai_notif")]]
+    )
+    await msg.answer("Время автоотчёта обновлено.", reply_markup=with_back(kb))
 
 
 @dp.message(BybitKeyState.api_key)
@@ -4422,15 +6354,18 @@ async def pa_manual_add(cb: types.CallbackQuery, state: FSMContext):
 
 @dp.message(PriceAlertState.enter_symbol)
 async def pa_manual_symbol(msg: types.Message, state: FSMContext):
-    sym = msg.text.strip().upper()
-    if not sym:
+    raw = (msg.text or "").strip().upper()
+    base = _base_from_symbol(raw)
+    if not base:
         await msg.answer("Введите тикер.")
         return
-    price = await fetch_price(sym)
+    price = await fetch_price(base)
     if price is None:
-        await msg.answer("Тикер не найден на Bybit.")
+        await msg.answer(
+            f"Монета {base} не найдена. Убедитесь, что она торгуется на Bybit и введите корректный тикер."
+        )
         return
-    await state.update_data(pa_symbol=sym)
+    await state.update_data(pa_symbol=base)
     await msg.answer("Введи цену для уведомления:")
     await state.set_state(PriceAlertState.waiting_price)
 
@@ -5063,6 +6998,7 @@ async def main():
     asyncio.create_task(report_scheduler())
     asyncio.create_task(notification_scheduler())
     asyncio.create_task(auto_update_scheduler())
+    asyncio.create_task(habit_scheduler())
     await dp.start_polling(bot)
 
 
