@@ -1440,10 +1440,11 @@ async def sync_futures_positions(uid: int, positions: list[dict]) -> list[dict]:
                 new_pct = min(size / base_sz * 100, 100.0) if base_sz else 0.0
                 close_pct = max(old_pct - new_pct, 0)
                 exit_price = await fetch_price(sym)
+                lev_used = tr.get("leverage") or lev or 1
                 if side == "Long":
-                    pnl = ((exit_price - e_price) / e_price * 100) if exit_price else 0
+                    pnl = ((exit_price - e_price) / e_price * 100 * lev_used) if exit_price else 0
                 else:
-                    pnl = ((e_price - exit_price) / e_price * 100) if exit_price else 0
+                    pnl = ((e_price - exit_price) / e_price * 100 * lev_used) if exit_price else 0
                 profit = round(pnl * close_pct / 100, 2) if exit_price else 0
                 risk_close = (
                     calc_risk(e_price, tr["stop_loss"], close_pct, side, tr.get("leverage", 1))
@@ -1506,10 +1507,11 @@ async def sync_futures_positions(uid: int, positions: list[dict]) -> list[dict]:
         e_price = tr["entry_price"]
         pct = tr["percent"]
         exit_price = await fetch_price(sym)
+        lev_used = tr.get("leverage") or 1
         if side == "Long":
-            pnl = ((exit_price - e_price) / e_price * 100) if exit_price else 0
+            pnl = ((exit_price - e_price) / e_price * 100 * lev_used) if exit_price else 0
         else:
-            pnl = ((e_price - exit_price) / e_price * 100) if exit_price else 0
+            pnl = ((e_price - exit_price) / e_price * 100 * lev_used) if exit_price else 0
         profit = round(pnl * pct / 100, 2) if exit_price else 0
         close_data = dict(
             user_id=uid,
@@ -1650,16 +1652,14 @@ SIGNAL_OPTIONS = [
 ]
 
 NUMERIC_STAR_SIGNALS = {
-    "Дивергенция RSI на дневке",
-    "Дивергенция MACD на дневке",
     "Мелкая дивергенция RSI на 1H",
     "Мелкая дивергенция MACD на 1H",
-    "Пробой уровня с увеличением объёма",
-    "Треугольник (4H/D)",
-    "Клин / расходящийся треугольник",
+    "Закрытие свечи за границей Боллинджера (4H/D)",
+    "RSI пересекает 30 или 70 (дневка)",
+    "Важная поддержка / сопротивление (1H/4H)",
     "Дивергенция на объёмах (1H/4H)",
-    "Консолидация на уровне (3+ свечи)",
     "Поддержка от мувингов (200 EMA/SMA)",
+    "MACD пересекает сигнальную / 0 (4H/D)",
     "Поддержка от мувингов (50 / 100 EMA/SMA)",
 }
 
@@ -5275,7 +5275,6 @@ async def add_trade_confirm(cb: types.CallbackQuery, state: FSMContext):
         tid = await save_trade(cb, state)
         await state.clear()
         await ask_notifications(cb.from_user.id, tid, state)
-        await maybe_send_ai_advice(cb.from_user.id, tid)
 
 
 @dp.callback_query(TradeState.confirming, F.data == "confirm_force")
@@ -5284,7 +5283,6 @@ async def add_trade_force(cb: types.CallbackQuery, state: FSMContext):
     tid = await save_trade(cb, state)
     await state.clear()
     await ask_notifications(cb.from_user.id, tid, state)
-    await maybe_send_ai_advice(cb.from_user.id, tid)
 
 
 @dp.callback_query(TradeState.confirming, F.data == "confirm_cancel")
@@ -5489,9 +5487,10 @@ async def close_trade_finish(msg: types.Message, state: FSMContext):
         ).fetchone()
     # если процент не был задан, считаем, что изначально открыто 100%
     percent = percent if percent is not None else 100.0
+    leverage = lev or 1
     pnl = ((exit_price - entry_price) / entry_price) * (
         100 if t_type.lower() in {"long", "spot"} else -100
-    )
+    ) * leverage
     profit = round(pnl * close_pct / 100, 2)
     exit_date = datetime.now().strftime("%Y-%m-%d")
     risk_close = calc_risk(entry_price, sl, close_pct, t_type, lev) if sl is not None else None
@@ -5752,7 +5751,6 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
         for p in positions:
             tid = save_imported_trade(uid, p)
             await ask_notifications(uid, tid, state)
-            await maybe_send_ai_advice(uid, tid)
         await state.clear()
         kb = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="optimization")]]
@@ -6255,7 +6253,6 @@ async def import_bybit_trade(cb: types.CallbackQuery, state: FSMContext):
         "✅ Сделка успешно импортирована с фьючерсного аккаунта Bybit!\nСтопы, цели и риск подтянуты автоматически. При необходимости отредактируй через \"📝 Изменить\" в текущих сделках."
     )
     await ask_notifications(cb.from_user.id, trade_id, state)
-    await maybe_send_ai_advice(cb.from_user.id, trade_id)
 
 
 @dp.callback_query(F.data == "opt_notify")
