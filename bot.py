@@ -3582,7 +3582,6 @@ async def show_trade_summary(uid: int, state: FSMContext):
 @dp.callback_query(TradeState.confirming, F.data == "signals_eval")
 async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    uid = cb.from_user.id
     data = await state.get_data()
     signals = data.get("signals", [])
     total, strong, medium, weak = signal_stats(signals)
@@ -3595,45 +3594,10 @@ async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
     ]
     if risk is not None:
         parts.append(f"🛑 Риск по стопу: {risk:.1f}%")
+    rec = _recommend_setup(strong, float(risk or 0))
     text = "\n".join(parts)
-    sub = get_subscription(uid)
-    if sub in {"basic", "pro"}:
-        symbol = data.get("symbol")
-        ttype = data.get("trade_type")
-        trend_text = ""
-        reco_block = ""
-        levels_block = ""
-        if symbol and ttype:
-            vol_line, vol_note, vol_short = await _volume_24h(symbol)
-            trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype, vol_short)
-            rec_block, verdict_line, trend_bias = format_trend_recommendations(d_res, h_res)
-            levels_block, supports, resistances = await _entry_exit_levels(symbol)
-            zone_reco, zone_dir = await _sr_trade_reco(symbol, supports, resistances, bias=trend_bias)
-            if zone_dir and trend_bias and (
-                (zone_dir == "Short" and trend_bias == "up")
-                or (zone_dir == "Long" and trend_bias == "down")
-            ):
-                zone_word = "сопротивления" if zone_dir == "Short" else "поддержки"
-                trend_word = "восходящие" if trend_bias == "up" else "нисходящие"
-                verdict_line = (
-                    f"⚠️ Вердикт: Цена у {zone_word}. Несмотря на {trend_word} тренды, "
-                    "текущая зона может стать как точкой разворота, так и пробоя. "
-                    "Работай только по подтверждённому сигналу."
-                )
-            vol_block = "\n".join(filter(None, [vol_line, vol_note]))
-            reco_block = ""
-            if vol_block:
-                reco_block += f"\n\n{vol_block}"
-            reco_block += f"\n\n{rec_block}\n{verdict_line}"
-            if levels_block:
-                reco_block += f"\n\n{levels_block}"
-            if zone_reco:
-                reco_block += f"\n\n{zone_reco}"
-        if trend_text:
-            text += "\n\n" + trend_text + reco_block
-        text += "\n\n" + await _build_ai_advice(uid, signals, strong, total, float(risk or 0), symbol)
-    else:
-        text += "\n\n🔐 Расширенный анализ доступен только с подпиской Basic. Сейчас отображён упрощённый анализ."
+    if rec:
+        text += "\n\n" + rec
     await cb.message.answer(text)
 
 
@@ -5272,17 +5236,15 @@ async def add_trade_confirm(cb: types.CallbackQuery, state: FSMContext):
         )
         await cb.message.answer(warn, reply_markup=kb)
     else:
-        tid = await save_trade(cb, state)
-        await state.clear()
-        await ask_notifications(cb.from_user.id, tid, state)
+        await save_trade(cb, state)
+        await go_home(cb.from_user.id, state)
 
 
 @dp.callback_query(TradeState.confirming, F.data == "confirm_force")
 async def add_trade_force(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    tid = await save_trade(cb, state)
-    await state.clear()
-    await ask_notifications(cb.from_user.id, tid, state)
+    await save_trade(cb, state)
+    await go_home(cb.from_user.id, state)
 
 
 @dp.callback_query(TradeState.confirming, F.data == "confirm_cancel")
