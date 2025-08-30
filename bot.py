@@ -2062,9 +2062,21 @@ async def notif_pref_stag(cb: types.CallbackQuery):
 async def show_manual_alerts(uid: int, message: types.Message) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1",
+            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1 ORDER BY id",
             (uid,),
         ).fetchall()
+
+    if not rows:
+        text = "🔔 Вне-сделочные уведомления:\nУ тебя нет вне-сделочных уведомлений."
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Добавить уведомление", callback_data="pa_manual_add")],
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_notify")],
+            ]
+        )
+        await message.answer(text, reply_markup=with_back(kb))
+        return
+
     lines = ["🔔 Вне-сделочные уведомления:"]
     buttons: list[list[InlineKeyboardButton]] = []
     for i, (aid, sym, price, mode, npct) in enumerate(rows, 1):
@@ -2074,13 +2086,10 @@ async def show_manual_alerts(uid: int, message: types.Message) -> None:
             InlineKeyboardButton(text=f"✏ {price}", callback_data=f"pa_edit_{aid}"),
             InlineKeyboardButton(text="🗑", callback_data=f"pa_del_{aid}"),
         ])
-    if rows:
-        buttons.append([InlineKeyboardButton(text="🔕 Отключить все", callback_data="pa_manual_disable_all")])
+    buttons.append([InlineKeyboardButton(text="🔕 Отключить все", callback_data="pa_manual_disable_all")])
     buttons.append([InlineKeyboardButton(text="➕ Добавить уведомление", callback_data="pa_manual_add")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="opt_notify")])
     kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
-    if not rows:
-        lines.append("У тебя нет вне-сделочных уведомлений.")
     await message.answer("\n".join(lines), reply_markup=kb)
 
 
