@@ -20,6 +20,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.utils.chat_action import ChatActionSender
+from aiogram.exceptions import TelegramConflictError
 from io import BytesIO
 
 import pandas as pd
@@ -6987,12 +6988,26 @@ async def charts(cb: types.CallbackQuery, state: FSMContext):
 
 # ---------- RUN ----------
 async def main():
+    # Ensure no other polling instance is active and drop pending updates
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.get_updates(limit=1, timeout=1)
+    except TelegramConflictError:
+        logging.error("Another bot instance is already running. Exiting.")
+        return
+    except Exception:
+        pass
+
     asyncio.create_task(reminder_scheduler())
     asyncio.create_task(report_scheduler())
     asyncio.create_task(notification_scheduler())
     asyncio.create_task(auto_update_scheduler())
     asyncio.create_task(habit_scheduler())
-    await dp.start_polling(bot)
+
+    try:
+        await dp.start_polling(bot)
+    except TelegramConflictError:
+        logging.error("Another bot instance is already running. Exiting.")
 
 
 if __name__ == "__main__":
