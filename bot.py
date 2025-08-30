@@ -3582,23 +3582,42 @@ async def show_trade_summary(uid: int, state: FSMContext):
 @dp.callback_query(TradeState.confirming, F.data == "signals_eval")
 async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     data = await state.get_data()
     signals = data.get("signals", [])
     total, strong, medium, weak = signal_stats(signals)
     risk = data.get("risk")
+    risk_val = float(risk) if risk is not None else 0.0
+    sig_names = ", ".join(signals) if signals else "—"
+
+    if risk_val > 60 and strong < 2:
+        analysis = "❌ Сетап опасный. Я бы не входил. Подожди подтверждений."
+    elif 30 <= risk_val <= 50 and strong >= 2:
+        analysis = (
+            "⚠️ Сетап нестабильный, но может выстрелить. Входи только частично и со стопом."
+        )
+    elif risk_val < 30 and strong >= 3:
+        analysis = (
+            "✅ Сетап сильный. Хороший шанс на профит. Следи за объёмами."
+        )
+    else:
+        analysis = (
+            "🤔 Пока выглядит слабо. Я бы подождал более чётких сигналов."
+        )
+    rec = _recommend_setup(strong, risk_val)
     parts = [
         f"⭐️ Звёзд: {total}",
-        f"🔥 Сильных сигналов: {strong}",
-        f"🟡 Средние: {medium}",
-        f"⚪️ Слабые: {weak}",
+        f"🔥 Сильные: {strong} | 🟡 Средние: {medium} | ⚪️ Слабые: {weak}",
     ]
     if risk is not None:
-        parts.append(f"🛑 Риск по стопу: {risk:.1f}%")
-    rec = _recommend_setup(strong, float(risk or 0))
-    text = "\n".join(parts)
+        parts.append(f"🛑 Риск по стопу: {risk_val:.1f}%")
+    parts.append(f"📈 Общий рейтинг: {total}⭐️")
+    parts.append(f"📍 Сигналы в сделке: {sig_names}")
+    parts.extend(["", "📊 Анализ:", analysis])
     if rec:
-        text += "\n\n" + rec
-    await cb.message.answer(text)
+        parts.extend(["", rec])
+    await cb.message.answer("\n".join(parts))
 
 
 async def save_trade(cb: types.CallbackQuery, state: FSMContext) -> int:
