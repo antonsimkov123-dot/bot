@@ -1925,7 +1925,7 @@ async def process_notifications(uid: int) -> None:
 
     with sqlite3.connect(DB_PATH) as conn:
         man_rows = conn.execute(
-            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1 AND COALESCE(triggered,0)=0",
+            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1",
             (uid,),
         ).fetchall()
     for aid, sym, target, mode, npct in man_rows:
@@ -2001,7 +2001,7 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
             (uid,),
         ).fetchall()
         manual_cnt = conn.execute(
-            "SELECT COUNT(*) FROM price_alerts WHERE user_id=? AND manual=1 AND COALESCE(triggered,0)=0",
+            "SELECT COUNT(*) FROM price_alerts WHERE user_id=? AND manual=1",
             (uid,),
         ).fetchone()[0]
         prefs = conn.execute(
@@ -2062,7 +2062,7 @@ async def notif_pref_stag(cb: types.CallbackQuery):
 async def show_manual_alerts(uid: int, message: types.Message) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1 AND COALESCE(triggered,0)=0",
+            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1",
             (uid,),
         ).fetchall()
     lines = ["🔔 Вне-сделочные уведомления:"]
@@ -2290,7 +2290,7 @@ async def notification_scheduler():
             uids.update(
                 row[0]
                 for row in conn.execute(
-                    "SELECT DISTINCT user_id FROM price_alerts WHERE manual=1 AND COALESCE(triggered,0)=0"
+                    "SELECT DISTINCT user_id FROM price_alerts WHERE manual=1"
                 ).fetchall()
             )
         for uid in uids:
