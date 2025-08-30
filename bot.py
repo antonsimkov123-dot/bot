@@ -2003,10 +2003,6 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
             "SELECT COUNT(*) FROM price_alerts WHERE user_id=? AND manual=1 AND triggered=0",
             (uid,),
         ).fetchone()[0]
-        auto_row = conn.execute(
-            "SELECT update_time, period_days FROM auto_updates WHERE user_id=?",
-            (uid,),
-        ).fetchone()
         prefs = conn.execute(
             "SELECT notify_stagnation FROM user_settings WHERE user_id=?",
             (uid,),
@@ -2034,11 +2030,6 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
             callback_data="pa_manual_list",
         )
     ])
-    auto_text = "⏱ Автообновление"
-    if auto_row:
-        mode = "ежедневно" if auto_row[1] == 1 else "еженедельно"
-        auto_text += f" ({mode} {auto_row[0]})"
-    buttons.append([InlineKeyboardButton(text=auto_text, callback_data="auto_sync")])
     if rows:
         buttons.append([InlineKeyboardButton(text="🔕 Выключить все", callback_data="notif_disable_all")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")])
@@ -2111,7 +2102,7 @@ async def auto_sync_cb(cb: types.CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="🕐 Ежедневно", callback_data="aus_daily")],
             [InlineKeyboardButton(text="📅 Еженедельно", callback_data="aus_weekly")],
             [InlineKeyboardButton(text="❌ Отключить автообновление", callback_data="aus_off")],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_notify")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")],
         ]
     )
     with sqlite3.connect(DB_PATH) as conn:
@@ -2166,7 +2157,7 @@ async def auto_sync_set_time(msg: types.Message, state: FSMContext):
     await state.clear()
     mode = "ежедневно" if period == 1 else "еженедельно"
     await msg.answer(f"✅ Автообновление включено: {mode} в {time_str}")
-    await show_notifications_menu(uid, msg)
+    await msg.answer("🔧 Оптимизация:", reply_markup=optimization_menu_kb(uid))
 
 
 @dp.callback_query(F.data == "aus_off")
@@ -2180,7 +2171,7 @@ async def auto_sync_off(cb: types.CallbackQuery, state: FSMContext):
         conn.commit()
     await state.clear()
     await cb.message.answer("❌ Автообновление отключено")
-    await show_notifications_menu(uid, cb.message)
+    await cb.message.answer("🔧 Оптимизация:", reply_markup=optimization_menu_kb(uid))
 
 
 async def run_auto_update(uid: int) -> bool:
@@ -2409,6 +2400,7 @@ def optimization_menu_kb(uid: int) -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton(text="🤖 Автотрейдинг по стратегии", callback_data="opt_autotrade")],
             [InlineKeyboardButton(text=auto_text, callback_data="opt_toggle")],
+            [InlineKeyboardButton(text="⏱ Автообновление", callback_data="auto_sync")],
             [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")],
         ]
     )
