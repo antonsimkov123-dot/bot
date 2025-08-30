@@ -2398,7 +2398,7 @@ def optimization_menu_kb(uid: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🛠️ Авторасчёт стопов", callback_data="opt_stops"),
                 InlineKeyboardButton(text="📬 Уведомления", callback_data="opt_notify"),
             ],
-            [InlineKeyboardButton(text="🤖 Автотрейдинг по стратегии", callback_data="opt_autotrade")],
+            [InlineKeyboardButton(text="🤖 Автотрейдинг", callback_data="opt_autotrade")],
             [InlineKeyboardButton(text=auto_text, callback_data="opt_toggle")],
             [InlineKeyboardButton(text="⏱ Автообновление", callback_data="auto_sync")],
             [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")],
