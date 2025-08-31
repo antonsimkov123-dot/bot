@@ -110,6 +110,15 @@ TREND_LEVELS = {"global": "Глобальный", "local": "Локальный",
 
 BAND_PCT = {"60": 0.004, "240": 0.006, "D": 0.015}
 
+# promo codes and their expiration dates (YYYY-MM-DD)
+PROMO_CODES = {
+    "BASICSEP25": "2025-09-30",
+    "CLGIFT2025": "2025-12-31",
+    "2MONTHACCESS": "2030-01-01",
+    "MARKETLENS1000": "2030-01-01",
+    "ILYAACCESS": "2030-01-01",
+}
+
 # -- Recommendation thresholds
 MIN_CLOSE_OUTSIDE_ATR = 0.25  # пробой, если закрытие за зоной на долю ATR
 RETEST_WINDOW_BARS = 5        # количество свечей для поиска ретеста
@@ -213,6 +222,7 @@ def init_db() -> None:
             user_id INTEGER PRIMARY KEY,
             is_automation_enabled INTEGER DEFAULT 0,
             subscription TEXT DEFAULT 'none',
+            sub_expires TEXT,
             notify_stagnation INTEGER DEFAULT 1,
             notify_targets INTEGER DEFAULT 1,
             notify_risk INTEGER DEFAULT 1,
@@ -235,6 +245,14 @@ def init_db() -> None:
             near_pct REAL,
             triggered INTEGER DEFAULT 0,
             manual INTEGER DEFAULT 0
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS promo_codes (
+            code TEXT PRIMARY KEY,
+            expires_at TEXT
         )
         """
     )
@@ -306,6 +324,9 @@ def add_missing_columns() -> None:
             cur.execute(
                 "ALTER TABLE user_settings ADD COLUMN subscription TEXT DEFAULT 'none'"
             )
+            conn.commit()
+        if "sub_expires" not in us_cols:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN sub_expires TEXT")
             conn.commit()
         if "notify_stagnation" not in us_cols:
             cur.execute("ALTER TABLE user_settings ADD COLUMN notify_stagnation INTEGER DEFAULT 1")
@@ -407,6 +428,18 @@ def add_missing_columns() -> None:
 
 init_db()
 add_missing_columns()
+def seed_promo_codes() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        for code, exp in PROMO_CODES.items():
+            cur.execute(
+                "INSERT OR IGNORE INTO promo_codes(code, expires_at) VALUES (?,?)",
+                (code, exp),
+            )
+        conn.commit()
+
+
+seed_promo_codes()
 
 # ---------- BOT ----------
 bot = Bot(BOT_TOKEN, parse_mode="HTML")
@@ -427,17 +460,34 @@ async def is_subscribed(uid: int) -> bool:
 def get_subscription(uid: int) -> str:
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT subscription FROM user_settings WHERE user_id=?", (uid,)
+            "SELECT subscription, sub_expires FROM user_settings WHERE user_id=?",
+            (uid,),
         ).fetchone()
-    return row[0] if row and row[0] else "none"
+    if not row:
+        return "none"
+    sub, exp = row
+    if sub in {"basic", "pro"} and exp:
+        try:
+            if datetime.fromisoformat(exp) < datetime.now():
+                set_subscription(uid, "none")
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute(
+                        "UPDATE user_settings SET sub_expires=NULL WHERE user_id=?",
+                        (uid,),
+                    )
+                    conn.commit()
+                return "none"
+        except ValueError:
+            pass
+    return sub if sub else "none"
 
 
-def set_subscription(uid: int, sub: str) -> None:
+def set_subscription(uid: int, sub: str, expires: datetime | None = None) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT INTO user_settings (user_id, subscription) VALUES (?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET subscription=excluded.subscription",
-            (uid, sub),
+            "INSERT INTO user_settings (user_id, subscription, sub_expires) VALUES (?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET subscription=excluded.subscription, sub_expires=excluded.sub_expires",
+            (uid, sub, expires.isoformat() if expires else None),
         )
         conn.commit()
 
@@ -544,6 +594,10 @@ class ClearAllState(StatesGroup):
 
 class SubscriptionState(StatesGroup):
     waiting_user = State()
+
+
+class PromoState(StatesGroup):
+    waiting_code = State()
 
 
 class AutoReportState(StatesGroup):
@@ -5663,11 +5717,58 @@ async def reports(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "optimization")
 async def optimization_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_basic(cb.message, cb.from_user.id):
+    uid = cb.from_user.id
+    if not await require_subscription(cb.message, uid):
+        return
+    if get_subscription(uid) not in {"basic", "pro"}:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔑 Ввести промокод", callback_data="enter_promo")]]
+        )
+        await cb.message.answer(
+            "🔒 Раздел доступен только с подпиской Basic (от 1000₽)\n💬 Или введите промокод ниже 👇",
+            reply_markup=kb,
+        )
         return
     await state.clear()
-    await cb.message.answer(
-        "🔧 Оптимизация:", reply_markup=optimization_menu_kb(cb.from_user.id)
+    await cb.message.answer("🔧 Оптимизация:", reply_markup=optimization_menu_kb(uid))
+
+
+@dp.callback_query(F.data == "enter_promo")
+async def promo_start(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.set_state(PromoState.waiting_code)
+    await cb.message.answer("Введите промокод:")
+
+
+@dp.message(PromoState.waiting_code)
+async def promo_apply(message: types.Message, state: FSMContext):
+    code = message.text.strip().upper()
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT expires_at FROM promo_codes WHERE code=?",
+            (code,),
+        ).fetchone()
+    if not row:
+        await message.answer("❌ Промокод недействителен или устарел.")
+        await state.clear()
+        return
+    exp = row[0]
+    if exp:
+        try:
+            if datetime.fromisoformat(exp) < datetime.now():
+                await message.answer("❌ Промокод недействителен или устарел.")
+                await state.clear()
+                return
+        except ValueError:
+            pass
+    expires = datetime.now() + timedelta(days=60)
+    set_subscription(message.from_user.id, "basic", expires)
+    await message.answer(
+        f"✅ Промокод активирован! Подписка Basic действует до {expires.strftime('%d.%m.%Y')}"
+    )
+    await state.clear()
+    await message.answer(
+        "🔧 Оптимизация:", reply_markup=optimization_menu_kb(message.from_user.id)
     )
 
 
