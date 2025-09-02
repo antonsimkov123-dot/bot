@@ -2401,6 +2401,7 @@ def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
     ]
     if uid == ADMIN_ID:
         rows.append([InlineKeyboardButton(text="🛂 Управление подпиской", callback_data="sub_manage")])
+    rows.append([InlineKeyboardButton(text="📚 Помощь / FAQ", callback_data="help_faq")])
     rows.append([InlineKeyboardButton(text=opt_text, callback_data="optimization")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -2842,6 +2843,27 @@ async def rating_detail(cb: types.CallbackQuery):
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="rating")]]
     )
     await cb.message.answer(text, reply_markup=with_back(kb))
+
+
+@dp.callback_query(F.data == "help_faq")
+async def help_faq_menu(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.clear()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📄 Текстовые гайды", callback_data="guide_text")],
+            [InlineKeyboardButton(text="🎬 Видеогайды", callback_data="guide_video")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
+        ]
+    )
+    await cb.message.answer(
+        "📖 Выберите, какие гайды вам нужны:", reply_markup=with_back(kb)
+    )
+
+
+@dp.callback_query(F.data.in_({"guide_text", "guide_video"}))
+async def guides_placeholder(cb: types.CallbackQuery):
+    await cb.answer("Раздел в разработке", show_alert=True)
 @dp.callback_query(F.data == "trades_menu")
 async def trades_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
