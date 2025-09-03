@@ -2861,7 +2861,26 @@ async def help_faq_menu(cb: types.CallbackQuery, state: FSMContext):
     )
 
 
-@dp.callback_query(F.data.in_({"guide_text", "guide_video"}))
+@dp.callback_query(F.data == "guide_text")
+async def send_text_guides(cb: types.CallbackQuery):
+    await cb.answer()
+    await bot.send_document(
+        cb.from_user.id,
+        FSInputFile("Подписка Free.docx"),
+        caption="📄 Гайд по Free-подписке",
+    )
+    await bot.send_document(
+        cb.from_user.id,
+        FSInputFile("Подписка Basic.docx"),
+        caption="📄 Гайд по Basic-подписке",
+    )
+    await bot.send_message(
+        cb.from_user.id,
+        "📚 Это текстовые гайды по функциям бота в разных подписках.",
+    )
+
+
+@dp.callback_query(F.data == "guide_video")
 async def guides_placeholder(cb: types.CallbackQuery):
     await cb.answer("Раздел в разработке", show_alert=True)
 @dp.callback_query(F.data == "trades_menu")
