@@ -493,16 +493,19 @@ def set_subscription(uid: int, sub: str, expires: datetime | None = None) -> Non
 
 
 async def require_subscription(message: types.Message, uid: int) -> bool:
-    if not await is_subscribed(uid) or get_subscription(uid) == "none":
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[[InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")]]
-        )
-        await message.answer(
-            "❌ Доступно только для подписчиков. Подпишись на канал @CryptoLens_MarketMinds и нажми кнопку «🔄 Проверить подписку».",
-            reply_markup=kb,
-        )
-        return False
-    return True
+    if get_subscription(uid) != "none":
+        return True
+    if await is_subscribed(uid):
+        set_subscription(uid, "free")
+        return True
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")]]
+    )
+    await message.answer(
+        "❌ Доступно только для подписчиков. Подпишись на канал @CryptoLens_MarketMinds и нажми кнопку «🔄 Проверить подписку».",
+        reply_markup=kb,
+    )
+    return False
 
 
 async def require_basic(message: types.Message, uid: int) -> bool:
@@ -526,10 +529,8 @@ async def require_pro(message: types.Message, uid: int) -> bool:
 @dp.callback_query(F.data == "check_sub")
 async def recheck_subscription(cb: types.CallbackQuery):
     await cb.answer()
-    if await is_subscribed(cb.from_user.id):
+    if await require_subscription(cb.message, cb.from_user.id):
         await cb.message.answer("✅ Подписка подтверждена. Теперь можно пользоваться этой функцией.")
-    else:
-        await require_subscription(cb.message, cb.from_user.id)
 
 
 def is_automation_enabled(uid: int) -> bool:
