@@ -20,6 +20,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import StatesGroup, State
 from aiogram.utils.chat_action import ChatActionSender
+from aiogram.exceptions import TelegramConflictError
 from io import BytesIO
 
 import pandas as pd
@@ -63,7 +64,7 @@ def add_labels(ax: plt.Axes, fmt: str = "{:.1f}") -> None:
         )
 
 # ---------- CONFIG ----------
-BOT_TOKEN = "8205192350:AAHUEmqDQK37-5D7dpcTUeMdpA6WpDACMkc"  # поменяй после теста!
+BOT_TOKEN = "8086138454:AAHTZGMDz5_CkNJSwmt9-9scFqO2Nuk12y0"  # поменяй после теста!
 DB_PATH = "trades.db"
 MULTI_SR_MODE = True  # переключатель множественных уровней поддержки/сопротивления
 SR_MAX_ZONES = 7  # максимум зон поддержки/сопротивления на график для каждой стороны
@@ -108,6 +109,15 @@ TREND_WINDOWS = {
 TREND_LEVELS = {"global": "Глобальный", "local": "Локальный", "scalp": "Скальп"}
 
 BAND_PCT = {"60": 0.004, "240": 0.006, "D": 0.015}
+
+# promo codes and their expiration dates (YYYY-MM-DD)
+PROMO_CODES = {
+    "BASICSEP25": "2025-09-30",
+    "CLGIFT2025": "2025-12-31",
+    "2MONTHACCESS": "2030-01-01",
+    "MARKETLENS1000": "2030-01-01",
+    "ILYAACCESS": "2030-01-01",
+}
 
 # -- Recommendation thresholds
 MIN_CLOSE_OUTSIDE_ATR = 0.25  # пробой, если закрытие за зоной на долю ATR
@@ -212,6 +222,7 @@ def init_db() -> None:
             user_id INTEGER PRIMARY KEY,
             is_automation_enabled INTEGER DEFAULT 0,
             subscription TEXT DEFAULT 'none',
+            sub_expires TEXT,
             notify_stagnation INTEGER DEFAULT 1,
             notify_targets INTEGER DEFAULT 1,
             notify_risk INTEGER DEFAULT 1,
@@ -234,6 +245,14 @@ def init_db() -> None:
             near_pct REAL,
             triggered INTEGER DEFAULT 0,
             manual INTEGER DEFAULT 0
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS promo_codes (
+            code TEXT PRIMARY KEY,
+            expires_at TEXT
         )
         """
     )
@@ -305,6 +324,9 @@ def add_missing_columns() -> None:
             cur.execute(
                 "ALTER TABLE user_settings ADD COLUMN subscription TEXT DEFAULT 'none'"
             )
+            conn.commit()
+        if "sub_expires" not in us_cols:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN sub_expires TEXT")
             conn.commit()
         if "notify_stagnation" not in us_cols:
             cur.execute("ALTER TABLE user_settings ADD COLUMN notify_stagnation INTEGER DEFAULT 1")
@@ -406,6 +428,18 @@ def add_missing_columns() -> None:
 
 init_db()
 add_missing_columns()
+def seed_promo_codes() -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        cur = conn.cursor()
+        for code, exp in PROMO_CODES.items():
+            cur.execute(
+                "INSERT OR IGNORE INTO promo_codes(code, expires_at) VALUES (?,?)",
+                (code, exp),
+            )
+        conn.commit()
+
+
+seed_promo_codes()
 
 # ---------- BOT ----------
 bot = Bot(BOT_TOKEN, parse_mode="HTML")
@@ -426,17 +460,34 @@ async def is_subscribed(uid: int) -> bool:
 def get_subscription(uid: int) -> str:
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
-            "SELECT subscription FROM user_settings WHERE user_id=?", (uid,)
+            "SELECT subscription, sub_expires FROM user_settings WHERE user_id=?",
+            (uid,),
         ).fetchone()
-    return row[0] if row and row[0] else "none"
+    if not row:
+        return "none"
+    sub, exp = row
+    if sub in {"basic", "pro"} and exp:
+        try:
+            if datetime.fromisoformat(exp) < datetime.now():
+                set_subscription(uid, "none")
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute(
+                        "UPDATE user_settings SET sub_expires=NULL WHERE user_id=?",
+                        (uid,),
+                    )
+                    conn.commit()
+                return "none"
+        except ValueError:
+            pass
+    return sub if sub else "none"
 
 
-def set_subscription(uid: int, sub: str) -> None:
+def set_subscription(uid: int, sub: str, expires: datetime | None = None) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "INSERT INTO user_settings (user_id, subscription) VALUES (?,?) "
-            "ON CONFLICT(user_id) DO UPDATE SET subscription=excluded.subscription",
-            (uid, sub),
+            "INSERT INTO user_settings (user_id, subscription, sub_expires) VALUES (?,?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET subscription=excluded.subscription, sub_expires=excluded.sub_expires",
+            (uid, sub, expires.isoformat() if expires else None),
         )
         conn.commit()
 
@@ -543,6 +594,10 @@ class ClearAllState(StatesGroup):
 
 class SubscriptionState(StatesGroup):
     waiting_user = State()
+
+
+class PromoState(StatesGroup):
+    waiting_code = State()
 
 
 class AutoReportState(StatesGroup):
@@ -1440,10 +1495,11 @@ async def sync_futures_positions(uid: int, positions: list[dict]) -> list[dict]:
                 new_pct = min(size / base_sz * 100, 100.0) if base_sz else 0.0
                 close_pct = max(old_pct - new_pct, 0)
                 exit_price = await fetch_price(sym)
+                lev_used = tr.get("leverage") or lev or 1
                 if side == "Long":
-                    pnl = ((exit_price - e_price) / e_price * 100) if exit_price else 0
+                    pnl = ((exit_price - e_price) / e_price * 100 * lev_used) if exit_price else 0
                 else:
-                    pnl = ((e_price - exit_price) / e_price * 100) if exit_price else 0
+                    pnl = ((e_price - exit_price) / e_price * 100 * lev_used) if exit_price else 0
                 profit = round(pnl * close_pct / 100, 2) if exit_price else 0
                 risk_close = (
                     calc_risk(e_price, tr["stop_loss"], close_pct, side, tr.get("leverage", 1))
@@ -1506,10 +1562,11 @@ async def sync_futures_positions(uid: int, positions: list[dict]) -> list[dict]:
         e_price = tr["entry_price"]
         pct = tr["percent"]
         exit_price = await fetch_price(sym)
+        lev_used = tr.get("leverage") or 1
         if side == "Long":
-            pnl = ((exit_price - e_price) / e_price * 100) if exit_price else 0
+            pnl = ((exit_price - e_price) / e_price * 100 * lev_used) if exit_price else 0
         else:
-            pnl = ((e_price - exit_price) / e_price * 100) if exit_price else 0
+            pnl = ((e_price - exit_price) / e_price * 100 * lev_used) if exit_price else 0
         profit = round(pnl * pct / 100, 2) if exit_price else 0
         close_data = dict(
             user_id=uid,
@@ -1627,7 +1684,7 @@ SIGNAL_OPTIONS = [
     ("Важная поддержка / сопротивление (D)", 4),
     ("Объёмный кластер на уровне", 4),
     ("Мелкая дивергенция RSI на 1H", 4),
-    ("Мелкая дивергенция MACD на 1H", 4),
+    ("Мелкая дивергенция MACD на 1H", 3),
     ("Пробой уровня с увеличением объёма", 3),
     ("Рост объёмов на пробое", 3),
     ("Пробой канала или трендовой", 3),
@@ -1648,6 +1705,18 @@ SIGNAL_OPTIONS = [
     ("Локальные уровни без объёма", 1),
     ("Поглощение на дневке", 1),
 ]
+
+NUMERIC_STAR_SIGNALS = {
+    "Мелкая дивергенция RSI на 1H",
+    "Мелкая дивергенция MACD на 1H",
+    "Закрытие свечи за границей Боллинджера (4H/D)",
+    "RSI пересекает 30 или 70 (дневка)",
+    "Важная поддержка / сопротивление (1H/4H)",
+    "Дивергенция на объёмах (1H/4H)",
+    "Поддержка от мувингов (200 EMA/SMA)",
+    "MACD пересекает сигнальную / 0 (4H/D)",
+    "Поддержка от мувингов (50 / 100 EMA/SMA)",
+}
 
 SIGNAL_STARS = {name: stars for name, stars in SIGNAL_OPTIONS}
 
@@ -1670,7 +1739,7 @@ SIGNALS_TEXT = (
     "⸻\n\n"
     "🟡 Средние сигналы:\n"
     "• Мелкая дивергенция RSI на 1H — ⭐️⭐️⭐️⭐️\n"
-    "• Мелкая дивергенция MACD на 1H — ⭐️⭐️⭐️⭐️\n"
+    "• Мелкая дивергенция MACD на 1H — ⭐️⭐️⭐️\n"
     "• Пробой уровня с увеличением объёма — ⭐️⭐️⭐️\n"
     "• Рост объёмов на пробое — ⭐️⭐️⭐️\n"
     "• Пробой канала или трендовой — ⭐️⭐️⭐️\n"
@@ -1694,9 +1763,9 @@ SIGNALS_TEXT = (
     "• Поглощение на дневке — ⭐️\n"
     "⸻\n\n"
     "📏 Шкала силы сигналов:\n"
-    "1–2 ⭐ — слабый\n"
-    "3–4 ⭐ — средний\n"
-    "5–6 ⭐ — сильный\n"
+    "1–2 ⭐️ — слабая\n"
+    "3–4 ⭐️ — средняя\n"
+    "5–6 ⭐️ — сильная\n"
     "⸻"
 )
 
@@ -1882,7 +1951,7 @@ async def process_notifications(uid: int) -> None:
             SELECT pa.id, t.symbol, t.trade_type, pa.price, pa.mode, pa.near_pct
             FROM price_alerts pa
             JOIN trades t ON pa.trade_id=t.id
-            WHERE t.user_id=? AND t.exit_price IS NULL AND pa.triggered=0 AND COALESCE(t.is_deleted,0)=0
+            WHERE t.user_id=? AND t.exit_price IS NULL AND COALESCE(pa.triggered,0)=0 AND COALESCE(t.is_deleted,0)=0
             """,
             (uid,),
         ).fetchall()
@@ -1910,7 +1979,7 @@ async def process_notifications(uid: int) -> None:
 
     with sqlite3.connect(DB_PATH) as conn:
         man_rows = conn.execute(
-            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1 AND triggered=0",
+            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1",
             (uid,),
         ).fetchall()
     for aid, sym, target, mode, npct in man_rows:
@@ -1986,13 +2055,9 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
             (uid,),
         ).fetchall()
         manual_cnt = conn.execute(
-            "SELECT COUNT(*) FROM price_alerts WHERE user_id=? AND manual=1 AND triggered=0",
+            "SELECT COUNT(*) FROM price_alerts WHERE user_id=? AND manual=1",
             (uid,),
         ).fetchone()[0]
-        auto_row = conn.execute(
-            "SELECT update_time, period_days FROM auto_updates WHERE user_id=?",
-            (uid,),
-        ).fetchone()
         prefs = conn.execute(
             "SELECT notify_stagnation FROM user_settings WHERE user_id=?",
             (uid,),
@@ -2020,11 +2085,6 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
             callback_data="pa_manual_list",
         )
     ])
-    auto_text = "⏱ Автообновление"
-    if auto_row:
-        mode = "ежедневно" if auto_row[1] == 1 else "еженедельно"
-        auto_text += f" ({mode} {auto_row[0]})"
-    buttons.append([InlineKeyboardButton(text=auto_text, callback_data="auto_sync")])
     if rows:
         buttons.append([InlineKeyboardButton(text="🔕 Выключить все", callback_data="notif_disable_all")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")])
@@ -2056,9 +2116,21 @@ async def notif_pref_stag(cb: types.CallbackQuery):
 async def show_manual_alerts(uid: int, message: types.Message) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1 AND triggered=0",
+            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1 ORDER BY id",
             (uid,),
         ).fetchall()
+
+    if not rows:
+        text = "🔔 Вне-сделочные уведомления:\nУ тебя нет вне-сделочных уведомлений."
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text="➕ Добавить уведомление", callback_data="pa_manual_add")],
+                [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_notify")],
+            ]
+        )
+        await message.answer(text, reply_markup=with_back(kb))
+        return
+
     lines = ["🔔 Вне-сделочные уведомления:"]
     buttons: list[list[InlineKeyboardButton]] = []
     for i, (aid, sym, price, mode, npct) in enumerate(rows, 1):
@@ -2068,13 +2140,10 @@ async def show_manual_alerts(uid: int, message: types.Message) -> None:
             InlineKeyboardButton(text=f"✏ {price}", callback_data=f"pa_edit_{aid}"),
             InlineKeyboardButton(text="🗑", callback_data=f"pa_del_{aid}"),
         ])
-    if rows:
-        buttons.append([InlineKeyboardButton(text="🔕 Отключить все", callback_data="pa_manual_disable_all")])
+    buttons.append([InlineKeyboardButton(text="🔕 Отключить все", callback_data="pa_manual_disable_all")])
     buttons.append([InlineKeyboardButton(text="➕ Добавить уведомление", callback_data="pa_manual_add")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="opt_notify")])
     kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
-    if not rows:
-        lines.append("У тебя нет вне-сделочных уведомлений.")
     await message.answer("\n".join(lines), reply_markup=kb)
 
 
@@ -2097,7 +2166,7 @@ async def auto_sync_cb(cb: types.CallbackQuery, state: FSMContext):
             [InlineKeyboardButton(text="🕐 Ежедневно", callback_data="aus_daily")],
             [InlineKeyboardButton(text="📅 Еженедельно", callback_data="aus_weekly")],
             [InlineKeyboardButton(text="❌ Отключить автообновление", callback_data="aus_off")],
-            [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_notify")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")],
         ]
     )
     with sqlite3.connect(DB_PATH) as conn:
@@ -2152,7 +2221,7 @@ async def auto_sync_set_time(msg: types.Message, state: FSMContext):
     await state.clear()
     mode = "ежедневно" if period == 1 else "еженедельно"
     await msg.answer(f"✅ Автообновление включено: {mode} в {time_str}")
-    await show_notifications_menu(uid, msg)
+    await msg.answer("🔧 Оптимизация:", reply_markup=optimization_menu_kb(uid))
 
 
 @dp.callback_query(F.data == "aus_off")
@@ -2166,7 +2235,7 @@ async def auto_sync_off(cb: types.CallbackQuery, state: FSMContext):
         conn.commit()
     await state.clear()
     await cb.message.answer("❌ Автообновление отключено")
-    await show_notifications_menu(uid, cb.message)
+    await cb.message.answer("🔧 Оптимизация:", reply_markup=optimization_menu_kb(uid))
 
 
 async def run_auto_update(uid: int) -> bool:
@@ -2278,13 +2347,13 @@ async def notification_scheduler():
             uids.update(
                 row[0]
                 for row in conn.execute(
-                    "SELECT DISTINCT t.user_id FROM price_alerts pa JOIN trades t ON pa.trade_id=t.id WHERE pa.triggered=0 AND t.exit_price IS NULL AND COALESCE(t.is_deleted,0)=0"
+                    "SELECT DISTINCT t.user_id FROM price_alerts pa JOIN trades t ON pa.trade_id=t.id WHERE COALESCE(pa.triggered,0)=0 AND t.exit_price IS NULL AND COALESCE(t.is_deleted,0)=0"
                 ).fetchall()
             )
             uids.update(
                 row[0]
                 for row in conn.execute(
-                    "SELECT DISTINCT user_id FROM price_alerts WHERE manual=1 AND triggered=0"
+                    "SELECT DISTINCT user_id FROM price_alerts WHERE manual=1"
                 ).fetchall()
             )
         for uid in uids:
@@ -2332,6 +2401,7 @@ def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
     ]
     if uid == ADMIN_ID:
         rows.append([InlineKeyboardButton(text="🛂 Управление подпиской", callback_data="sub_manage")])
+    rows.append([InlineKeyboardButton(text="📚 Помощь / FAQ", callback_data="help_faq")])
     rows.append([InlineKeyboardButton(text=opt_text, callback_data="optimization")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -2393,8 +2463,9 @@ def optimization_menu_kb(uid: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🛠️ Авторасчёт стопов", callback_data="opt_stops"),
                 InlineKeyboardButton(text="📬 Уведомления", callback_data="opt_notify"),
             ],
-            [InlineKeyboardButton(text="🤖 Автотрейдинг по стратегии", callback_data="opt_autotrade")],
             [InlineKeyboardButton(text=auto_text, callback_data="opt_toggle")],
+            [InlineKeyboardButton(text="⏱ Автообновление", callback_data="auto_sync")],
+            [InlineKeyboardButton(text="🤖 Автотрейдинг", callback_data="opt_autotrade")],
             [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")],
         ]
     )
@@ -2468,7 +2539,16 @@ def with_back(kb: InlineKeyboardMarkup) -> InlineKeyboardMarkup:
 
 def signals_keyboard() -> InlineKeyboardMarkup:
     buttons = [
-        [InlineKeyboardButton(text=f"{name} — {'⭐️'*stars}", callback_data=f"sig_{idx}")]
+        [
+            InlineKeyboardButton(
+                text=(
+                    f"{name} — {stars}⭐️"
+                    if name in NUMERIC_STAR_SIGNALS
+                    else f"{name} — {'⭐️'*stars}"
+                ),
+                callback_data=f"sig_{idx}",
+            )
+        ]
         for idx, (name, stars) in enumerate(SIGNAL_OPTIONS)
     ]
     buttons.append([InlineKeyboardButton(text="🛑 Завершить выбор", callback_data="signals_done")])
@@ -2763,6 +2843,27 @@ async def rating_detail(cb: types.CallbackQuery):
         inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="rating")]]
     )
     await cb.message.answer(text, reply_markup=with_back(kb))
+
+
+@dp.callback_query(F.data == "help_faq")
+async def help_faq_menu(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.clear()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📄 Текстовые гайды", callback_data="guide_text")],
+            [InlineKeyboardButton(text="🎬 Видеогайды", callback_data="guide_video")],
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")],
+        ]
+    )
+    await cb.message.answer(
+        "📖 Выберите, какие гайды вам нужны:", reply_markup=with_back(kb)
+    )
+
+
+@dp.callback_query(F.data.in_({"guide_text", "guide_video"}))
+async def guides_placeholder(cb: types.CallbackQuery):
+    await cb.answer("Раздел в разработке", show_alert=True)
 @dp.callback_query(F.data == "trades_menu")
 async def trades_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
@@ -3559,59 +3660,42 @@ async def show_trade_summary(uid: int, state: FSMContext):
 @dp.callback_query(TradeState.confirming, F.data == "signals_eval")
 async def evaluate_setup(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    uid = cb.from_user.id
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     data = await state.get_data()
     signals = data.get("signals", [])
     total, strong, medium, weak = signal_stats(signals)
     risk = data.get("risk")
+    risk_val = float(risk) if risk is not None else 0.0
+    sig_names = ", ".join(signals) if signals else "—"
+
+    if risk_val > 60 and strong < 2:
+        analysis = "❌ Сетап опасный. Я бы не входил. Подожди подтверждений."
+    elif 30 <= risk_val <= 50 and strong >= 2:
+        analysis = (
+            "⚠️ Сетап нестабильный, но может выстрелить. Входи только частично и со стопом."
+        )
+    elif risk_val < 30 and strong >= 3:
+        analysis = (
+            "✅ Сетап сильный. Хороший шанс на профит. Следи за объёмами."
+        )
+    else:
+        analysis = (
+            "🤔 Пока выглядит слабо. Я бы подождал более чётких сигналов."
+        )
+    rec = _recommend_setup(strong, risk_val)
     parts = [
         f"⭐️ Звёзд: {total}",
-        f"🔥 Сильных сигналов: {strong}",
-        f"🟡 Средние: {medium}",
-        f"⚪️ Слабые: {weak}",
+        f"🔥 Сильные: {strong} | 🟡 Средние: {medium} | ⚪️ Слабые: {weak}",
     ]
     if risk is not None:
-        parts.append(f"🛑 Риск по стопу: {risk:.1f}%")
-    text = "\n".join(parts)
-    sub = get_subscription(uid)
-    if sub in {"basic", "pro"}:
-        symbol = data.get("symbol")
-        ttype = data.get("trade_type")
-        trend_text = ""
-        reco_block = ""
-        levels_block = ""
-        if symbol and ttype:
-            vol_line, vol_note, vol_short = await _volume_24h(symbol)
-            trend_text, d_res, h_res = await _analyze_micro_trend(symbol, ttype, vol_short)
-            rec_block, verdict_line, trend_bias = format_trend_recommendations(d_res, h_res)
-            levels_block, supports, resistances = await _entry_exit_levels(symbol)
-            zone_reco, zone_dir = await _sr_trade_reco(symbol, supports, resistances, bias=trend_bias)
-            if zone_dir and trend_bias and (
-                (zone_dir == "Short" and trend_bias == "up")
-                or (zone_dir == "Long" and trend_bias == "down")
-            ):
-                zone_word = "сопротивления" if zone_dir == "Short" else "поддержки"
-                trend_word = "восходящие" if trend_bias == "up" else "нисходящие"
-                verdict_line = (
-                    f"⚠️ Вердикт: Цена у {zone_word}. Несмотря на {trend_word} тренды, "
-                    "текущая зона может стать как точкой разворота, так и пробоя. "
-                    "Работай только по подтверждённому сигналу."
-                )
-            vol_block = "\n".join(filter(None, [vol_line, vol_note]))
-            reco_block = ""
-            if vol_block:
-                reco_block += f"\n\n{vol_block}"
-            reco_block += f"\n\n{rec_block}\n{verdict_line}"
-            if levels_block:
-                reco_block += f"\n\n{levels_block}"
-            if zone_reco:
-                reco_block += f"\n\n{zone_reco}"
-        if trend_text:
-            text += "\n\n" + trend_text + reco_block
-        text += "\n\n" + await _build_ai_advice(uid, signals, strong, total, float(risk or 0), symbol)
-    else:
-        text += "\n\n🔐 Расширенный анализ доступен только с подпиской Basic. Сейчас отображён упрощённый анализ."
-    await cb.message.answer(text)
+        parts.append(f"🛑 Риск по стопу: {risk_val:.1f}%")
+    parts.append(f"📈 Общий рейтинг: {total}⭐️")
+    parts.append(f"📍 Сигналы в сделке: {sig_names}")
+    parts.extend(["", "📊 Анализ:", analysis])
+    if rec:
+        parts.extend(["", rec])
+    await cb.message.answer("\n".join(parts))
 
 
 async def save_trade(cb: types.CallbackQuery, state: FSMContext) -> int:
@@ -5249,19 +5333,15 @@ async def add_trade_confirm(cb: types.CallbackQuery, state: FSMContext):
         )
         await cb.message.answer(warn, reply_markup=kb)
     else:
-        tid = await save_trade(cb, state)
-        await state.clear()
-        await ask_notifications(cb.from_user.id, tid, state)
-        await maybe_send_ai_advice(cb.from_user.id, tid)
+        await save_trade(cb, state)
+        await go_home(cb.from_user.id, state)
 
 
 @dp.callback_query(TradeState.confirming, F.data == "confirm_force")
 async def add_trade_force(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    tid = await save_trade(cb, state)
-    await state.clear()
-    await ask_notifications(cb.from_user.id, tid, state)
-    await maybe_send_ai_advice(cb.from_user.id, tid)
+    await save_trade(cb, state)
+    await go_home(cb.from_user.id, state)
 
 
 @dp.callback_query(TradeState.confirming, F.data == "confirm_cancel")
@@ -5466,9 +5546,10 @@ async def close_trade_finish(msg: types.Message, state: FSMContext):
         ).fetchone()
     # если процент не был задан, считаем, что изначально открыто 100%
     percent = percent if percent is not None else 100.0
+    leverage = lev or 1
     pnl = ((exit_price - entry_price) / entry_price) * (
         100 if t_type.lower() in {"long", "spot"} else -100
-    )
+    ) * leverage
     profit = round(pnl * close_pct / 100, 2)
     exit_date = datetime.now().strftime("%Y-%m-%d")
     risk_close = calc_risk(entry_price, sl, close_pct, t_type, lev) if sl is not None else None
@@ -5658,11 +5739,58 @@ async def reports(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "optimization")
 async def optimization_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
-    if not await require_basic(cb.message, cb.from_user.id):
+    uid = cb.from_user.id
+    if not await require_subscription(cb.message, uid):
+        return
+    if get_subscription(uid) not in {"basic", "pro"}:
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[InlineKeyboardButton(text="🔑 Ввести промокод", callback_data="enter_promo")]]
+        )
+        await cb.message.answer(
+            "🔒 Раздел доступен только с подпиской Basic (от 1000₽)\n💬 Или введите промокод ниже 👇",
+            reply_markup=kb,
+        )
         return
     await state.clear()
-    await cb.message.answer(
-        "🔧 Оптимизация:", reply_markup=optimization_menu_kb(cb.from_user.id)
+    await cb.message.answer("🔧 Оптимизация:", reply_markup=optimization_menu_kb(uid))
+
+
+@dp.callback_query(F.data == "enter_promo")
+async def promo_start(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    await state.set_state(PromoState.waiting_code)
+    await cb.message.answer("Введите промокод:")
+
+
+@dp.message(PromoState.waiting_code)
+async def promo_apply(message: types.Message, state: FSMContext):
+    code = message.text.strip().upper()
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT expires_at FROM promo_codes WHERE code=?",
+            (code,),
+        ).fetchone()
+    if not row:
+        await message.answer("❌ Промокод недействителен или устарел.")
+        await state.clear()
+        return
+    exp = row[0]
+    if exp:
+        try:
+            if datetime.fromisoformat(exp) < datetime.now():
+                await message.answer("❌ Промокод недействителен или устарел.")
+                await state.clear()
+                return
+        except ValueError:
+            pass
+    expires = datetime.now() + timedelta(days=60)
+    set_subscription(message.from_user.id, "basic", expires)
+    await message.answer(
+        f"✅ Промокод активирован! Подписка Basic действует до {expires.strftime('%d.%m.%Y')}"
+    )
+    await state.clear()
+    await message.answer(
+        "🔧 Оптимизация:", reply_markup=optimization_menu_kb(message.from_user.id)
     )
 
 
@@ -5729,7 +5857,6 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
         for p in positions:
             tid = save_imported_trade(uid, p)
             await ask_notifications(uid, tid, state)
-            await maybe_send_ai_advice(uid, tid)
         await state.clear()
         kb = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="optimization")]]
@@ -6232,7 +6359,6 @@ async def import_bybit_trade(cb: types.CallbackQuery, state: FSMContext):
         "✅ Сделка успешно импортирована с фьючерсного аккаунта Bybit!\nСтопы, цели и риск подтянуты автоматически. При необходимости отредактируй через \"📝 Изменить\" в текущих сделках."
     )
     await ask_notifications(cb.from_user.id, trade_id, state)
-    await maybe_send_ai_advice(cb.from_user.id, trade_id)
 
 
 @dp.callback_query(F.data == "opt_notify")
@@ -6994,12 +7120,26 @@ async def charts(cb: types.CallbackQuery, state: FSMContext):
 
 # ---------- RUN ----------
 async def main():
+    # Ensure no other polling instance is active and drop pending updates
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+        await bot.get_updates(limit=1, timeout=1)
+    except TelegramConflictError:
+        logging.error("Another bot instance is already running. Exiting.")
+        return
+    except Exception:
+        pass
+
     asyncio.create_task(reminder_scheduler())
     asyncio.create_task(report_scheduler())
     asyncio.create_task(notification_scheduler())
     asyncio.create_task(auto_update_scheduler())
     asyncio.create_task(habit_scheduler())
-    await dp.start_polling(bot)
+
+    try:
+        await dp.start_polling(bot)
+    except TelegramConflictError:
+        logging.error("Another bot instance is already running. Exiting.")
 
 
 if __name__ == "__main__":
