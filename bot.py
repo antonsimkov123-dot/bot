@@ -2873,6 +2873,15 @@ async def send_text_guides(cb: types.CallbackQuery):
     await cb.answer()
     if not await require_subscription(cb.message, cb.from_user.id):
         return
+    await bot.send_message(
+        cb.from_user.id,
+        "📚 Это текстовые гайды по функциям бота в разных подписках.",
+    )
+    await bot.send_document(
+        cb.from_user.id,
+        FSInputFile("Как подключить bybit к боту.docx"),
+        caption="📎 Как подключить Bybit к боту",
+    )
     await bot.send_document(
         cb.from_user.id,
         FSInputFile("Подписка Free.docx"),
@@ -2882,10 +2891,6 @@ async def send_text_guides(cb: types.CallbackQuery):
         cb.from_user.id,
         FSInputFile("Подписка Basic.docx"),
         caption="📄 Гайд по Basic-подписке",
-    )
-    await bot.send_message(
-        cb.from_user.id,
-        "📚 Это текстовые гайды по функциям бота в разных подписках.",
     )
 
 
