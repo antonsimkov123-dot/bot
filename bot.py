@@ -493,15 +493,20 @@ def set_subscription(uid: int, sub: str, expires: datetime | None = None) -> Non
 
 
 async def require_subscription(message: types.Message, uid: int) -> bool:
-    if not await is_subscribed(uid) or get_subscription(uid) == "none":
+    sub = get_subscription(uid)
+    if not await is_subscribed(uid):
+        if sub == "free":
+            set_subscription(uid, "none")
         kb = InlineKeyboardMarkup(
             inline_keyboard=[[InlineKeyboardButton(text="🔄 Проверить подписку", callback_data="check_sub")]]
         )
         await message.answer(
-            "❌ Доступно только для подписчиков. Подпишись на канал @CryptoLens_MarketMinds и нажми кнопку «🔄 Проверить подписку».",
+            "❌ Доступно только для подписчиков. Подпишись на канал @CryptoLens_MarketMinds и нажми «🔄 Проверить подписку».",
             reply_markup=kb,
         )
         return False
+    if sub == "none":
+        set_subscription(uid, "free")
     return True
 
 
@@ -526,10 +531,8 @@ async def require_pro(message: types.Message, uid: int) -> bool:
 @dp.callback_query(F.data == "check_sub")
 async def recheck_subscription(cb: types.CallbackQuery):
     await cb.answer()
-    if await is_subscribed(cb.from_user.id):
+    if await require_subscription(cb.message, cb.from_user.id):
         await cb.message.answer("✅ Подписка подтверждена. Теперь можно пользоваться этой функцией.")
-    else:
-        await require_subscription(cb.message, cb.from_user.id)
 
 
 def is_automation_enabled(uid: int) -> bool:
@@ -2776,6 +2779,8 @@ async def build_profile_text(uid: int, include_balance: bool = False) -> str:
 @dp.callback_query(F.data == "profile")
 async def show_profile(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     await state.clear()
     text = await build_profile_text(cb.from_user.id, include_balance=True)
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="main_menu")]])
@@ -2848,6 +2853,8 @@ async def rating_detail(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "help_faq")
 async def help_faq_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     await state.clear()
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -2861,12 +2868,38 @@ async def help_faq_menu(cb: types.CallbackQuery, state: FSMContext):
     )
 
 
-@dp.callback_query(F.data.in_({"guide_text", "guide_video"}))
+@dp.callback_query(F.data == "guide_text")
+async def send_text_guides(cb: types.CallbackQuery):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
+    await bot.send_document(
+        cb.from_user.id,
+        FSInputFile("Подписка Free.docx"),
+        caption="📄 Гайд по Free-подписке",
+    )
+    await bot.send_document(
+        cb.from_user.id,
+        FSInputFile("Подписка Basic.docx"),
+        caption="📄 Гайд по Basic-подписке",
+    )
+    await bot.send_message(
+        cb.from_user.id,
+        "📚 Это текстовые гайды по функциям бота в разных подписках.",
+    )
+
+
+@dp.callback_query(F.data == "guide_video")
 async def guides_placeholder(cb: types.CallbackQuery):
+    if not await require_subscription(cb.message, cb.from_user.id):
+        await cb.answer()
+        return
     await cb.answer("Раздел в разработке", show_alert=True)
 @dp.callback_query(F.data == "trades_menu")
 async def trades_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     await state.clear()
     await cb.message.answer("📦 Сделки:", reply_markup=trades_menu_kb())
 
@@ -2874,6 +2907,8 @@ async def trades_menu(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "reminders")
 async def reminders_overview(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     await state.clear()
     await show_reminders_menu(cb.from_user.id, cb.message)
 
@@ -2881,6 +2916,8 @@ async def reminders_overview(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "add_reminder")
 async def reminder_start(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="reminders")]])
     await cb.message.answer(
         "Введите время напоминания (HH:MM):",
@@ -2891,6 +2928,9 @@ async def reminder_start(cb: types.CallbackQuery, state: FSMContext):
 
 @dp.message(ReminderState.entering_time)
 async def reminder_time(msg: types.Message, state: FSMContext):
+    if not await require_subscription(msg, msg.from_user.id):
+        await state.clear()
+        return
     if not is_time(msg.text):
         await msg.answer("Формат HH:MM")
         return
@@ -2911,6 +2951,8 @@ async def reminder_time(msg: types.Message, state: FSMContext):
 @dp.callback_query(ReminderState.choosing_period, lambda c: c.data.startswith("period_"))
 async def reminder_save(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     period = int(cb.data.split("_")[1])
     data = await state.get_data()
     t = datetime.strptime(data["remind_time"], "%H:%M").time()
@@ -2935,6 +2977,8 @@ async def reminder_save(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "auto_report")
 async def auto_report_start(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="reminders")]])
     await cb.message.answer(
         "Введите время автоотчёта (HH:MM):",
@@ -2945,6 +2989,9 @@ async def auto_report_start(cb: types.CallbackQuery, state: FSMContext):
 
 @dp.message(AutoReportState.entering_time)
 async def auto_report_time(msg: types.Message, state: FSMContext):
+    if not await require_subscription(msg, msg.from_user.id):
+        await state.clear()
+        return
     if not is_time(msg.text):
         await msg.answer("Формат HH:MM")
         return
@@ -2964,6 +3011,8 @@ async def auto_report_time(msg: types.Message, state: FSMContext):
 @dp.callback_query(AutoReportState.choosing_period, lambda c: c.data.startswith("arep_"))
 async def auto_report_save(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     choice = cb.data.split("_")[1]
     uid = cb.from_user.id
     if choice == "off":
@@ -2996,6 +3045,8 @@ async def auto_report_save(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "del_reminder")
 async def reminder_delete_list(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     await state.clear()
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
@@ -3019,6 +3070,8 @@ async def reminder_delete_list(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(ReminderDelState.choosing_reminder, lambda c: c.data.startswith("delr_"))
 async def reminder_delete_confirm(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     rid = int(cb.data.split("_")[1])
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
@@ -3048,6 +3101,8 @@ async def reminder_delete_confirm(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(ReminderDelState.confirming, F.data == "confirm_delr")
 async def reminder_delete(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     data = await state.get_data()
     rid = data.get("del_id")
     with sqlite3.connect(DB_PATH) as conn:
@@ -3091,6 +3146,8 @@ async def danger_day_start(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(DangerDayState.choosing_reason, lambda c: c.data.startswith("dng_"))
 async def danger_reason_chosen(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     code = cb.data.split("_")[1]
     reasons = {
         "emo": "Эмоционально нестабилен",
@@ -3115,6 +3172,9 @@ async def danger_reason_chosen(cb: types.CallbackQuery, state: FSMContext):
 
 @dp.message(DangerDayState.entering_custom)
 async def danger_custom_reason(msg: types.Message, state: FSMContext):
+    if not await require_subscription(msg, msg.from_user.id):
+        await state.clear()
+        return
     reason = msg.text.strip()
     save_danger_day(msg.from_user.id, reason)
     await msg.answer(f"⚠️ День отмечен как опасный: {reason}")
@@ -3124,6 +3184,8 @@ async def danger_custom_reason(msg: types.Message, state: FSMContext):
 @dp.callback_query(F.data == "active")
 async def show_active(cb: types.CallbackQuery):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     uid = cb.from_user.id
 
     conn = sqlite3.connect(DB_PATH)
@@ -3175,6 +3237,8 @@ async def show_active(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data.startswith("view_"))
 async def show_trade_details(cb: types.CallbackQuery):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     tid = int(cb.data.split("_")[1])
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute(
@@ -3210,6 +3274,8 @@ async def show_trade_details(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "history")
 async def show_history(cb: types.CallbackQuery):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
@@ -5659,6 +5725,9 @@ async def delete_trade_do(cb: types.CallbackQuery, state: FSMContext):
 # ---------- EXPORT CSV ----------
 @dp.callback_query(lambda c: c.data == "export_csv")
 async def export_csv(cb: types.CallbackQuery):
+    await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     uid = cb.from_user.id
     df = pd.read_sql_query(
         "SELECT * FROM trades WHERE user_id=? AND COALESCE(is_deleted,0)=0",
@@ -5677,6 +5746,8 @@ async def export_csv(cb: types.CallbackQuery):
 @dp.callback_query(lambda c: c.data == "reports")
 async def reports(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     await state.clear()
     uid = cb.from_user.id
     df = pd.read_sql_query(
@@ -6634,6 +6705,8 @@ async def notif_enable(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "clear_reports")
 async def clear_reports(cb: types.CallbackQuery):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute("DELETE FROM trades WHERE user_id=?", (uid,))
@@ -6688,6 +6761,8 @@ async def ignore_cb(cb: types.CallbackQuery):
 @dp.callback_query(F.data == "clear_all")
 async def clear_all(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     text = (
         "⚠️ Вы собираетесь удалить ВСЕ данные:\n"
         "– Сделки (все типы)\n"
@@ -6708,12 +6783,17 @@ async def clear_all(cb: types.CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "cancel_clear_all")
 async def cancel_clear_all(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
+    if not await require_subscription(cb.message, cb.from_user.id):
+        return
     await cb.message.answer("Операция отменена.")
     await go_home(cb.from_user.id, state)
 
 
 @dp.message(ClearAllState.confirming)
 async def clear_all_confirm(msg: types.Message, state: FSMContext):
+    if not await require_subscription(msg, msg.from_user.id):
+        await state.clear()
+        return
     if msg.text.strip().lower() == "of course":
         uid = msg.from_user.id
         with sqlite3.connect(DB_PATH) as conn:
