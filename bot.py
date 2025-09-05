@@ -317,7 +317,8 @@ def init_db() -> None:
             notify_risk INTEGER DEFAULT 1,
             habit_report_enabled INTEGER DEFAULT 0,
             habit_report_time TEXT DEFAULT '21:00',
-            habit_comment_enabled INTEGER DEFAULT 0
+            habit_comment_enabled INTEGER DEFAULT 0,
+            spot_min_usd REAL DEFAULT 1.0
         )
         """
     )
@@ -434,6 +435,9 @@ def add_missing_columns() -> None:
             conn.commit()
         if "habit_comment_enabled" not in us_cols:
             cur.execute("ALTER TABLE user_settings ADD COLUMN habit_comment_enabled INTEGER DEFAULT 0")
+            conn.commit()
+        if "spot_min_usd" not in us_cols:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN spot_min_usd REAL DEFAULT 1.0")
             conn.commit()
 
         cur.execute("PRAGMA table_info(price_alerts)")
@@ -642,6 +646,25 @@ def set_automation(uid: int, enabled: bool) -> None:
         )
         conn.commit()
 
+
+def get_spot_threshold(uid: int) -> float:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT spot_min_usd FROM user_settings WHERE user_id=?",
+            (uid,),
+        ).fetchone()
+    return float(row[0]) if row and row[0] is not None else 1.0
+
+
+def set_spot_threshold(uid: int, value: float) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO user_settings (user_id, spot_min_usd) VALUES (?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET spot_min_usd=excluded.spot_min_usd",
+            (uid, value),
+        )
+        conn.commit()
+
 # ---------- STATES ----------
 class TradeState(StatesGroup):
     choosing_type = State()
@@ -737,6 +760,10 @@ class HabitNotifyState(StatesGroup):
 
 class AICoinState(StatesGroup):
     enter_symbol = State()
+
+
+class TradeFilterState(StatesGroup):
+    entering_value = State()
 
 
 class PriceAlertState(StatesGroup):
@@ -1230,6 +1257,7 @@ def save_imported_trade(uid: int, pos: dict) -> int:
 
 def process_spot_history(uid: int, orders: list[dict]) -> None:
     stable = {"USDT", "USDC"}
+    min_usd = get_spot_threshold(uid)
     orders = sorted(orders, key=lambda o: int(o.get("execTime", 0)))
     for o in orders:
         sym = o.get("symbol", "")
@@ -1248,7 +1276,7 @@ def process_spot_history(uid: int, orders: list[dict]) -> None:
             if ts
             else datetime.now().strftime("%Y-%m-%d")
         )
-        if side == "Buy" and usd_val < 1:
+        if side == "Buy" and usd_val < min_usd:
             continue
         if side == "Buy":
             with sqlite3.connect(DB_PATH) as conn:
@@ -1416,12 +1444,13 @@ async def sync_spot_balances(
     api_key: str,
     api_secret: str,
     balances: list[tuple[str, float, float]],
+    min_usd: float,
 ) -> None:
     """Ensure trades table reflects spot balances."""
     stable = {"USDT", "USDC"}
     now = datetime.now().strftime("%Y-%m-%d")
-    # Skip tiny holdings (<$1) to avoid clutter
-    balance_map = {c: (amt, usd) for c, amt, usd in balances if amt > 0 and usd >= 1}
+    # Skip tiny holdings below user-defined threshold to avoid clutter
+    balance_map = {c: (amt, usd) for c, amt, usd in balances if amt > 0 and usd >= min_usd}
     for coin, (amt, usd) in balance_map.items():
         if coin in stable:
             continue
@@ -2348,7 +2377,8 @@ async def run_auto_update(uid: int) -> bool:
     ok_bal, balinfo = await fetch_bybit_balance(uid, api_key, api_secret, acc_type)
     if ok_bal:
         _, _, bal_details = balinfo
-        await sync_spot_balances(uid, api_key, api_secret, bal_details)
+        min_usd = get_spot_threshold(uid)
+        await sync_spot_balances(uid, api_key, api_secret, bal_details, min_usd)
     if ok_spot and spot_orders:
         process_spot_history(uid, spot_orders)
     if ok_pos:
@@ -2561,6 +2591,7 @@ def optimization_menu_kb(uid: int) -> InlineKeyboardMarkup:
             ],
             [InlineKeyboardButton(text=auto_text, callback_data="opt_toggle")],
             [InlineKeyboardButton(text="⏱ Автообновление", callback_data="auto_sync")],
+            [InlineKeyboardButton(text="⚙️ Настройки фильтра сделок", callback_data="opt_filter")],
             [InlineKeyboardButton(text="🤖 Автотрейдинг", callback_data="opt_autotrade")],
             [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")],
         ]
@@ -6007,7 +6038,8 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
     bal_details: list[tuple[str, float, float]] = []
     if ok_bal:
         _, _, bal_details = balinfo
-        await sync_spot_balances(uid, row[0], row[1], bal_details)
+        min_usd = get_spot_threshold(uid)
+        await sync_spot_balances(uid, row[0], row[1], bal_details, min_usd)
     if ok_spot and spot_orders:
         process_spot_history(uid, spot_orders)
     if ok_pos:
@@ -6061,6 +6093,73 @@ async def optimization_stub(cb: types.CallbackQuery):
     if not await require_pro(cb.message, cb.from_user.id):
         return
     await cb.message.answer("🔒 Функция в разработке. Следи за обновлениями!")
+
+
+@dp.callback_query(F.data == "opt_filter")
+async def trade_filter_menu(cb: types.CallbackQuery):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    uid = cb.from_user.id
+    cur_val = get_spot_threshold(uid)
+    buttons = [
+        [
+            InlineKeyboardButton(text="1$", callback_data="tfilter_1"),
+            InlineKeyboardButton(text="5$", callback_data="tfilter_5"),
+            InlineKeyboardButton(text="10$", callback_data="tfilter_10"),
+        ],
+        [InlineKeyboardButton(text="✏ Ввести вручную", callback_data="tfilter_custom")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")],
+    ]
+    kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
+    await cb.message.answer(
+        f"Минимальная сумма сделки (USD). Текущий порог: ${cur_val:.2f}",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(lambda c: c.data in {"tfilter_1", "tfilter_5", "tfilter_10"})
+async def trade_filter_set(cb: types.CallbackQuery):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    value = float(cb.data.split("_")[1])
+    set_spot_threshold(cb.from_user.id, value)
+    await cb.message.answer(f"✅ Порог установлен: ${value:.2f}")
+    await cb.message.answer("🔧 Оптимизация:", reply_markup=optimization_menu_kb(cb.from_user.id))
+
+
+@dp.callback_query(F.data == "tfilter_custom")
+async def trade_filter_custom(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_filter")]]
+    )
+    await cb.message.answer("Введи минимальную сумму в USD:", reply_markup=with_back(kb))
+    await state.set_state(TradeFilterState.entering_value)
+
+
+@dp.message(TradeFilterState.entering_value)
+async def trade_filter_save(msg: types.Message, state: FSMContext):
+    if not await require_basic(msg, msg.from_user.id):
+        return
+    txt = msg.text.strip().replace(",", ".")
+    try:
+        value = float(txt)
+    except ValueError:
+        await msg.answer("❌ Неверное значение. Введи число.")
+        return
+    if value <= 0:
+        await msg.answer("❌ Значение должно быть больше 0.")
+        return
+    set_spot_threshold(msg.from_user.id, value)
+    await state.clear()
+    await msg.answer(f"✅ Порог установлен: ${value:.2f}")
+    await msg.answer(
+        "🔧 Оптимизация:", reply_markup=optimization_menu_kb(msg.from_user.id)
+    )
 
 
 @dp.callback_query(F.data == "opt_stops")
