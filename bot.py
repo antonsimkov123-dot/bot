@@ -1241,12 +1241,15 @@ def process_spot_history(uid: int, orders: list[dict]) -> None:
         side = o.get("side")
         price = float(o.get("avgPrice") or o.get("execPrice") or 0)
         qty = float(o.get("size") or o.get("execQty") or 0)
+        usd_val = price * qty
         ts = o.get("execTime")
         dt = (
             datetime.fromtimestamp(int(ts) / 1000).strftime("%Y-%m-%d")
             if ts
             else datetime.now().strftime("%Y-%m-%d")
         )
+        if side == "Buy" and usd_val < 1:
+            continue
         if side == "Buy":
             with sqlite3.connect(DB_PATH) as conn:
                 cur = conn.cursor()
@@ -1417,7 +1420,8 @@ async def sync_spot_balances(
     """Ensure trades table reflects spot balances."""
     stable = {"USDT", "USDC"}
     now = datetime.now().strftime("%Y-%m-%d")
-    balance_map = {c: (amt, usd) for c, amt, usd in balances if amt > 0}
+    # Skip tiny holdings (<$1) to avoid clutter
+    balance_map = {c: (amt, usd) for c, amt, usd in balances if amt > 0 and usd >= 1}
     for coin, (amt, usd) in balance_map.items():
         if coin in stable:
             continue
