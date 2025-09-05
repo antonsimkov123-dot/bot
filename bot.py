@@ -2577,7 +2577,7 @@ def reports_menu_kb() -> InlineKeyboardMarkup:
 
 def optimization_menu_kb(uid: int) -> InlineKeyboardMarkup:
     auto_text = (
-        "🟢⚙️ Автоматизация [вкл]" if is_automation_enabled(uid) else "🔴⚙️ Автоматизация [выкл]"
+        "🟢⚙️Автоматизация [вкл]" if is_automation_enabled(uid) else "🔴⚙️Автоматизация [выкл]"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -2589,9 +2589,13 @@ def optimization_menu_kb(uid: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🛠️ Авторасчёт стопов", callback_data="opt_stops"),
                 InlineKeyboardButton(text="📬 Уведомления", callback_data="opt_notify"),
             ],
-            [InlineKeyboardButton(text=auto_text, callback_data="opt_toggle")],
-            [InlineKeyboardButton(text="⏱ Автообновление", callback_data="auto_sync")],
-            [InlineKeyboardButton(text="⚙️ Настройки фильтра сделок", callback_data="opt_filter")],
+            [
+                InlineKeyboardButton(text=auto_text, callback_data="opt_toggle"),
+                InlineKeyboardButton(
+                    text="⚙️Настройки фильтра сделок", callback_data="opt_filter"
+                ),
+            ],
+            [InlineKeyboardButton(text="⏱️Автообновление", callback_data="auto_sync")],
             [InlineKeyboardButton(text="🤖 Автотрейдинг", callback_data="opt_autotrade")],
             [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")],
         ]
