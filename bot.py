@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from collections import defaultdict, Counter
 from itertools import combinations
 load_dotenv()
+logger = logging.getLogger(__name__)
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile, BufferedInputFile
@@ -2099,18 +2100,33 @@ async def process_notifications(uid: int) -> None:
             text += f"\nТип: {display_pa_mode(mode, npct)}"
             try:
                 await bot.send_message(uid, text)
-            except Exception:
-                pass
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("DELETE FROM price_alerts WHERE id=?", (aid,))
-                conn.commit()
+            except Exception as e:
+                logger.error(
+                    "alert send failed user=%s symbol=%s target=%s mode=%s: %s",
+                    uid,
+                    sym,
+                    target,
+                    mode,
+                    e,
+                )
+            else:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("DELETE FROM price_alerts WHERE id=?", (aid,))
+                    conn.commit()
+                logger.info(
+                    "alert sent user=%s symbol=%s target=%s mode=%s",
+                    uid,
+                    sym,
+                    target,
+                    mode,
+                )
 
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
             "UPDATE price_alerts SET manual=1 WHERE trade_id IS NULL AND (manual IS NULL OR manual=0)"
         )
         man_rows = conn.execute(
-            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND trade_id IS NULL",
+            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND trade_id IS NULL AND manual=1",
             (uid,),
         ).fetchall()
     for aid, sym, target, mode, npct in man_rows:
@@ -2129,11 +2145,26 @@ async def process_notifications(uid: int) -> None:
             text += f"\nТип: {display_pa_mode(mode, npct)}"
             try:
                 await bot.send_message(uid, text)
-            except Exception:
-                pass
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("DELETE FROM price_alerts WHERE id=?", (aid,))
-                conn.commit()
+            except Exception as e:
+                logger.error(
+                    "manual alert send failed user=%s symbol=%s target=%s mode=%s: %s",
+                    uid,
+                    sym,
+                    target,
+                    mode,
+                    e,
+                )
+            else:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("DELETE FROM price_alerts WHERE id=?", (aid,))
+                    conn.commit()
+                logger.info(
+                    "manual alert sent user=%s symbol=%s target=%s mode=%s",
+                    uid,
+                    sym,
+                    target,
+                    mode,
+                )
 
 
 async def show_reminders_menu(uid: int, message: types.Message) -> None:
@@ -2493,7 +2524,7 @@ async def notification_scheduler():
             uids.update(
                 row[0]
                 for row in conn.execute(
-                    "SELECT DISTINCT user_id FROM price_alerts WHERE trade_id IS NULL"
+                    "SELECT DISTINCT user_id FROM price_alerts WHERE trade_id IS NULL AND manual=1"
                 ).fetchall()
             )
         for uid in uids:
