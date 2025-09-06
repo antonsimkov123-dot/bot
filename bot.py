@@ -6405,11 +6405,16 @@ async def analyze_chart_image(
 
 
 async def _visual_chart_analysis(img) -> str:
-    """Very rough colour-based trend guess used when no ticker is available."""
+    """Crude visual study of candles/volumes used when no ticker is available."""
     try:
         width, height = img.size
-        body = img.crop((0, int(height * 0.25), width, height))
-        small = body.resize((200, 200)).convert("RGB")
+        chart_top = int(height * 0.1)
+        chart_bottom = int(height * 0.8)
+        chart = img.crop((0, chart_top, width, chart_bottom))
+        volume = img.crop((0, chart_bottom, width, height))
+
+        # ----- trend & candle colours -----
+        small = chart.resize((200, 200)).convert("RGB")
         red = green = 0
         for r, g, b in small.getdata():
             if g > r + 40 and g > b + 40:
@@ -6417,12 +6422,62 @@ async def _visual_chart_analysis(img) -> str:
             elif r > g + 40 and r > b + 40:
                 red += 1
         if green > red:
-            trend = "восходящую"  # mostly green candles
+            trend = "восходящий"
+            candle_desc = "преобладают бычьи свечи"
         elif red > green:
-            trend = "нисходящую"  # mostly red candles
+            trend = "нисходящий"
+            candle_desc = "преобладает медвежий импульс"
         else:
-            trend = "боковую"  # fallback if colours are balanced
-        return f"🔍 Визуальный анализ показывает {trend} тенденцию на графике."
+            trend = "боковой"
+            candle_desc = "наблюдается консолидация"
+
+        # ----- support / resistance -----
+        gray = np.array(chart.convert("L"))
+        mask = gray < 200  # assume dark pixels form candles
+        rows = np.where(mask.any(axis=1))[0]
+        if rows.size:
+            top_ratio = rows[0] / gray.shape[0]
+            bottom_ratio = rows[-1] / gray.shape[0]
+        else:
+            top_ratio = 0.2
+            bottom_ratio = 0.8
+
+        def level_desc(ratio: float) -> str:
+            if ratio <= 0.33:
+                return "верхней трети"
+            if ratio <= 0.66:
+                return "средней зоне"
+            return "нижней трети"
+
+        support_desc = level_desc(bottom_ratio)
+        resistance_desc = level_desc(top_ratio)
+
+        # ----- volumes -----
+        vol_gray = np.array(volume.convert("L"))
+        vol_mask = vol_gray < 200
+        col_heights = vol_mask.sum(axis=0)
+        avg_h = col_heights.mean() if col_heights.size else 0
+        last_h = col_heights[-1] if col_heights.size else 0
+        if avg_h == 0:
+            volume_desc = "объёмы не распознаны"
+        elif last_h > avg_h * 1.5:
+            volume_desc = "присутствует локальный всплеск на последних барах"
+        elif vol_mask.sum() / vol_mask.size < 0.1:
+            volume_desc = "объёмы низкие"
+        else:
+            volume_desc = "объёмы стабильные"
+
+        pattern_desc = "ярко выраженных паттернов не обнаружено"
+        analysis = (
+            "📉 Визуальный анализ графика:\n\n"
+            f"— Глобальный тренд: {trend}\n"
+            f"— Поддержка: визуально в {support_desc}\n"
+            f"— Сопротивление: {resistance_desc}\n"
+            f"— Объёмы: {volume_desc}\n"
+            f"— Свечи: {candle_desc}\n"
+            f"— Паттерны: {pattern_desc}"
+        )
+        return analysis
     except Exception:
         return "⚠️ Не удалось выполнить визуальный анализ."
 
