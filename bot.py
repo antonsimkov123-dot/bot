@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 from collections import defaultdict, Counter
 from itertools import combinations
 from typing import Optional
+import re
 load_dotenv()
 logger = logging.getLogger(__name__)
 from aiogram import Bot, Dispatcher, types, F
@@ -6346,17 +6347,40 @@ async def ai_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.answer("Что тебя интересует?", reply_markup=with_back(kb))
 
 
-async def analyze_chart_image(message: types.Message) -> Optional[str]:
-    """Try to recognize a ticker symbol from a chart image.
+async def analyze_chart_image(message: types.Message) -> tuple[Optional[str], bool]:
+    """Attempt to recognize ticker and presence of numeric values.
 
-    This is a placeholder for future CV/AI logic. It should return the
-    detected ticker (e.g. "BTC") or ``None`` if the chart cannot be
-    recognized.
+    Returns a tuple ``(ticker, has_numbers)`` where ``ticker`` is a detected
+    symbol (e.g. ``"BTC"``) or ``None`` if not found, and ``has_numbers``
+    indicates whether any digits were spotted on the image.  This remains a
+    lightweight placeholder until proper CV/AI logic is implemented.
     """
-    return None
+
+    try:
+        from PIL import Image
+        import pytesseract
+    except Exception:  # pillow or tesseract not available
+        return None, False
+
+    file = await bot.get_file(message.photo[-1].file_id)
+    buf = BytesIO()
+    await bot.download_file(file.file_path, buf)
+    buf.seek(0)
+    try:
+        img = Image.open(buf)
+    except Exception:
+        return None, False
+
+    text = pytesseract.image_to_string(img)
+    has_numbers = bool(re.search(r"\d", text))
+    match = re.search(r"\b[A-Z]{3,}\b", text)
+    ticker = match.group(0) if match else None
+    return ticker, has_numbers
 
 
-async def _run_ai_coin_analysis(msg: types.Message, base: str, price: float) -> None:
+async def _run_ai_coin_analysis(
+    msg: types.Message, base: str, price: float, warning: Optional[str] = None
+) -> None:
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
     )
@@ -6379,7 +6403,10 @@ async def _run_ai_coin_analysis(msg: types.Message, base: str, price: float) -> 
             )
         vol_block = "\n".join(filter(None, [vol_line, vol_note]))
         price_line = f"💰 Текущая цена: {fmt_price(price)}"
-        trend_block = price_line + "\n\n" + trend_text
+        trend_block = ""
+        if warning:
+            trend_block += warning + "\n\n"
+        trend_block += price_line + "\n\n" + trend_text
         if vol_block:
             trend_block += f"\n\n{vol_block}"
         trend_block += f"\n\n{rec_block}\n{verdict_line}"
@@ -6430,7 +6457,7 @@ async def ai_coin_analyze_photo(msg: types.Message, state: FSMContext):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
     )
-    base = await analyze_chart_image(msg)
+    base, has_numbers = await analyze_chart_image(msg)
     if not base:
         await msg.answer(
             "❌ График не распознан. Пожалуйста, пришлите изображение, на котором видны свечи, цена и объёмы.",
@@ -6446,7 +6473,13 @@ async def ai_coin_analyze_photo(msg: types.Message, state: FSMContext):
         )
         await state.clear()
         return
-    await _run_ai_coin_analysis(msg, base, price)
+    warning = None
+    if not has_numbers:
+        warning = (
+            "❗ Внимание: на изображении отсутствуют числовые значения (цены или объёмы). "
+            "Анализ выполнен с возможной неточностью."
+        )
+    await _run_ai_coin_analysis(msg, base, price, warning=warning)
     await state.clear()
 
 
