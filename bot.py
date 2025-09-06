@@ -6585,11 +6585,7 @@ async def ai_coin_prompt(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     if not await require_basic(cb.message, cb.from_user.id):
         return
-    await cb.message.answer(
-        "✏️ Введите тикер монеты (например, BTC)\n"
-        "или\n"
-        "📸 Пришлите скриншот графика монеты (где видно свечи, уровни и объёмы)"
-    )
+    await cb.message.answer("✏️ Введите тикер монеты (например, BTC)")
     await state.set_state(AICoinState.enter_symbol)
 
 
