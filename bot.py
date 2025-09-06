@@ -6361,14 +6361,15 @@ async def analyze_chart_image(
 
     try:
         from PIL import Image, ImageOps
-        import pytesseract
     except Exception:
         return None, False, None
 
     try:
-        pytesseract.get_tesseract_version()
+        import pytesseract  # optional
+        tesseract_ok = bool(pytesseract.get_tesseract_version())
     except Exception:
-        return None, False, None
+        pytesseract = None
+        tesseract_ok = False
 
     file = await bot.get_file(message.photo[-1].file_id)
     buf = BytesIO()
@@ -6385,40 +6386,45 @@ async def analyze_chart_image(
     header = ImageOps.autocontrast(inv.crop((0, 0, width, int(height * 0.25))))
     full = ImageOps.autocontrast(inv)
 
-    cfg = "--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/-."
-    text_header = pytesseract.image_to_string(header, config=cfg)
-    text_full = text_header + "\n" + pytesseract.image_to_string(full, config=cfg)
-    has_numbers = bool(re.search(r"\d", text_full))
+    ticker = None
+    has_numbers = False
+    if tesseract_ok:
+        cfg = "--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/-."
+        text_header = pytesseract.image_to_string(header, config=cfg)
+        text_full = text_header + "\n" + pytesseract.image_to_string(full, config=cfg)
+        has_numbers = bool(re.search(r"\d", text_full))
 
-    pattern = r"[A-Z0-9]{2,}(?:[./-][A-Z0-9]{2,})?(?:\s*-\s*[A-Z0-9]{2,})?"
-    ticker_match = re.search(pattern, text_header)
-    if not ticker_match:
-        ticker_match = re.search(pattern, text_full)
-    ticker = ticker_match.group(0).replace(" ", "") if ticker_match else None
+        pattern = r"[A-Z0-9]{2,}(?:[./-][A-Z0-9]{2,})?(?:\s*-\s*[A-Z0-9]{2,})?"
+        ticker_match = re.search(pattern, text_header)
+        if not ticker_match:
+            ticker_match = re.search(pattern, text_full)
+        if ticker_match:
+            ticker = ticker_match.group(0).replace(" ", "")
+
     return ticker, has_numbers, img
 
 
 async def _visual_chart_analysis(img) -> str:
     """Very rough colour-based trend guess used when no ticker is available."""
     try:
-        from PIL import Image
+        width, height = img.size
+        body = img.crop((0, int(height * 0.25), width, height))
+        small = body.resize((200, 200)).convert("RGB")
+        red = green = 0
+        for r, g, b in small.getdata():
+            if g > r + 40 and g > b + 40:
+                green += 1
+            elif r > g + 40 and r > b + 40:
+                red += 1
+        if green > red:
+            trend = "восходящую"  # mostly green candles
+        elif red > green:
+            trend = "нисходящую"  # mostly red candles
+        else:
+            trend = "боковую"  # fallback if colours are balanced
+        return f"🔍 Визуальный анализ показывает {trend} тенденцию на графике."
     except Exception:
         return "⚠️ Не удалось выполнить визуальный анализ."
-
-    width, height = img.size
-    body = img.crop((0, int(height * 0.25), width, height))
-    small = body.resize((200, 200)).convert("RGB")
-    red = green = 0
-    for r, g, b in small.getdata():
-        if g > r + 40 and g > b + 40:
-            green += 1
-        elif r > g + 40 and r > b + 40:
-            red += 1
-    if green > red:
-        trend = "восходящую"  # mostly green candles
-    else:
-        trend = "нисходящую"  # default to bearish if unsure
-    return f"🔍 Визуальный анализ показывает {trend} тенденцию на графике."
 
 
 async def _run_ai_coin_analysis(
