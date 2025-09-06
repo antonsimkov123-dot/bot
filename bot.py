@@ -2103,6 +2103,9 @@ async def process_notifications(uid: int) -> None:
                 conn.commit()
 
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE price_alerts SET manual=1 WHERE trade_id IS NULL AND manual<>1"
+        )
         man_rows = conn.execute(
             "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1",
             (uid,),
@@ -2170,6 +2173,9 @@ async def show_reminders_menu(uid: int, message: types.Message) -> None:
 
 async def show_notifications_menu(uid: int, message: types.Message) -> None:
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE price_alerts SET manual=1 WHERE trade_id IS NULL AND manual<>1"
+        )
         rows = conn.execute(
             """
             SELECT t.id, t.symbol, t.trade_type, t.leverage, t.notifications_enabled,
@@ -2240,6 +2246,9 @@ async def notif_pref_stag(cb: types.CallbackQuery):
 
 async def show_manual_alerts(uid: int, message: types.Message) -> None:
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE price_alerts SET manual=1 WHERE trade_id IS NULL AND manual<>1"
+        )
         rows = conn.execute(
             "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1 ORDER BY id",
             (uid,),
@@ -6815,6 +6824,9 @@ async def pa_manual_disable_all(cb: types.CallbackQuery):
         return
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE price_alerts SET manual=1 WHERE trade_id IS NULL AND manual<>1"
+        )
         conn.execute("DELETE FROM price_alerts WHERE user_id=? AND manual=1", (uid,))
         conn.commit()
     await cb.message.answer("🔕 Вне-сделочные уведомления отключены.")
