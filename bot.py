@@ -883,10 +883,7 @@ async def save_price_alert(msg: types.Message, state: FSMContext) -> None:
     if tid:
         await send_notif_config(msg, uid, tid)
     else:
-        if manual_val == 2:
-            await show_manual2_alerts(uid, msg)
-        else:
-            await show_manual_alerts(uid, msg)
+        await show_manual_alerts(uid, msg)
 
 
 async def ask_notify_mode(cb: types.CallbackQuery, state: FSMContext) -> None:
@@ -2180,7 +2177,7 @@ async def show_reminders_menu(uid: int, message: types.Message) -> None:
 async def show_notifications_menu(uid: int, message: types.Message) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "UPDATE price_alerts SET manual=1 WHERE trade_id IS NULL AND (manual IS NULL OR manual=0)"
+            "UPDATE price_alerts SET manual=1 WHERE trade_id IS NULL AND COALESCE(manual,0) != 1"
         )
         conn.commit()
         rows = conn.execute(
@@ -2194,10 +2191,6 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
         ).fetchall()
         manual_cnt = conn.execute(
             "SELECT COUNT(*) FROM price_alerts WHERE user_id=? AND trade_id IS NULL AND manual=1",
-            (uid,),
-        ).fetchone()[0]
-        manual2_cnt = conn.execute(
-            "SELECT COUNT(*) FROM price_alerts WHERE user_id=? AND trade_id IS NULL AND manual=2",
             (uid,),
         ).fetchone()[0]
         prefs = conn.execute(
@@ -2225,20 +2218,6 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
                 "🔔 Вне-сделочные уведомления" + (f" ({manual_cnt})" if manual_cnt else "")
             ),
             callback_data="pa_manual_list",
-        )
-    ])
-    buttons.append([
-        InlineKeyboardButton(
-            text=(
-                "🔔 Вне-сделочные уведомления 2" + (f" ({manual2_cnt})" if manual2_cnt else "")
-            ),
-            callback_data="pa2_manual_list",
-        )
-    ])
-    buttons.append([
-        InlineKeyboardButton(
-            text="🔔 Список вне-сделочных уведомлений",
-            callback_data="pa_manual_show",
         )
     ])
     if rows:
@@ -2272,7 +2251,7 @@ async def notif_pref_stag(cb: types.CallbackQuery):
 async def show_manual_alerts(uid: int, message: types.Message) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
-            "UPDATE price_alerts SET manual=1 WHERE trade_id IS NULL AND (manual IS NULL OR manual=0)"
+            "UPDATE price_alerts SET manual=1 WHERE trade_id IS NULL AND COALESCE(manual,0) != 1"
         )
         conn.commit()
         rows = conn.execute(
@@ -2313,56 +2292,6 @@ async def pa_manual_list_cb(cb: types.CallbackQuery):
     if not await require_basic(cb.message, cb.from_user.id):
         return
     await show_manual_alerts(cb.from_user.id, cb.message)
-
-
-@dp.callback_query(F.data == "pa_manual_show")
-async def pa_manual_show_cb(cb: types.CallbackQuery):
-    await cb.answer()
-    if not await require_basic(cb.message, cb.from_user.id):
-        return
-    await show_manual_alerts(cb.from_user.id, cb.message)
-
-
-async def show_manual2_alerts(uid: int, message: types.Message) -> None:
-    with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute(
-            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND trade_id IS NULL AND manual=2 ORDER BY id",
-            (uid,),
-        ).fetchall()
-
-    if not rows:
-        text = "🔔 Вне-сделочные уведомления:\nУ тебя пока нет уведомлений."
-        kb = InlineKeyboardMarkup(
-            inline_keyboard=[
-                [InlineKeyboardButton(text="➕ Добавить уведомление", callback_data="pa2_manual_add")],
-                [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_notify")],
-            ]
-        )
-        await message.answer(text, reply_markup=with_back(kb))
-        return
-
-    lines = ["🔔 Вне-сделочные уведомления:"]
-    buttons: list[list[InlineKeyboardButton]] = []
-    for i, (aid, sym, price, mode, npct) in enumerate(rows, 1):
-        mode_txt = display_pa_mode(mode, npct)
-        lines.append(f"{i}. {sym} {price} — {mode_txt}")
-        buttons.append([
-            InlineKeyboardButton(text=f"✏ {price}", callback_data=f"pa_edit_{aid}"),
-            InlineKeyboardButton(text="🗑", callback_data=f"pa_del_{aid}"),
-        ])
-    buttons.append([InlineKeyboardButton(text="🔕 Отключить все", callback_data="pa2_manual_disable_all")])
-    buttons.append([InlineKeyboardButton(text="➕ Добавить уведомление", callback_data="pa2_manual_add")])
-    buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="opt_notify")])
-    kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
-    await message.answer("\n".join(lines), reply_markup=kb)
-
-
-@dp.callback_query(F.data == "pa2_manual_list")
-async def pa2_manual_list_cb(cb: types.CallbackQuery):
-    await cb.answer()
-    if not await require_basic(cb.message, cb.from_user.id):
-        return
-    await show_manual2_alerts(cb.from_user.id, cb.message)
 
 
 @dp.callback_query(F.data == "auto_sync")
@@ -6836,16 +6765,6 @@ async def pa_manual_add(cb: types.CallbackQuery, state: FSMContext):
     await state.set_state(PriceAlertState.enter_symbol)
 
 
-@dp.callback_query(F.data == "pa2_manual_add")
-async def pa2_manual_add(cb: types.CallbackQuery, state: FSMContext):
-    await cb.answer()
-    if not await require_basic(cb.message, cb.from_user.id):
-        return
-    await state.update_data(pa_trade_id=None, pa_edit_id=None, pa_symbol=None, pa_manual=2)
-    await cb.message.answer("Введите тикер (например: BTC, eth, sol, ton и т.д.):")
-    await state.set_state(PriceAlertState.enter_symbol)
-
-
 @dp.message(PriceAlertState.enter_symbol)
 async def pa_manual_symbol(msg: types.Message, state: FSMContext):
     raw = (msg.text or "").strip().upper()
@@ -6893,15 +6812,12 @@ async def pa_del(cb: types.CallbackQuery):
     if not row:
         await cb.message.answer("Уведомление не найдено.")
         return
-    tid, _, manual = row
+    tid, _, _ = row
     await cb.message.answer("🗑 Уведомление удалено.")
     if tid:
         await send_notif_config(cb.message, cb.from_user.id, tid)
     else:
-        if manual == 2:
-            await show_manual2_alerts(cb.from_user.id, cb.message)
-        else:
-            await show_manual_alerts(cb.from_user.id, cb.message)
+        await show_manual_alerts(cb.from_user.id, cb.message)
 
 
 @dp.callback_query(F.data == "pa_manual_disable_all")
@@ -6918,22 +6834,6 @@ async def pa_manual_disable_all(cb: types.CallbackQuery):
         conn.commit()
     await cb.message.answer("🔕 Вне-сделочные уведомления отключены.")
     await show_manual_alerts(uid, cb.message)
-
-
-@dp.callback_query(F.data == "pa2_manual_disable_all")
-async def pa2_manual_disable_all(cb: types.CallbackQuery):
-    await cb.answer()
-    if not await require_basic(cb.message, cb.from_user.id):
-        return
-    uid = cb.from_user.id
-    with sqlite3.connect(DB_PATH) as conn:
-        conn.execute(
-            "DELETE FROM price_alerts WHERE user_id=? AND manual=2",
-            (uid,),
-        )
-        conn.commit()
-    await cb.message.answer("🔕 Вне-сделочные уведомления отключены.")
-    await show_manual2_alerts(uid, cb.message)
 
 
 @dp.message(PriceAlertState.waiting_price)
