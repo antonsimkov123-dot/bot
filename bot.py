@@ -30,6 +30,9 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.patches import Rectangle
 import matplotlib.patheffects as pe
+import re
+import shutil
+from PIL import Image
 
 plt.rcParams.update({
     "font.family": "sans-serif",
@@ -62,6 +65,41 @@ def add_labels(ax: plt.Axes, fmt: str = "{:.1f}") -> None:
             fontsize=9,
             fontweight="bold",
         )
+
+# ---------- OCR ----------
+async def analyze_chart_image(msg: types.Message, state: FSMContext) -> str | None:
+    """
+    Extract a ticker symbol from a chart screenshot using Tesseract OCR.
+    The upper portion of the image is scanned where the ticker usually resides.
+    If OCR dependencies are missing or a ticker cannot be found, the user is
+    prompted to enter the ticker manually.
+    """
+    if not msg.photo:
+        await msg.answer("Пожалуйста, отправьте скриншот графика.")
+        return None
+    if shutil.which("tesseract") is None:
+        await msg.answer("⚠️ Не найден бинарный Tesseract. Установите tesseract-ocr.")
+        return None
+    try:
+        import pytesseract
+    except Exception:
+        await msg.answer("⚠️ Библиотека pytesseract не установлена.")
+        return None
+    photo = msg.photo[-1]
+    file = await bot.get_file(photo.file_id)
+    buf = BytesIO()
+    await bot.download_file(file.file_path, buf)
+    img = Image.open(buf)
+    w, h = img.size
+    top = img.crop((0, 0, w, int(h * 0.25)))
+    text = pytesseract.image_to_string(top)
+    ticker_re = r"\b[A-Z0-9]{1,10}(?:/[A-Z0-9]{1,10})?\b"
+    match = re.search(ticker_re, text)
+    if match:
+        return match.group(0)
+    await msg.answer("Не удалось распознать тикер. Введите тикер вручную:")
+    await state.set_state(TradeState.entering_symbol)
+    return None
 
 # ---------- CONFIG ----------
 BOT_TOKEN = "8086138454:AAHTZGMDz5_CkNJSwmt9-9scFqO2Nuk12y0"  # поменяй после теста!
