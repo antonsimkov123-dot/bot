@@ -2182,6 +2182,7 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
         conn.execute(
             "UPDATE price_alerts SET manual=1 WHERE trade_id IS NULL AND (manual IS NULL OR manual=0)"
         )
+        conn.commit()
         rows = conn.execute(
             """
             SELECT t.id, t.symbol, t.trade_type, t.leverage, t.notifications_enabled,
@@ -2192,11 +2193,11 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
             (uid,),
         ).fetchall()
         manual_cnt = conn.execute(
-            "SELECT COUNT(*) FROM price_alerts WHERE user_id=? AND manual=1",
+            "SELECT COUNT(*) FROM price_alerts WHERE user_id=? AND trade_id IS NULL AND manual=1",
             (uid,),
         ).fetchone()[0]
         manual2_cnt = conn.execute(
-            "SELECT COUNT(*) FROM price_alerts WHERE user_id=? AND manual=2",
+            "SELECT COUNT(*) FROM price_alerts WHERE user_id=? AND trade_id IS NULL AND manual=2",
             (uid,),
         ).fetchone()[0]
         prefs = conn.execute(
@@ -2267,8 +2268,9 @@ async def show_manual_alerts(uid: int, message: types.Message) -> None:
         conn.execute(
             "UPDATE price_alerts SET manual=1 WHERE trade_id IS NULL AND (manual IS NULL OR manual=0)"
         )
+        conn.commit()
         rows = conn.execute(
-            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1 ORDER BY id",
+            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND trade_id IS NULL AND manual=1 ORDER BY id",
             (uid,),
         ).fetchall()
 
@@ -2310,7 +2312,7 @@ async def pa_manual_list_cb(cb: types.CallbackQuery):
 async def show_manual2_alerts(uid: int, message: types.Message) -> None:
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
-            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=2 ORDER BY id",
+            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND trade_id IS NULL AND manual=2 ORDER BY id",
             (uid,),
         ).fetchall()
 
