@@ -2235,6 +2235,12 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
             callback_data="pa2_manual_list",
         )
     ])
+    buttons.append([
+        InlineKeyboardButton(
+            text="🔔 Список вне-сделочных уведомлений",
+            callback_data="pa_manual_show",
+        )
+    ])
     if rows:
         buttons.append([InlineKeyboardButton(text="🔕 Выключить все", callback_data="notif_disable_all")])
     buttons.append([InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")])
@@ -2303,6 +2309,14 @@ async def show_manual_alerts(uid: int, message: types.Message) -> None:
 
 @dp.callback_query(F.data == "pa_manual_list")
 async def pa_manual_list_cb(cb: types.CallbackQuery):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    await show_manual_alerts(cb.from_user.id, cb.message)
+
+
+@dp.callback_query(F.data == "pa_manual_show")
+async def pa_manual_show_cb(cb: types.CallbackQuery):
     await cb.answer()
     if not await require_basic(cb.message, cb.from_user.id):
         return
