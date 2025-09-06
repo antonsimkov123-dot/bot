@@ -6404,9 +6404,19 @@ async def analyze_chart_image(
     return ticker, has_numbers, img
 
 
-async def _visual_chart_analysis(img) -> str:
-    """Crude visual study of candles/volumes used when no ticker is available."""
+async def _visual_chart_analysis(img) -> tuple[str, Optional[BytesIO]]:
+    """Crude visual study of candles/volumes with optional price-axis parsing.
+
+    Returns ``(text, image_buf)`` where ``image_buf`` is a BytesIO containing
+    the annotated chart or ``None`` on failure.
+    """
     try:
+        from PIL import ImageOps, ImageDraw, ImageFont
+        try:
+            import pytesseract  # optional
+        except Exception:
+            pytesseract = None
+
         width, height = img.size
         chart_top = int(height * 0.1)
         chart_bottom = int(height * 0.8)
@@ -6431,7 +6441,7 @@ async def _visual_chart_analysis(img) -> str:
             trend = "боковой"
             candle_desc = "наблюдается консолидация"
 
-        # ----- support / resistance -----
+        # ----- support / resistance positions -----
         gray = np.array(chart.convert("L"))
         mask = gray < 200  # assume dark pixels form candles
         rows = np.where(mask.any(axis=1))[0]
@@ -6442,15 +6452,34 @@ async def _visual_chart_analysis(img) -> str:
             top_ratio = 0.2
             bottom_ratio = 0.8
 
-        def level_desc(ratio: float) -> str:
-            if ratio <= 0.33:
-                return "верхней трети"
-            if ratio <= 0.66:
-                return "средней зоне"
-            return "нижней трети"
+        # Try to read price axis on the right for numeric levels
+        price_numbers: list[float] = []
+        if pytesseract:
+            axis = chart.crop((int(width * 0.85), 0, width, chart.height))
+            axis = ImageOps.autocontrast(axis)
+            txt = pytesseract.image_to_string(
+                axis,
+                config="--psm 6 -c tessedit_char_whitelist=0123456789.,",
+            )
+            for n in re.findall(r"\d+(?:[.,]\d+)?", txt):
+                try:
+                    price_numbers.append(float(n.replace(",", ".")))
+                except ValueError:
+                    continue
 
-        support_desc = level_desc(bottom_ratio)
-        resistance_desc = level_desc(top_ratio)
+        if len(price_numbers) >= 2:
+            high = max(price_numbers)
+            low = min(price_numbers)
+            span = high - low if high > low else 1
+            resistance_val = high - top_ratio * span
+            support_val = high - bottom_ratio * span
+            support_desc = f"в районе ${fmt_price(support_val)}"
+            resistance_desc = f"в районе ${fmt_price(resistance_val)}"
+            numeric_levels = True
+        else:
+            support_desc = "визуально в нижней части"
+            resistance_desc = "визуально в верхней части"
+            numeric_levels = False
 
         # ----- volumes -----
         vol_gray = np.array(volume.convert("L"))
@@ -6471,15 +6500,34 @@ async def _visual_chart_analysis(img) -> str:
         analysis = (
             "📉 Визуальный анализ графика:\n\n"
             f"— Глобальный тренд: {trend}\n"
-            f"— Поддержка: визуально в {support_desc}\n"
+            f"— Поддержка: {support_desc}\n"
             f"— Сопротивление: {resistance_desc}\n"
             f"— Объёмы: {volume_desc}\n"
             f"— Свечи: {candle_desc}\n"
             f"— Паттерны: {pattern_desc}"
         )
-        return analysis
+
+        # ----- annotate image -----
+        draw = ImageDraw.Draw(img)
+        chart_h = chart_bottom - chart_top
+        res_y = chart_top + top_ratio * chart_h
+        sup_y = chart_top + bottom_ratio * chart_h
+        draw.line([(0, res_y), (width, res_y)], fill="red", width=2)
+        draw.line([(0, sup_y), (width, sup_y)], fill="green", width=2)
+        font = ImageFont.load_default()
+        if numeric_levels:
+            draw.text((5, res_y - 10), f"R {fmt_price(resistance_val)}", fill="red", font=font)
+            draw.text((5, sup_y - 10), f"S {fmt_price(support_val)}", fill="green", font=font)
+        else:
+            draw.text((5, res_y - 10), "Resistance", fill="red", font=font)
+            draw.text((5, sup_y - 10), "Support", fill="green", font=font)
+
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        return analysis, buf
     except Exception:
-        return "⚠️ Не удалось выполнить визуальный анализ."
+        return "⚠️ Не удалось выполнить визуальный анализ.", None
 
 
 async def _run_ai_coin_analysis(
@@ -6562,30 +6610,23 @@ async def ai_coin_analyze_photo(msg: types.Message, state: FSMContext):
         inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
     )
     base, has_numbers, img = await analyze_chart_image(msg)
-    warning = None
+    analysis, annotated = (
+        await _visual_chart_analysis(img) if img else ("⚠️ Не удалось выполнить визуальный анализ.", None)
+    )
+    parts = []
     if not has_numbers:
-        warning = (
-            "❗ Внимание: на изображении отсутствуют числовые значения (цены или объёмы). "
-            "Анализ выполнен с возможной неточностью."
+        parts.append(
+            "❗ Внимание: на изображении отсутствуют числовые значения (цены или объёмы). Анализ выполнен с возможной неточностью."
         )
-    if not base:
-        analysis = await _visual_chart_analysis(img) if img else "⚠️ Не удалось выполнить визуальный анализ."
-        text = f"{warning}\n\n{analysis}" if warning else analysis
-        await msg.answer(text, reply_markup=with_back(kb))
-        return
-    base = _base_from_symbol(base.strip().upper())
-    price = await fetch_price(base)
-    if price is None:
-        analysis = await _visual_chart_analysis(img)
-        pre = (
-            f"⚠️ Монета {base} не найдена на Bybit. Анализ выполнен только по изображению."
+    if base:
+        parts.append(f"Тикер: {base.strip().upper()}")
+    parts.append(analysis)
+    await msg.answer("\n\n".join(parts), reply_markup=with_back(kb))
+    if annotated:
+        await msg.answer_photo(
+            BufferedInputFile(annotated.getvalue(), filename="chart.png"),
+            reply_markup=with_back(kb),
         )
-        if warning:
-            pre = warning + "\n\n" + pre
-        await msg.answer(pre + "\n\n" + analysis, reply_markup=with_back(kb))
-        await state.clear()
-        return
-    await _run_ai_coin_analysis(msg, base, price, warning=warning)
     await state.clear()
 
 
