@@ -12,6 +12,7 @@ import calendar
 from dotenv import load_dotenv
 from collections import defaultdict, Counter
 from itertools import combinations
+from typing import Optional
 load_dotenv()
 logger = logging.getLogger(__name__)
 from aiogram import Bot, Dispatcher, types, F
@@ -6345,30 +6346,20 @@ async def ai_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.answer("Что тебя интересует?", reply_markup=with_back(kb))
 
 
-@dp.callback_query(F.data == "ai_coin")
-async def ai_coin_prompt(cb: types.CallbackQuery, state: FSMContext):
-    await cb.answer()
-    if not await require_basic(cb.message, cb.from_user.id):
-        return
-    await cb.message.answer("Введи тикер монеты (например, BTC):")
-    await state.set_state(AICoinState.enter_symbol)
+async def analyze_chart_image(message: types.Message) -> Optional[str]:
+    """Try to recognize a ticker symbol from a chart image.
+
+    This is a placeholder for future CV/AI logic. It should return the
+    detected ticker (e.g. "BTC") or ``None`` if the chart cannot be
+    recognized.
+    """
+    return None
 
 
-@dp.message(AICoinState.enter_symbol)
-async def ai_coin_analyze(msg: types.Message, state: FSMContext):
-    raw = (msg.text or "").strip().upper()
-    base = _base_from_symbol(raw)
+async def _run_ai_coin_analysis(msg: types.Message, base: str, price: float) -> None:
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
     )
-    price = await fetch_price(base)
-    if price is None:
-        await msg.answer(
-            f"❌ Монета {base} не найдена. Убедитесь, что она торгуется на Bybit и введите корректный тикер.",
-            reply_markup=with_back(kb),
-        )
-        await state.clear()
-        return
     await msg.answer("💬 Идёт анализ…")
     async with ChatActionSender.typing(bot, msg.chat.id):
         vol_line, vol_note, vol_short = await _volume_24h(base)
@@ -6400,6 +6391,62 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
         await msg.answer(trend_block + "\n\n" + advice, reply_markup=with_back(kb))
         if supports and resistances:
             await _send_sr_charts(msg.chat.id, base, entry=price)
+
+
+@dp.callback_query(F.data == "ai_coin")
+async def ai_coin_prompt(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    await cb.message.answer(
+        "✏️ Введите тикер монеты (например, BTC)\n"
+        "или\n"
+        "📸 Пришлите скриншот графика монеты (где видно свечи, уровни и объёмы)"
+    )
+    await state.set_state(AICoinState.enter_symbol)
+
+
+@dp.message(AICoinState.enter_symbol, F.text)
+async def ai_coin_analyze_text(msg: types.Message, state: FSMContext):
+    raw = (msg.text or "").strip().upper()
+    base = _base_from_symbol(raw)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
+    )
+    price = await fetch_price(base)
+    if price is None:
+        await msg.answer(
+            f"❌ Монета {base} не найдена. Убедитесь, что она торгуется на Bybit и введите корректный тикер.",
+            reply_markup=with_back(kb),
+        )
+        await state.clear()
+        return
+    await _run_ai_coin_analysis(msg, base, price)
+    await state.clear()
+
+
+@dp.message(AICoinState.enter_symbol, F.photo)
+async def ai_coin_analyze_photo(msg: types.Message, state: FSMContext):
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
+    )
+    base = await analyze_chart_image(msg)
+    if not base:
+        await msg.answer(
+            "❌ График не распознан. Пожалуйста, пришлите изображение, на котором видны свечи, цена и объёмы.",
+            reply_markup=with_back(kb),
+        )
+        return
+    base = _base_from_symbol(base.strip().upper())
+    price = await fetch_price(base)
+    if price is None:
+        await msg.answer(
+            f"❌ Монета {base} не найдена. Убедитесь, что она торгуется на Bybit и введите корректный тикер.",
+            reply_markup=with_back(kb),
+        )
+        await state.clear()
+        return
+    await _run_ai_coin_analysis(msg, base, price)
     await state.clear()
 
 
