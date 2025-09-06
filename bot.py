@@ -6446,11 +6446,19 @@ async def _visual_chart_analysis(img) -> tuple[str, Optional[BytesIO]]:
         mask = gray < 200  # assume dark pixels form candles
         rows = np.where(mask.any(axis=1))[0]
         if rows.size:
-            top_ratio = rows[0] / gray.shape[0]
-            bottom_ratio = rows[-1] / gray.shape[0]
+            slice_mask = mask[rows[0] : rows[-1] + 1]
+            counts = slice_mask.sum(axis=1)
+            smooth = np.convolve(counts, np.ones(5) / 5, mode="same")
+            n = len(smooth)
+            top_slice = smooth[: int(n * 0.4)]
+            bottom_slice = smooth[int(n * 0.6) :]
+            res_row = int(top_slice.argmax()) if top_slice.size else 0
+            sup_row = int(bottom_slice.argmax()) + int(n * 0.6) if bottom_slice.size else n - 1
+            resistance_ratio = (rows[0] + res_row) / gray.shape[0]
+            support_ratio = (rows[0] + sup_row) / gray.shape[0]
         else:
-            top_ratio = 0.2
-            bottom_ratio = 0.8
+            resistance_ratio = 0.2
+            support_ratio = 0.8
 
         # Try to read price axis on the right for numeric levels
         price_numbers: list[float] = []
@@ -6471,8 +6479,8 @@ async def _visual_chart_analysis(img) -> tuple[str, Optional[BytesIO]]:
             high = max(price_numbers)
             low = min(price_numbers)
             span = high - low if high > low else 1
-            resistance_val = high - top_ratio * span
-            support_val = high - bottom_ratio * span
+            resistance_val = high - resistance_ratio * span
+            support_val = high - support_ratio * span
             support_desc = f"в районе ${fmt_price(support_val)}"
             resistance_desc = f"в районе ${fmt_price(resistance_val)}"
             numeric_levels = True
@@ -6510,8 +6518,8 @@ async def _visual_chart_analysis(img) -> tuple[str, Optional[BytesIO]]:
         # ----- annotate image -----
         draw = ImageDraw.Draw(img)
         chart_h = chart_bottom - chart_top
-        res_y = chart_top + top_ratio * chart_h
-        sup_y = chart_top + bottom_ratio * chart_h
+        res_y = chart_top + resistance_ratio * chart_h
+        sup_y = chart_top + support_ratio * chart_h
         draw.line([(0, res_y), (width, res_y)], fill="red", width=2)
         draw.line([(0, sup_y), (width, sup_y)], fill="green", width=2)
         font = ImageFont.load_default()
