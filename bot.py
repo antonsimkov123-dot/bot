@@ -6359,7 +6359,12 @@ async def analyze_chart_image(message: types.Message) -> tuple[Optional[str], bo
     try:
         from PIL import Image
         import pytesseract
-    except Exception:  # pillow or tesseract not available
+    except Exception:
+        return None, False
+
+    try:
+        pytesseract.get_tesseract_version()
+    except Exception:
         return None, False
 
     file = await bot.get_file(message.photo[-1].file_id)
@@ -6371,10 +6376,17 @@ async def analyze_chart_image(message: types.Message) -> tuple[Optional[str], bo
     except Exception:
         return None, False
 
-    text = pytesseract.image_to_string(img)
-    has_numbers = bool(re.search(r"\d", text))
-    match = re.search(r"\b[A-Z]{3,}\b", text)
-    ticker = match.group(0) if match else None
+    width, height = img.size
+    header = img.crop((0, 0, width, int(height * 0.25)))
+
+    text_header = pytesseract.image_to_string(header, config="--psm 6")
+    text_full = text_header + "\n" + pytesseract.image_to_string(img, config="--psm 6")
+    has_numbers = bool(re.search(r"\d", text_full))
+
+    ticker_match = re.search(r"[A-Z0-9]{2,}(?:[./-][A-Z0-9]{2,})?", text_header)
+    if not ticker_match:
+        ticker_match = re.search(r"[A-Z0-9]{2,}(?:[./-][A-Z0-9]{2,})?", text_full)
+    ticker = ticker_match.group(0) if ticker_match else None
     return ticker, has_numbers
 
 
@@ -6460,7 +6472,7 @@ async def ai_coin_analyze_photo(msg: types.Message, state: FSMContext):
     base, has_numbers = await analyze_chart_image(msg)
     if not base:
         await msg.answer(
-            "❌ График не распознан. Пожалуйста, пришлите изображение, на котором видны свечи, цена и объёмы.",
+            "❓ Не удалось распознать тикер на графике. Введите его вручную или пришлите другой скрин.",
             reply_markup=with_back(kb),
         )
         return
