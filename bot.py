@@ -66,6 +66,7 @@ def add_labels(ax: plt.Axes, fmt: str = "{:.1f}") -> None:
 
 # ---------- CONFIG ----------
 BOT_TOKEN = "8086138454:AAHTZGMDz5_CkNJSwmt9-9scFqO2Nuk12y0"  # поменяй после теста!
+BOT_ID = int(BOT_TOKEN.split(":")[0])
 DB_PATH = "trades.db"
 MULTI_SR_MODE = True  # переключатель множественных уровней поддержки/сопротивления
 SR_MAX_ZONES = 7  # максимум зон поддержки/сопротивления на график для каждой стороны
@@ -854,7 +855,7 @@ def display_pa_mode(mode: str, pct: float | None) -> str:
     return f"Приближение ±{(pct or 0.3):.1f}%"
 
 
-async def save_price_alert(msg: types.Message, state: FSMContext) -> None:
+async def save_price_alert(msg: types.Message, state: FSMContext, uid: int | None = None) -> None:
     data = await state.get_data()
     tid = data.get("pa_trade_id")
     symbol = data.get("pa_symbol")
@@ -864,7 +865,7 @@ async def save_price_alert(msg: types.Message, state: FSMContext) -> None:
     direction = data.get("pa_direction", "both")
     near_pct = data.get("pa_near_pct")
     manual_flag = data.get("pa_manual")
-    uid = msg.from_user.id
+    uid = uid if uid is not None else msg.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
         if aid:
             conn.execute(
@@ -1987,6 +1988,8 @@ def build_auto_report(uid: int, days: int) -> str:
 
 
 async def process_notifications(uid: int) -> None:
+    if uid is None or uid == BOT_ID:
+        return
     now = datetime.now()
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
@@ -2509,6 +2512,11 @@ async def report_scheduler():
 async def notification_scheduler():
     while True:
         with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "DELETE FROM price_alerts WHERE user_id IS NULL OR user_id=?",
+                (BOT_ID,),
+            )
+            conn.commit()
             uids = {
                 row[0]
                 for row in conn.execute(
@@ -2527,6 +2535,8 @@ async def notification_scheduler():
                     "SELECT DISTINCT user_id FROM price_alerts WHERE trade_id IS NULL AND manual=1"
                 ).fetchall()
             )
+        uids.discard(None)
+        uids.discard(BOT_ID)
         for uid in uids:
             await process_notifications(uid)
         await asyncio.sleep(60)
@@ -6907,7 +6917,7 @@ async def pa_mode_cb(cb: types.CallbackQuery, state: FSMContext):
         await cb.message.answer("Насколько близко уведомлять?", reply_markup=with_back(kb))
         await state.set_state(PriceAlertState.choose_sensitivity)
     else:
-        await save_price_alert(cb.message, state)
+        await save_price_alert(cb.message, state, cb.from_user.id)
 
 
 @dp.callback_query(PriceAlertState.choose_sensitivity)
@@ -6919,7 +6929,7 @@ async def pa_sens_cb(cb: types.CallbackQuery, state: FSMContext):
     else:
         pct = float(cb.data.split("_")[2])
         await state.update_data(pa_near_pct=pct)
-        await save_price_alert(cb.message, state)
+        await save_price_alert(cb.message, state, cb.from_user.id)
 
 
 @dp.message(PriceAlertState.enter_custom)
