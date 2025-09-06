@@ -6347,47 +6347,78 @@ async def ai_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.answer("Что тебя интересует?", reply_markup=with_back(kb))
 
 
-async def analyze_chart_image(message: types.Message) -> tuple[Optional[str], bool]:
+async def analyze_chart_image(
+    message: types.Message,
+) -> tuple[Optional[str], bool, Optional["Image.Image"]]:
     """Attempt to recognize ticker and presence of numeric values.
 
-    Returns a tuple ``(ticker, has_numbers)`` where ``ticker`` is a detected
-    symbol (e.g. ``"BTC"``) or ``None`` if not found, and ``has_numbers``
-    indicates whether any digits were spotted on the image.  This remains a
-    lightweight placeholder until proper CV/AI logic is implemented.
+    Returns ``(ticker, has_numbers, image)`` where ``ticker`` is the detected
+    symbol (``None`` if not found), ``has_numbers`` indicates whether any digits
+    were spotted, and ``image`` is the loaded Pillow object for further visual
+    analysis.  This remains a lightweight placeholder until proper CV/AI logic
+    is implemented.
     """
 
     try:
-        from PIL import Image
+        from PIL import Image, ImageOps
         import pytesseract
     except Exception:
-        return None, False
+        return None, False, None
 
     try:
         pytesseract.get_tesseract_version()
     except Exception:
-        return None, False
+        return None, False, None
 
     file = await bot.get_file(message.photo[-1].file_id)
     buf = BytesIO()
     await bot.download_file(file.file_path, buf)
     buf.seek(0)
     try:
-        img = Image.open(buf)
+        img = Image.open(buf).convert("RGB")
     except Exception:
-        return None, False
+        return None, False, None
 
+    gray = ImageOps.grayscale(img)
+    inv = ImageOps.invert(gray)
     width, height = img.size
-    header = img.crop((0, 0, width, int(height * 0.25)))
+    header = ImageOps.autocontrast(inv.crop((0, 0, width, int(height * 0.25))))
+    full = ImageOps.autocontrast(inv)
 
-    text_header = pytesseract.image_to_string(header, config="--psm 6")
-    text_full = text_header + "\n" + pytesseract.image_to_string(img, config="--psm 6")
+    cfg = "--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/-."
+    text_header = pytesseract.image_to_string(header, config=cfg)
+    text_full = text_header + "\n" + pytesseract.image_to_string(full, config=cfg)
     has_numbers = bool(re.search(r"\d", text_full))
 
-    ticker_match = re.search(r"[A-Z0-9]{2,}(?:[./-][A-Z0-9]{2,})?", text_header)
+    pattern = r"[A-Z0-9]{2,}(?:[./-][A-Z0-9]{2,})?(?:\s*-\s*[A-Z0-9]{2,})?"
+    ticker_match = re.search(pattern, text_header)
     if not ticker_match:
-        ticker_match = re.search(r"[A-Z0-9]{2,}(?:[./-][A-Z0-9]{2,})?", text_full)
-    ticker = ticker_match.group(0) if ticker_match else None
-    return ticker, has_numbers
+        ticker_match = re.search(pattern, text_full)
+    ticker = ticker_match.group(0).replace(" ", "") if ticker_match else None
+    return ticker, has_numbers, img
+
+
+async def _visual_chart_analysis(img) -> str:
+    """Very rough colour-based trend guess used when no ticker is available."""
+    try:
+        from PIL import Image
+    except Exception:
+        return "⚠️ Не удалось выполнить визуальный анализ."
+
+    width, height = img.size
+    body = img.crop((0, int(height * 0.25), width, height))
+    small = body.resize((200, 200)).convert("RGB")
+    red = green = 0
+    for r, g, b in small.getdata():
+        if g > r + 40 and g > b + 40:
+            green += 1
+        elif r > g + 40 and r > b + 40:
+            red += 1
+    if green > red:
+        trend = "восходящую"  # mostly green candles
+    else:
+        trend = "нисходящую"  # default to bearish if unsure
+    return f"🔍 Визуальный анализ показывает {trend} тенденцию на графике."
 
 
 async def _run_ai_coin_analysis(
@@ -6469,28 +6500,30 @@ async def ai_coin_analyze_photo(msg: types.Message, state: FSMContext):
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
     )
-    base, has_numbers = await analyze_chart_image(msg)
-    if not base:
-        await msg.answer(
-            "❓ Не удалось распознать тикер на графике. Введите его вручную или пришлите другой скрин.",
-            reply_markup=with_back(kb),
-        )
-        return
-    base = _base_from_symbol(base.strip().upper())
-    price = await fetch_price(base)
-    if price is None:
-        await msg.answer(
-            f"❌ Монета {base} не найдена. Убедитесь, что она торгуется на Bybit и введите корректный тикер.",
-            reply_markup=with_back(kb),
-        )
-        await state.clear()
-        return
+    base, has_numbers, img = await analyze_chart_image(msg)
     warning = None
     if not has_numbers:
         warning = (
             "❗ Внимание: на изображении отсутствуют числовые значения (цены или объёмы). "
             "Анализ выполнен с возможной неточностью."
         )
+    if not base:
+        analysis = await _visual_chart_analysis(img) if img else "⚠️ Не удалось выполнить визуальный анализ."
+        text = f"{warning}\n\n{analysis}" if warning else analysis
+        await msg.answer(text, reply_markup=with_back(kb))
+        return
+    base = _base_from_symbol(base.strip().upper())
+    price = await fetch_price(base)
+    if price is None:
+        analysis = await _visual_chart_analysis(img)
+        pre = (
+            f"⚠️ Монета {base} не найдена на Bybit. Анализ выполнен только по изображению."
+        )
+        if warning:
+            pre = warning + "\n\n" + pre
+        await msg.answer(pre + "\n\n" + analysis, reply_markup=with_back(kb))
+        await state.clear()
+        return
     await _run_ai_coin_analysis(msg, base, price, warning=warning)
     await state.clear()
 
