@@ -2581,7 +2581,6 @@ def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📅 Напоминания", callback_data="reminders"),
             InlineKeyboardButton(text="🧹 Очистить всё", callback_data="clear_all"),
         ],
-        [InlineKeyboardButton(text="🤖 Автотрейдинг", callback_data="pro_entry")],
     ]
     if uid == ADMIN_ID:
         rows.append([InlineKeyboardButton(text="🛂 Управление подпиской", callback_data="sub_manage")])
