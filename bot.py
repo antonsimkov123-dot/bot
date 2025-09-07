@@ -2699,7 +2699,7 @@ def optimization_menu_kb(uid: int) -> InlineKeyboardMarkup:
                 ),
             ],
             [InlineKeyboardButton(text="⏱️Автообновление", callback_data="auto_sync")],
-            [InlineKeyboardButton(text="🤖 Автотрейдинг", callback_data="opt_autotrade")],
+            [InlineKeyboardButton(text="🤖 Автотрейдинг", callback_data="pro_entry")],
             [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")],
         ]
     )
@@ -6255,13 +6255,6 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
     await state.update_data(positions=positions)
     await cb.message.answer("Выбери сделку для импорта:", reply_markup=kb)
 
-
-@dp.callback_query(F.data == "opt_autotrade")
-async def optimization_stub(cb: types.CallbackQuery):
-    await cb.answer()
-    if not await require_pro(cb.message, cb.from_user.id):
-        return
-    await cb.message.answer("🔒 Функция в разработке. Следи за обновлениями!")
 
 
 @dp.callback_query(F.data == "opt_filter")
