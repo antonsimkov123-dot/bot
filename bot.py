@@ -2581,12 +2581,58 @@ def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton(text="📅 Напоминания", callback_data="reminders"),
             InlineKeyboardButton(text="🧹 Очистить всё", callback_data="clear_all"),
         ],
+        [InlineKeyboardButton(text="🤖 Автотрейдинг", callback_data="pro_entry")],
     ]
     if uid == ADMIN_ID:
         rows.append([InlineKeyboardButton(text="🛂 Управление подпиской", callback_data="sub_manage")])
     rows.append([InlineKeyboardButton(text="📚 Помощь / FAQ", callback_data="help_faq")])
     rows.append([InlineKeyboardButton(text=opt_text, callback_data="optimization")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def pro_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🤖 Автотрейдинг", callback_data="pro_autotrade")],
+            [InlineKeyboardButton(text="🧠 CryptoLens AI", callback_data="pro_ai")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")],
+        ]
+    )
+
+
+def pro_autotrade_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔧 Стратегия", callback_data="pro_auto_strategy")],
+            [InlineKeyboardButton(text="📊 Уровень риска", callback_data="pro_auto_risk")],
+            [InlineKeyboardButton(text="⏰ Выбор таймфрейма анализа", callback_data="pro_auto_tf")],
+            [
+                InlineKeyboardButton(
+                    text="💼 Макс. кол-во сделок одновременно",
+                    callback_data="pro_auto_max",
+                )
+            ],
+            [InlineKeyboardButton(text="📈 Список активных сделок", callback_data="pro_auto_list")],
+            [InlineKeyboardButton(text="❌ Остановить автотрейдинг", callback_data="pro_auto_stop")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="pro_menu")],
+        ]
+    )
+
+
+def pro_ai_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Проанализировать монету", callback_data="pro_ai_analyze")],
+            [InlineKeyboardButton(text="📷 Отправить скрин графика", callback_data="pro_ai_screenshot")],
+            [InlineKeyboardButton(text="📂 История анализов", callback_data="pro_ai_history")],
+            [InlineKeyboardButton(text="⚙️ Настройки анализа", callback_data="pro_ai_settings")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="pro_menu")],
+        ]
+    )
+
+
+async def send_pro_menu(uid: int) -> None:
+    await bot.send_message(uid, "Главное меню Pro-функций:", reply_markup=pro_menu_kb())
 
 
 def trades_menu_kb() -> InlineKeyboardMarkup:
@@ -2865,6 +2911,68 @@ async def cmd_menu(message: types.Message, state: FSMContext):
 async def cb_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     await go_home(cb.from_user.id, state)
+
+
+PRO_AUTO_PLACEHOLDERS = {
+    "pro_auto_strategy",
+    "pro_auto_risk",
+    "pro_auto_tf",
+    "pro_auto_max",
+    "pro_auto_list",
+    "pro_auto_stop",
+}
+
+PRO_AI_PLACEHOLDERS = {
+    "pro_ai_analyze",
+    "pro_ai_screenshot",
+    "pro_ai_history",
+    "pro_ai_settings",
+}
+
+
+@dp.callback_query(F.data == "pro_entry")
+async def pro_entry(cb: types.CallbackQuery):
+    await cb.answer()
+    if get_subscription(cb.from_user.id) != "pro":
+        await cb.message.answer(
+            "🚫 Доступно только в Pro-версии.\nОформите подписку или активируйте промокод для доступа."
+        )
+        return
+    await send_pro_menu(cb.from_user.id)
+
+
+@dp.callback_query(F.data == "pro_menu")
+async def pro_menu_cb(cb: types.CallbackQuery):
+    await cb.answer()
+    await send_pro_menu(cb.from_user.id)
+
+
+@dp.callback_query(F.data == "pro_autotrade")
+async def pro_autotrade_cb(cb: types.CallbackQuery):
+    await cb.answer()
+    await bot.send_message(
+        cb.from_user.id, "Меню «Автотрейдинг»:", reply_markup=pro_autotrade_kb()
+    )
+
+
+@dp.callback_query(F.data == "pro_ai")
+async def pro_ai_cb(cb: types.CallbackQuery):
+    await cb.answer()
+    await bot.send_message(
+        cb.from_user.id, "Меню «CryptoLens AI»:", reply_markup=pro_ai_kb()
+    )
+
+
+@dp.callback_query(F.data.in_(PRO_AUTO_PLACEHOLDERS))
+async def pro_auto_placeholder(cb: types.CallbackQuery):
+    await cb.answer()
+    await cb.message.answer("🔧 Функция в разработке.")
+
+
+@dp.callback_query(F.data.in_(PRO_AI_PLACEHOLDERS))
+async def pro_ai_placeholder(cb: types.CallbackQuery):
+    await cb.answer()
+    await cb.message.answer("🛠️ Функция в разработке.")
 
 
 async def build_profile_text(uid: int, include_balance: bool = False) -> str:
