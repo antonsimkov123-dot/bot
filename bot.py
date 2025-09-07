@@ -322,7 +322,8 @@ def init_db() -> None:
             habit_report_enabled INTEGER DEFAULT 0,
             habit_report_time TEXT DEFAULT '21:00',
             habit_comment_enabled INTEGER DEFAULT 0,
-            spot_min_usd REAL DEFAULT 1.0
+            spot_min_usd REAL DEFAULT 1.0,
+            autotrade_mode TEXT DEFAULT 'both'
         )
         """
     )
@@ -442,6 +443,9 @@ def add_missing_columns() -> None:
             conn.commit()
         if "spot_min_usd" not in us_cols:
             cur.execute("ALTER TABLE user_settings ADD COLUMN spot_min_usd REAL DEFAULT 1.0")
+            conn.commit()
+        if "autotrade_mode" not in us_cols:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN autotrade_mode TEXT DEFAULT 'both'")
             conn.commit()
 
         cur.execute("PRAGMA table_info(price_alerts)")
@@ -666,6 +670,25 @@ def set_spot_threshold(uid: int, value: float) -> None:
             "INSERT INTO user_settings (user_id, spot_min_usd) VALUES (?,?) "
             "ON CONFLICT(user_id) DO UPDATE SET spot_min_usd=excluded.spot_min_usd",
             (uid, value),
+        )
+        conn.commit()
+
+
+def get_trade_mode(uid: int) -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT autotrade_mode FROM user_settings WHERE user_id=?",
+            (uid,),
+        ).fetchone()
+    return row[0] if row and row[0] else "both"
+
+
+def set_trade_mode(uid: int, mode: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO user_settings (user_id, autotrade_mode) VALUES (?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET autotrade_mode=excluded.autotrade_mode",
+            (uid, mode),
         )
         conn.commit()
 
@@ -2605,6 +2628,7 @@ def pro_autotrade_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🔧 Стратегия", callback_data="pro_auto_strategy")],
             [InlineKeyboardButton(text="📊 Уровень риска", callback_data="pro_auto_risk")],
             [InlineKeyboardButton(text="⏰ Выбор таймфрейма анализа", callback_data="pro_auto_tf")],
+            [InlineKeyboardButton(text="🔀 Режим сделок", callback_data="pro_auto_mode")],
             [
                 InlineKeyboardButton(
                     text="💼 Макс. кол-во сделок одновременно",
@@ -2616,6 +2640,30 @@ def pro_autotrade_kb() -> InlineKeyboardMarkup:
             [InlineKeyboardButton(text="🔙 Назад", callback_data="pro_menu")],
         ]
     )
+
+
+TRADE_MODE_OPTIONS = [
+    ("trade_mode_long", "🔼 Только лонги", "long"),
+    ("trade_mode_short", "🔽 Только шорты", "short"),
+    ("trade_mode_both", "🔁 И лонги, и шорты", "both"),
+    ("trade_mode_trend", "📈 По тренду", "trend"),
+]
+TRADE_MODE_CALLBACKS = {cb: mode for cb, _text, mode in TRADE_MODE_OPTIONS}
+
+
+def trade_mode_kb(uid: int) -> InlineKeyboardMarkup:
+    current = get_trade_mode(uid)
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=("✅ " if current == mode else "") + label,
+                callback_data=cb,
+            )
+        ]
+        for cb, label, mode in TRADE_MODE_OPTIONS
+    ]
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="pro_autotrade")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def pro_ai_kb() -> InlineKeyboardMarkup:
@@ -2952,6 +3000,20 @@ async def pro_autotrade_cb(cb: types.CallbackQuery):
     await bot.send_message(
         cb.from_user.id, "Меню «Автотрейдинг»:", reply_markup=pro_autotrade_kb()
     )
+
+
+@dp.callback_query(F.data == "pro_auto_mode")
+async def pro_auto_mode_cb(cb: types.CallbackQuery):
+    await cb.answer()
+    await cb.message.answer("Выберите режим сделок:", reply_markup=trade_mode_kb(cb.from_user.id))
+
+
+@dp.callback_query(F.data.in_(TRADE_MODE_CALLBACKS.keys()))
+async def pro_auto_mode_set(cb: types.CallbackQuery):
+    mode = TRADE_MODE_CALLBACKS[cb.data]
+    set_trade_mode(cb.from_user.id, mode)
+    await cb.answer("Режим сохранён")
+    await cb.message.edit_reply_markup(trade_mode_kb(cb.from_user.id))
 
 
 @dp.callback_query(F.data == "pro_ai")
