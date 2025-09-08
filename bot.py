@@ -12,7 +12,10 @@ import calendar
 from dotenv import load_dotenv
 from collections import defaultdict, Counter
 from itertools import combinations
+from typing import Optional
+import re
 load_dotenv()
+logger = logging.getLogger(__name__)
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.filters import CommandStart
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, FSInputFile, BufferedInputFile
@@ -65,6 +68,7 @@ def add_labels(ax: plt.Axes, fmt: str = "{:.1f}") -> None:
 
 # ---------- CONFIG ----------
 BOT_TOKEN = "8086138454:AAHTZGMDz5_CkNJSwmt9-9scFqO2Nuk12y0"  # поменяй после теста!
+BOT_ID = int(BOT_TOKEN.split(":")[0])
 DB_PATH = "trades.db"
 MULTI_SR_MODE = True  # переключатель множественных уровней поддержки/сопротивления
 SR_MAX_ZONES = 7  # максимум зон поддержки/сопротивления на график для каждой стороны
@@ -109,6 +113,95 @@ TREND_WINDOWS = {
 TREND_LEVELS = {"global": "Глобальный", "local": "Локальный", "scalp": "Скальп"}
 
 BAND_PCT = {"60": 0.004, "240": 0.006, "D": 0.015}
+
+DISCLAIMER_TEXT = """⚠️ ВАЖНО! Прочти перед запуском CryptoLensBot
+
+🚫 CryptoLensBot — это не кнопка “разбогатей”.
+Он не даёт 100% сигналов, не обещает прибыль, и не принимает решения за вас.
+
+Это не халява.
+Это не чудо-бот.
+Это не финансовый советник.
+
+⸻
+
+🤖 Что это тогда?
+
+CryptoLensBot — это ИНСТРУМЕНТ:
+
+🔹 AI-советник анализирует монету и помогает вам увидеть:
+— зоны сопротивления и поддержки,
+— вероятности движения,
+— поведение толпы,
+— и то, что вы могли упустить в своём анализе.
+
+🔹 Но даже если AI-советник пишет “отличный вход”, это НЕ значит, что нужно слепо заходить.
+Это дополнительный аргумент, сигнал, мнение, но не приговор.
+Ты должен проверить его сам, подтвердить через свой анализ, и только потом принимать решение.
+
+🔹 AI-советник — это не CryptoLens AI.
+Он пока не учитывает:
+— свечные паттерны,
+— дивергенции,
+— MACD / RSI,
+— скользящие средние и многие другие вещи.
+
+👉 Всё это появится в будущей нейросети CryptoLens AI.
+Только тогда анализ будет максимально приближен к авторскому стилю и уровню.
+
+⸻
+
+💡 Для чего он нужен?
+
+🔸 Показывает сильные и слабые стороны твоих сделок
+🔸 Помогает улучшить мышление трейдера
+🔸 Служит зеркалом — ты начинаешь видеть, где и как ошибаешься
+🔸 Даёт мотивацию расти и осознанно подходить к трейдингу
+
+⸻
+
+💸 О деньгах и ответственности:
+
+❗Никаких гарантий на прибыль.
+Ты сам решаешь, входить в сделку или нет.
+Ты сам несёшь ответственность за результат.
+
+✅ Пользу получат те, кто:
+— внимательно следит за своими действиями,
+— обучается на ошибках,
+— использует бота как помощника,
+а не как повод избежать ответственности.
+
+❌ Если ты просто жмёшь “Сигнал → Сделка”,
+это не трейдинг. Это рулетка.
+
+⸻
+
+🧠 Если ты новичок:
+
+📌 Используй AI-советника, чтобы вникнуть в трейдинг
+📌 Жди CryptoSchool, где я дам базу и теорию
+📌 Или жди автотрейдинг, который уже сам будет входить/выходить
+
+⚠️ Но даже автотрейдинг — это не Грааль.
+Он не даёт 100% гарантий, он просто снимает часть нагрузки.
+
+⸻
+
+🚀 Запомни:
+
+CryptoLensBot повышает шанс на положительный исход,
+но никогда не заменит твоё мышление.
+
+Это инструмент, который:
+— помогает,
+— подсказывает,
+— направляет,
+но не принимает решения за тебя.
+
+CryptoLens — не обманка. Это зеркало.
+Захочешь — научит. Забьёшь — проигнорирует.
+Всё зависит от тебя."""
 
 # promo codes and their expiration dates (YYYY-MM-DD)
 PROMO_CODES = {
@@ -228,7 +321,9 @@ def init_db() -> None:
             notify_risk INTEGER DEFAULT 1,
             habit_report_enabled INTEGER DEFAULT 0,
             habit_report_time TEXT DEFAULT '21:00',
-            habit_comment_enabled INTEGER DEFAULT 0
+            habit_comment_enabled INTEGER DEFAULT 0,
+            spot_min_usd REAL DEFAULT 1.0,
+            autotrade_mode TEXT DEFAULT 'both'
         )
         """
     )
@@ -345,6 +440,12 @@ def add_missing_columns() -> None:
             conn.commit()
         if "habit_comment_enabled" not in us_cols:
             cur.execute("ALTER TABLE user_settings ADD COLUMN habit_comment_enabled INTEGER DEFAULT 0")
+            conn.commit()
+        if "spot_min_usd" not in us_cols:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN spot_min_usd REAL DEFAULT 1.0")
+            conn.commit()
+        if "autotrade_mode" not in us_cols:
+            cur.execute("ALTER TABLE user_settings ADD COLUMN autotrade_mode TEXT DEFAULT 'both'")
             conn.commit()
 
         cur.execute("PRAGMA table_info(price_alerts)")
@@ -553,6 +654,44 @@ def set_automation(uid: int, enabled: bool) -> None:
         )
         conn.commit()
 
+
+def get_spot_threshold(uid: int) -> float:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT spot_min_usd FROM user_settings WHERE user_id=?",
+            (uid,),
+        ).fetchone()
+    return float(row[0]) if row and row[0] is not None else 1.0
+
+
+def set_spot_threshold(uid: int, value: float) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO user_settings (user_id, spot_min_usd) VALUES (?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET spot_min_usd=excluded.spot_min_usd",
+            (uid, value),
+        )
+        conn.commit()
+
+
+def get_trade_mode(uid: int) -> str:
+    with sqlite3.connect(DB_PATH) as conn:
+        row = conn.execute(
+            "SELECT autotrade_mode FROM user_settings WHERE user_id=?",
+            (uid,),
+        ).fetchone()
+    return row[0] if row and row[0] else "both"
+
+
+def set_trade_mode(uid: int, mode: str) -> None:
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "INSERT INTO user_settings (user_id, autotrade_mode) VALUES (?,?) "
+            "ON CONFLICT(user_id) DO UPDATE SET autotrade_mode=excluded.autotrade_mode",
+            (uid, mode),
+        )
+        conn.commit()
+
 # ---------- STATES ----------
 class TradeState(StatesGroup):
     choosing_type = State()
@@ -650,6 +789,10 @@ class AICoinState(StatesGroup):
     enter_symbol = State()
 
 
+class TradeFilterState(StatesGroup):
+    entering_value = State()
+
+
 class PriceAlertState(StatesGroup):
     enter_symbol = State()
     waiting_price = State()
@@ -737,7 +880,7 @@ def display_pa_mode(mode: str, pct: float | None) -> str:
     return f"Приближение ±{(pct or 0.3):.1f}%"
 
 
-async def save_price_alert(msg: types.Message, state: FSMContext) -> None:
+async def save_price_alert(msg: types.Message, state: FSMContext, uid: int | None = None) -> None:
     data = await state.get_data()
     tid = data.get("pa_trade_id")
     symbol = data.get("pa_symbol")
@@ -746,17 +889,20 @@ async def save_price_alert(msg: types.Message, state: FSMContext) -> None:
     mode = data["pa_mode"]
     direction = data.get("pa_direction", "both")
     near_pct = data.get("pa_near_pct")
-    uid = msg.from_user.id
+    manual_flag = data.get("pa_manual")
+    uid = uid if uid is not None else msg.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
         if aid:
             conn.execute(
                 "UPDATE price_alerts SET price=?, direction=?, mode=?, near_pct=?, triggered=0 WHERE id=?",
                 (price, direction, mode, near_pct, aid),
             )
+            manual_val = manual_flag
         else:
+            manual_val = manual_flag if manual_flag is not None else (1 if symbol and not tid else 0)
             conn.execute(
-                "INSERT INTO price_alerts(user_id, trade_id, symbol, price, direction, mode, near_pct, manual) VALUES (?,?,?,?,?,?,?,?)",
-                (uid, tid, symbol, price, direction, mode, near_pct, 1 if symbol and not tid else 0),
+                "INSERT INTO price_alerts(user_id, trade_id, symbol, price, direction, mode, near_pct, manual) VALUES (?,?,?,?,?, ?,?,?)",
+                (uid, tid, symbol, price, direction, mode, near_pct, manual_val),
             )
         conn.commit()
     await msg.answer("✅ Уведомление сохранено.")
@@ -1141,6 +1287,7 @@ def save_imported_trade(uid: int, pos: dict) -> int:
 
 def process_spot_history(uid: int, orders: list[dict]) -> None:
     stable = {"USDT", "USDC"}
+    min_usd = get_spot_threshold(uid)
     orders = sorted(orders, key=lambda o: int(o.get("execTime", 0)))
     for o in orders:
         sym = o.get("symbol", "")
@@ -1152,12 +1299,15 @@ def process_spot_history(uid: int, orders: list[dict]) -> None:
         side = o.get("side")
         price = float(o.get("avgPrice") or o.get("execPrice") or 0)
         qty = float(o.get("size") or o.get("execQty") or 0)
+        usd_val = price * qty
         ts = o.get("execTime")
         dt = (
             datetime.fromtimestamp(int(ts) / 1000).strftime("%Y-%m-%d")
             if ts
             else datetime.now().strftime("%Y-%m-%d")
         )
+        if side == "Buy" and usd_val < min_usd:
+            continue
         if side == "Buy":
             with sqlite3.connect(DB_PATH) as conn:
                 cur = conn.cursor()
@@ -1324,11 +1474,13 @@ async def sync_spot_balances(
     api_key: str,
     api_secret: str,
     balances: list[tuple[str, float, float]],
+    min_usd: float,
 ) -> None:
     """Ensure trades table reflects spot balances."""
     stable = {"USDT", "USDC"}
     now = datetime.now().strftime("%Y-%m-%d")
-    balance_map = {c: (amt, usd) for c, amt, usd in balances if amt > 0}
+    # Skip tiny holdings below user-defined threshold to avoid clutter
+    balance_map = {c: (amt, usd) for c, amt, usd in balances if amt > 0 and usd >= min_usd}
     for coin, (amt, usd) in balance_map.items():
         if coin in stable:
             continue
@@ -1861,6 +2013,8 @@ def build_auto_report(uid: int, days: int) -> str:
 
 
 async def process_notifications(uid: int) -> None:
+    if uid is None or uid == BOT_ID:
+        return
     now = datetime.now()
     with sqlite3.connect(DB_PATH) as conn:
         rows = conn.execute(
@@ -1974,15 +2128,33 @@ async def process_notifications(uid: int) -> None:
             text += f"\nТип: {display_pa_mode(mode, npct)}"
             try:
                 await bot.send_message(uid, text)
-            except Exception:
-                pass
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("DELETE FROM price_alerts WHERE id=?", (aid,))
-                conn.commit()
+            except Exception as e:
+                logger.error(
+                    "alert send failed user=%s symbol=%s target=%s mode=%s: %s",
+                    uid,
+                    sym,
+                    target,
+                    mode,
+                    e,
+                )
+            else:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("DELETE FROM price_alerts WHERE id=?", (aid,))
+                    conn.commit()
+                logger.info(
+                    "alert sent user=%s symbol=%s target=%s mode=%s",
+                    uid,
+                    sym,
+                    target,
+                    mode,
+                )
 
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE price_alerts SET manual=1 WHERE trade_id IS NULL AND (manual IS NULL OR manual=0)"
+        )
         man_rows = conn.execute(
-            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1",
+            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND trade_id IS NULL AND manual=1",
             (uid,),
         ).fetchall()
     for aid, sym, target, mode, npct in man_rows:
@@ -2001,11 +2173,26 @@ async def process_notifications(uid: int) -> None:
             text += f"\nТип: {display_pa_mode(mode, npct)}"
             try:
                 await bot.send_message(uid, text)
-            except Exception:
-                pass
-            with sqlite3.connect(DB_PATH) as conn:
-                conn.execute("DELETE FROM price_alerts WHERE id=?", (aid,))
-                conn.commit()
+            except Exception as e:
+                logger.error(
+                    "manual alert send failed user=%s symbol=%s target=%s mode=%s: %s",
+                    uid,
+                    sym,
+                    target,
+                    mode,
+                    e,
+                )
+            else:
+                with sqlite3.connect(DB_PATH) as conn:
+                    conn.execute("DELETE FROM price_alerts WHERE id=?", (aid,))
+                    conn.commit()
+                logger.info(
+                    "manual alert sent user=%s symbol=%s target=%s mode=%s",
+                    uid,
+                    sym,
+                    target,
+                    mode,
+                )
 
 
 async def show_reminders_menu(uid: int, message: types.Message) -> None:
@@ -2048,6 +2235,10 @@ async def show_reminders_menu(uid: int, message: types.Message) -> None:
 
 async def show_notifications_menu(uid: int, message: types.Message) -> None:
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE price_alerts SET manual=1 WHERE trade_id IS NULL AND COALESCE(manual,0) != 1"
+        )
+        conn.commit()
         rows = conn.execute(
             """
             SELECT t.id, t.symbol, t.trade_type, t.leverage, t.notifications_enabled,
@@ -2058,7 +2249,7 @@ async def show_notifications_menu(uid: int, message: types.Message) -> None:
             (uid,),
         ).fetchall()
         manual_cnt = conn.execute(
-            "SELECT COUNT(*) FROM price_alerts WHERE user_id=? AND manual=1",
+            "SELECT COUNT(*) FROM price_alerts WHERE user_id=? AND trade_id IS NULL AND manual=1",
             (uid,),
         ).fetchone()[0]
         prefs = conn.execute(
@@ -2118,8 +2309,12 @@ async def notif_pref_stag(cb: types.CallbackQuery):
 
 async def show_manual_alerts(uid: int, message: types.Message) -> None:
     with sqlite3.connect(DB_PATH) as conn:
+        conn.execute(
+            "UPDATE price_alerts SET manual=1 WHERE trade_id IS NULL AND COALESCE(manual,0) != 1"
+        )
+        conn.commit()
         rows = conn.execute(
-            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND manual=1 ORDER BY id",
+            "SELECT id, symbol, price, mode, near_pct FROM price_alerts WHERE user_id=? AND trade_id IS NULL AND manual=1 ORDER BY id",
             (uid,),
         ).fetchall()
 
@@ -2255,7 +2450,8 @@ async def run_auto_update(uid: int) -> bool:
     ok_bal, balinfo = await fetch_bybit_balance(uid, api_key, api_secret, acc_type)
     if ok_bal:
         _, _, bal_details = balinfo
-        await sync_spot_balances(uid, api_key, api_secret, bal_details)
+        min_usd = get_spot_threshold(uid)
+        await sync_spot_balances(uid, api_key, api_secret, bal_details, min_usd)
     if ok_spot and spot_orders:
         process_spot_history(uid, spot_orders)
     if ok_pos:
@@ -2341,6 +2537,11 @@ async def report_scheduler():
 async def notification_scheduler():
     while True:
         with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                "DELETE FROM price_alerts WHERE user_id IS NULL OR user_id=?",
+                (BOT_ID,),
+            )
+            conn.commit()
             uids = {
                 row[0]
                 for row in conn.execute(
@@ -2356,9 +2557,11 @@ async def notification_scheduler():
             uids.update(
                 row[0]
                 for row in conn.execute(
-                    "SELECT DISTINCT user_id FROM price_alerts WHERE manual=1"
+                    "SELECT DISTINCT user_id FROM price_alerts WHERE trade_id IS NULL AND manual=1"
                 ).fetchall()
             )
+        uids.discard(None)
+        uids.discard(BOT_ID)
         for uid in uids:
             await process_notifications(uid)
         await asyncio.sleep(60)
@@ -2409,6 +2612,76 @@ def main_menu_kb(uid: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def pro_menu_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🤖 Автотрейдинг", callback_data="pro_autotrade")],
+            [InlineKeyboardButton(text="🧠 CryptoLens AI", callback_data="pro_ai")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")],
+        ]
+    )
+
+
+def pro_autotrade_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="🔧 Стратегия", callback_data="pro_auto_strategy")],
+            [InlineKeyboardButton(text="📊 Уровень риска", callback_data="pro_auto_risk")],
+            [InlineKeyboardButton(text="⏰ Выбор таймфрейма анализа", callback_data="pro_auto_tf")],
+            [InlineKeyboardButton(text="🔀 Режим сделок", callback_data="pro_auto_mode")],
+            [
+                InlineKeyboardButton(
+                    text="💼 Макс. кол-во сделок одновременно",
+                    callback_data="pro_auto_max",
+                )
+            ],
+            [InlineKeyboardButton(text="📈 Список активных сделок", callback_data="pro_auto_list")],
+            [InlineKeyboardButton(text="❌ Остановить автотрейдинг", callback_data="pro_auto_stop")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="pro_menu")],
+        ]
+    )
+
+
+TRADE_MODE_OPTIONS = [
+    ("trade_mode_long", "🔼 Только лонги", "long"),
+    ("trade_mode_short", "🔽 Только шорты", "short"),
+    ("trade_mode_both", "🔁 И лонги, и шорты", "both"),
+    ("trade_mode_trend", "📈 По тренду", "trend"),
+]
+TRADE_MODE_CALLBACKS = {cb: mode for cb, _text, mode in TRADE_MODE_OPTIONS}
+
+
+def trade_mode_kb(uid: int) -> InlineKeyboardMarkup:
+    current = get_trade_mode(uid)
+    rows = [
+        [
+            InlineKeyboardButton(
+                text=("✅ " if current == mode else "") + label,
+                callback_data=cb,
+            )
+        ]
+        for cb, label, mode in TRADE_MODE_OPTIONS
+    ]
+    rows.append([InlineKeyboardButton(text="🔙 Назад", callback_data="pro_autotrade")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def pro_ai_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="📊 Проанализировать монету", callback_data="pro_ai_analyze")],
+            [InlineKeyboardButton(text="📷 Отправить скрин графика", callback_data="pro_ai_screenshot")],
+            [InlineKeyboardButton(text="📂 История анализов", callback_data="pro_ai_history")],
+            [InlineKeyboardButton(text="⚙️ Настройки анализа", callback_data="pro_ai_settings")],
+            [InlineKeyboardButton(text="🔙 Назад", callback_data="pro_menu")],
+        ]
+    )
+
+
+async def send_pro_menu(uid: int) -> None:
+    await bot.send_message(uid, "Главное меню Pro-функций:", reply_markup=pro_menu_kb())
+
+
 def trades_menu_kb() -> InlineKeyboardMarkup:
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -2454,7 +2727,7 @@ def reports_menu_kb() -> InlineKeyboardMarkup:
 
 def optimization_menu_kb(uid: int) -> InlineKeyboardMarkup:
     auto_text = (
-        "🟢⚙️ Автоматизация [вкл]" if is_automation_enabled(uid) else "🔴⚙️ Автоматизация [выкл]"
+        "🟢⚙️Автоматизация [вкл]" if is_automation_enabled(uid) else "🔴⚙️Автоматизация [выкл]"
     )
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -2466,9 +2739,14 @@ def optimization_menu_kb(uid: int) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(text="🛠️ Авторасчёт стопов", callback_data="opt_stops"),
                 InlineKeyboardButton(text="📬 Уведомления", callback_data="opt_notify"),
             ],
-            [InlineKeyboardButton(text=auto_text, callback_data="opt_toggle")],
-            [InlineKeyboardButton(text="⏱ Автообновление", callback_data="auto_sync")],
-            [InlineKeyboardButton(text="🤖 Автотрейдинг", callback_data="opt_autotrade")],
+            [
+                InlineKeyboardButton(text=auto_text, callback_data="opt_toggle"),
+                InlineKeyboardButton(
+                    text="⚙️Настройки фильтра сделок", callback_data="opt_filter"
+                ),
+            ],
+            [InlineKeyboardButton(text="⏱️Автообновление", callback_data="auto_sync")],
+            [InlineKeyboardButton(text="🤖 Автотрейдинг", callback_data="pro_entry")],
             [InlineKeyboardButton(text="🔙 Назад", callback_data="main_menu")],
         ]
     )
@@ -2669,6 +2947,7 @@ async def go_home(user_id: int, state: FSMContext):
 # ---------- COMMON ----------
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
+    await message.answer(DISCLAIMER_TEXT)
     await go_home(message.from_user.id, state)
 
 @dp.message(F.text.in_({"меню", "Меню", "/menu", "🏠"}))
@@ -2679,6 +2958,82 @@ async def cmd_menu(message: types.Message, state: FSMContext):
 async def cb_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     await go_home(cb.from_user.id, state)
+
+
+PRO_AUTO_PLACEHOLDERS = {
+    "pro_auto_strategy",
+    "pro_auto_risk",
+    "pro_auto_tf",
+    "pro_auto_max",
+    "pro_auto_list",
+    "pro_auto_stop",
+}
+
+PRO_AI_PLACEHOLDERS = {
+    "pro_ai_analyze",
+    "pro_ai_screenshot",
+    "pro_ai_history",
+    "pro_ai_settings",
+}
+
+
+@dp.callback_query(F.data == "pro_entry")
+async def pro_entry(cb: types.CallbackQuery):
+    await cb.answer()
+    if get_subscription(cb.from_user.id) != "pro":
+        await cb.message.answer(
+            "🚫 Доступно только в Pro-версии.\nОформите подписку или активируйте промокод для доступа."
+        )
+        return
+    await send_pro_menu(cb.from_user.id)
+
+
+@dp.callback_query(F.data == "pro_menu")
+async def pro_menu_cb(cb: types.CallbackQuery):
+    await cb.answer()
+    await send_pro_menu(cb.from_user.id)
+
+
+@dp.callback_query(F.data == "pro_autotrade")
+async def pro_autotrade_cb(cb: types.CallbackQuery):
+    await cb.answer()
+    await bot.send_message(
+        cb.from_user.id, "Меню «Автотрейдинг»:", reply_markup=pro_autotrade_kb()
+    )
+
+
+@dp.callback_query(F.data == "pro_auto_mode")
+async def pro_auto_mode_cb(cb: types.CallbackQuery):
+    await cb.answer()
+    await cb.message.answer("Выберите режим сделок:", reply_markup=trade_mode_kb(cb.from_user.id))
+
+
+@dp.callback_query(F.data.in_(TRADE_MODE_CALLBACKS.keys()))
+async def pro_auto_mode_set(cb: types.CallbackQuery):
+    mode = TRADE_MODE_CALLBACKS[cb.data]
+    set_trade_mode(cb.from_user.id, mode)
+    await cb.answer("Режим сохранён")
+    await cb.message.edit_reply_markup(trade_mode_kb(cb.from_user.id))
+
+
+@dp.callback_query(F.data == "pro_ai")
+async def pro_ai_cb(cb: types.CallbackQuery):
+    await cb.answer()
+    await bot.send_message(
+        cb.from_user.id, "Меню «CryptoLens AI»:", reply_markup=pro_ai_kb()
+    )
+
+
+@dp.callback_query(F.data.in_(PRO_AUTO_PLACEHOLDERS))
+async def pro_auto_placeholder(cb: types.CallbackQuery):
+    await cb.answer()
+    await cb.message.answer("🔧 Функция в разработке.")
+
+
+@dp.callback_query(F.data.in_(PRO_AI_PLACEHOLDERS))
+async def pro_ai_placeholder(cb: types.CallbackQuery):
+    await cb.answer()
+    await cb.message.answer("🛠️ Функция в разработке.")
 
 
 async def build_profile_text(uid: int, include_balance: bool = False) -> str:
@@ -2873,6 +3228,15 @@ async def send_text_guides(cb: types.CallbackQuery):
     await cb.answer()
     if not await require_subscription(cb.message, cb.from_user.id):
         return
+    await bot.send_message(
+        cb.from_user.id,
+        "📚 Это текстовые гайды по функциям бота в разных подписках.",
+    )
+    await bot.send_document(
+        cb.from_user.id,
+        FSInputFile("Как подключить bybit к боту.docx"),
+        caption="📎 Как подключить Bybit к боту",
+    )
     await bot.send_document(
         cb.from_user.id,
         FSInputFile("Подписка Free.docx"),
@@ -2882,10 +3246,6 @@ async def send_text_guides(cb: types.CallbackQuery):
         cb.from_user.id,
         FSInputFile("Подписка Basic.docx"),
         caption="📄 Гайд по Basic-подписке",
-    )
-    await bot.send_message(
-        cb.from_user.id,
-        "📚 Это текстовые гайды по функциям бота в разных подписках.",
     )
 
 
@@ -5477,7 +5837,7 @@ async def notif_choose_mode(cb: types.CallbackQuery, state: FSMContext):
                 [InlineKeyboardButton(text="🔙 Назад", callback_data="opt_notify")],
             ]
         )
-        await cb.message.answer("Насколько близко уведомлять?", reply_markup=with_back(kb))
+        await cb.message.answer("Выберите порог приближения:", reply_markup=with_back(kb))
         await state.set_state(NotifyState.choose_near)
     else:
         await present_notif_summary(cb.message, state)
@@ -5908,7 +6268,8 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
     bal_details: list[tuple[str, float, float]] = []
     if ok_bal:
         _, _, bal_details = balinfo
-        await sync_spot_balances(uid, row[0], row[1], bal_details)
+        min_usd = get_spot_threshold(uid)
+        await sync_spot_balances(uid, row[0], row[1], bal_details, min_usd)
     if ok_spot and spot_orders:
         process_spot_history(uid, spot_orders)
     if ok_pos:
@@ -5956,12 +6317,72 @@ async def opt_bybit(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.answer("Выбери сделку для импорта:", reply_markup=kb)
 
 
-@dp.callback_query(F.data == "opt_autotrade")
-async def optimization_stub(cb: types.CallbackQuery):
+
+@dp.callback_query(F.data == "opt_filter")
+async def trade_filter_menu(cb: types.CallbackQuery):
     await cb.answer()
-    if not await require_pro(cb.message, cb.from_user.id):
+    if not await require_basic(cb.message, cb.from_user.id):
         return
-    await cb.message.answer("🔒 Функция в разработке. Следи за обновлениями!")
+    uid = cb.from_user.id
+    cur_val = get_spot_threshold(uid)
+    buttons = [
+        [
+            InlineKeyboardButton(text="1$", callback_data="tfilter_1"),
+            InlineKeyboardButton(text="5$", callback_data="tfilter_5"),
+            InlineKeyboardButton(text="10$", callback_data="tfilter_10"),
+        ],
+        [InlineKeyboardButton(text="✏ Ввести вручную", callback_data="tfilter_custom")],
+        [InlineKeyboardButton(text="🔙 Назад", callback_data="optimization")],
+    ]
+    kb = with_back(InlineKeyboardMarkup(inline_keyboard=buttons))
+    await cb.message.answer(
+        f"Минимальная сумма сделки (USD). Текущий порог: ${cur_val:.2f}",
+        reply_markup=kb,
+    )
+
+
+@dp.callback_query(lambda c: c.data in {"tfilter_1", "tfilter_5", "tfilter_10"})
+async def trade_filter_set(cb: types.CallbackQuery):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    value = float(cb.data.split("_")[1])
+    set_spot_threshold(cb.from_user.id, value)
+    await cb.message.answer(f"✅ Порог установлен: ${value:.2f}")
+    await cb.message.answer("🔧 Оптимизация:", reply_markup=optimization_menu_kb(cb.from_user.id))
+
+
+@dp.callback_query(F.data == "tfilter_custom")
+async def trade_filter_custom(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_filter")]]
+    )
+    await cb.message.answer("Введи минимальную сумму в USD:", reply_markup=with_back(kb))
+    await state.set_state(TradeFilterState.entering_value)
+
+
+@dp.message(TradeFilterState.entering_value)
+async def trade_filter_save(msg: types.Message, state: FSMContext):
+    if not await require_basic(msg, msg.from_user.id):
+        return
+    txt = msg.text.strip().replace(",", ".")
+    try:
+        value = float(txt)
+    except ValueError:
+        await msg.answer("❌ Неверное значение. Введи число.")
+        return
+    if value <= 0:
+        await msg.answer("❌ Значение должно быть больше 0.")
+        return
+    set_spot_threshold(msg.from_user.id, value)
+    await state.clear()
+    await msg.answer(f"✅ Порог установлен: ${value:.2f}")
+    await msg.answer(
+        "🔧 Оптимизация:", reply_markup=optimization_menu_kb(msg.from_user.id)
+    )
 
 
 @dp.callback_query(F.data == "opt_stops")
@@ -6088,30 +6509,203 @@ async def ai_menu(cb: types.CallbackQuery, state: FSMContext):
     await cb.message.answer("Что тебя интересует?", reply_markup=with_back(kb))
 
 
-@dp.callback_query(F.data == "ai_coin")
-async def ai_coin_prompt(cb: types.CallbackQuery, state: FSMContext):
-    await cb.answer()
-    if not await require_basic(cb.message, cb.from_user.id):
-        return
-    await cb.message.answer("Введи тикер монеты (например, BTC):")
-    await state.set_state(AICoinState.enter_symbol)
+async def analyze_chart_image(
+    message: types.Message,
+) -> tuple[Optional[str], bool, Optional["Image.Image"]]:
+    """Attempt to recognize ticker and presence of numeric values.
+
+    Returns ``(ticker, has_numbers, image)`` where ``ticker`` is the detected
+    symbol (``None`` if not found), ``has_numbers`` indicates whether any digits
+    were spotted, and ``image`` is the loaded Pillow object for further visual
+    analysis.  This remains a lightweight placeholder until proper CV/AI logic
+    is implemented.
+    """
+
+    try:
+        from PIL import Image, ImageOps
+    except Exception:
+        return None, False, None
+
+    try:
+        import pytesseract  # optional
+        tesseract_ok = bool(pytesseract.get_tesseract_version())
+    except Exception:
+        pytesseract = None
+        tesseract_ok = False
+
+    file = await bot.get_file(message.photo[-1].file_id)
+    buf = BytesIO()
+    await bot.download_file(file.file_path, buf)
+    buf.seek(0)
+    try:
+        img = Image.open(buf).convert("RGB")
+    except Exception:
+        return None, False, None
+
+    gray = ImageOps.grayscale(img)
+    inv = ImageOps.invert(gray)
+    width, height = img.size
+    header = ImageOps.autocontrast(inv.crop((0, 0, width, int(height * 0.25))))
+    full = ImageOps.autocontrast(inv)
+
+    ticker = None
+    has_numbers = False
+    if tesseract_ok:
+        cfg = "--psm 6 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789/-."
+        text_header = pytesseract.image_to_string(header, config=cfg)
+        text_full = text_header + "\n" + pytesseract.image_to_string(full, config=cfg)
+        has_numbers = bool(re.search(r"\d", text_full))
+
+        pattern = r"[A-Z0-9]{2,}(?:[./-][A-Z0-9]{2,})?(?:\s*-\s*[A-Z0-9]{2,})?"
+        ticker_match = re.search(pattern, text_header)
+        if not ticker_match:
+            ticker_match = re.search(pattern, text_full)
+        if ticker_match:
+            ticker = ticker_match.group(0).replace(" ", "")
+
+    return ticker, has_numbers, img
 
 
-@dp.message(AICoinState.enter_symbol)
-async def ai_coin_analyze(msg: types.Message, state: FSMContext):
-    raw = (msg.text or "").strip().upper()
-    base = _base_from_symbol(raw)
+async def _visual_chart_analysis(img) -> tuple[str, Optional[BytesIO]]:
+    """Crude visual study of candles/volumes with optional price-axis parsing.
+
+    Returns ``(text, image_buf)`` where ``image_buf`` is a BytesIO containing
+    the annotated chart or ``None`` on failure.
+    """
+    try:
+        from PIL import ImageOps, ImageDraw, ImageFont
+        try:
+            import pytesseract  # optional
+        except Exception:
+            pytesseract = None
+
+        width, height = img.size
+        chart_top = int(height * 0.1)
+        chart_bottom = int(height * 0.8)
+        chart = img.crop((0, chart_top, width, chart_bottom))
+        volume = img.crop((0, chart_bottom, width, height))
+
+        # ----- trend & candle colours -----
+        small = chart.resize((200, 200)).convert("RGB")
+        red = green = 0
+        for r, g, b in small.getdata():
+            if g > r + 40 and g > b + 40:
+                green += 1
+            elif r > g + 40 and r > b + 40:
+                red += 1
+        if green > red:
+            trend = "восходящий"
+            candle_desc = "преобладают бычьи свечи"
+        elif red > green:
+            trend = "нисходящий"
+            candle_desc = "преобладает медвежий импульс"
+        else:
+            trend = "боковой"
+            candle_desc = "наблюдается консолидация"
+
+        # ----- support / resistance positions -----
+        gray = np.array(chart.convert("L"))
+        mask = gray < 200  # assume dark pixels form candles
+        rows = np.where(mask.any(axis=1))[0]
+        if rows.size:
+            slice_mask = mask[rows[0] : rows[-1] + 1]
+            counts = slice_mask.sum(axis=1)
+            smooth = np.convolve(counts, np.ones(5) / 5, mode="same")
+            n = len(smooth)
+            top_slice = smooth[: int(n * 0.4)]
+            bottom_slice = smooth[int(n * 0.6) :]
+            res_row = int(top_slice.argmax()) if top_slice.size else 0
+            sup_row = int(bottom_slice.argmax()) + int(n * 0.6) if bottom_slice.size else n - 1
+            resistance_ratio = (rows[0] + res_row) / gray.shape[0]
+            support_ratio = (rows[0] + sup_row) / gray.shape[0]
+        else:
+            resistance_ratio = 0.2
+            support_ratio = 0.8
+
+        # Try to read price axis on the right for numeric levels
+        price_numbers: list[float] = []
+        if pytesseract:
+            axis = chart.crop((int(width * 0.85), 0, width, chart.height))
+            axis = ImageOps.autocontrast(axis)
+            txt = pytesseract.image_to_string(
+                axis,
+                config="--psm 6 -c tessedit_char_whitelist=0123456789.,",
+            )
+            for n in re.findall(r"\d+(?:[.,]\d+)?", txt):
+                try:
+                    price_numbers.append(float(n.replace(",", ".")))
+                except ValueError:
+                    continue
+
+        if len(price_numbers) >= 2:
+            high = max(price_numbers)
+            low = min(price_numbers)
+            span = high - low if high > low else 1
+            resistance_val = high - resistance_ratio * span
+            support_val = high - support_ratio * span
+            support_desc = f"в районе ${fmt_price(support_val)}"
+            resistance_desc = f"в районе ${fmt_price(resistance_val)}"
+            numeric_levels = True
+        else:
+            support_desc = "визуально в нижней части"
+            resistance_desc = "визуально в верхней части"
+            numeric_levels = False
+
+        # ----- volumes -----
+        vol_gray = np.array(volume.convert("L"))
+        vol_mask = vol_gray < 200
+        col_heights = vol_mask.sum(axis=0)
+        avg_h = col_heights.mean() if col_heights.size else 0
+        last_h = col_heights[-1] if col_heights.size else 0
+        if avg_h == 0:
+            volume_desc = "объёмы не распознаны"
+        elif last_h > avg_h * 1.5:
+            volume_desc = "присутствует локальный всплеск на последних барах"
+        elif vol_mask.sum() / vol_mask.size < 0.1:
+            volume_desc = "объёмы низкие"
+        else:
+            volume_desc = "объёмы стабильные"
+
+        pattern_desc = "ярко выраженных паттернов не обнаружено"
+        analysis = (
+            "📉 Визуальный анализ графика:\n\n"
+            f"— Глобальный тренд: {trend}\n"
+            f"— Поддержка: {support_desc}\n"
+            f"— Сопротивление: {resistance_desc}\n"
+            f"— Объёмы: {volume_desc}\n"
+            f"— Свечи: {candle_desc}\n"
+            f"— Паттерны: {pattern_desc}"
+        )
+
+        # ----- annotate image -----
+        draw = ImageDraw.Draw(img)
+        chart_h = chart_bottom - chart_top
+        res_y = chart_top + resistance_ratio * chart_h
+        sup_y = chart_top + support_ratio * chart_h
+        draw.line([(0, res_y), (width, res_y)], fill="red", width=2)
+        draw.line([(0, sup_y), (width, sup_y)], fill="green", width=2)
+        font = ImageFont.load_default()
+        if numeric_levels:
+            draw.text((5, res_y - 10), f"R {fmt_price(resistance_val)}", fill="red", font=font)
+            draw.text((5, sup_y - 10), f"S {fmt_price(support_val)}", fill="green", font=font)
+        else:
+            draw.text((5, res_y - 10), "Resistance", fill="red", font=font)
+            draw.text((5, sup_y - 10), "Support", fill="green", font=font)
+
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        buf.seek(0)
+        return analysis, buf
+    except Exception:
+        return "⚠️ Не удалось выполнить визуальный анализ.", None
+
+
+async def _run_ai_coin_analysis(
+    msg: types.Message, base: str, price: float, warning: Optional[str] = None
+) -> None:
     kb = InlineKeyboardMarkup(
         inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
     )
-    price = await fetch_price(base)
-    if price is None:
-        await msg.answer(
-            f"❌ Монета {base} не найдена. Убедитесь, что она торгуется на Bybit и введите корректный тикер.",
-            reply_markup=with_back(kb),
-        )
-        await state.clear()
-        return
     await msg.answer("💬 Идёт анализ…")
     async with ChatActionSender.typing(bot, msg.chat.id):
         vol_line, vol_note, vol_short = await _volume_24h(base)
@@ -6131,7 +6725,10 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
             )
         vol_block = "\n".join(filter(None, [vol_line, vol_note]))
         price_line = f"💰 Текущая цена: {fmt_price(price)}"
-        trend_block = price_line + "\n\n" + trend_text
+        trend_block = ""
+        if warning:
+            trend_block += warning + "\n\n"
+        trend_block += price_line + "\n\n" + trend_text
         if vol_block:
             trend_block += f"\n\n{vol_block}"
         trend_block += f"\n\n{rec_block}\n{verdict_line}"
@@ -6143,6 +6740,59 @@ async def ai_coin_analyze(msg: types.Message, state: FSMContext):
         await msg.answer(trend_block + "\n\n" + advice, reply_markup=with_back(kb))
         if supports and resistances:
             await _send_sr_charts(msg.chat.id, base, entry=price)
+
+
+@dp.callback_query(F.data == "ai_coin")
+async def ai_coin_prompt(cb: types.CallbackQuery, state: FSMContext):
+    await cb.answer()
+    if not await require_basic(cb.message, cb.from_user.id):
+        return
+    await cb.message.answer("✏️ Введите тикер монеты (например, BTC)")
+    await state.set_state(AICoinState.enter_symbol)
+
+
+@dp.message(AICoinState.enter_symbol, F.text)
+async def ai_coin_analyze_text(msg: types.Message, state: FSMContext):
+    raw = (msg.text or "").strip().upper()
+    base = _base_from_symbol(raw)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
+    )
+    price = await fetch_price(base)
+    if price is None:
+        await msg.answer(
+            f"❌ Монета {base} не найдена. Убедитесь, что она торгуется на Bybit и введите корректный тикер.",
+            reply_markup=with_back(kb),
+        )
+        await state.clear()
+        return
+    await _run_ai_coin_analysis(msg, base, price)
+    await state.clear()
+
+
+@dp.message(AICoinState.enter_symbol, F.photo)
+async def ai_coin_analyze_photo(msg: types.Message, state: FSMContext):
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[[InlineKeyboardButton(text="🔙 Назад", callback_data="opt_ai")]]
+    )
+    base, has_numbers, img = await analyze_chart_image(msg)
+    analysis, annotated = (
+        await _visual_chart_analysis(img) if img else ("⚠️ Не удалось выполнить визуальный анализ.", None)
+    )
+    parts = []
+    if not has_numbers:
+        parts.append(
+            "❗ Внимание: на изображении отсутствуют числовые значения (цены или объёмы). Анализ выполнен с возможной неточностью."
+        )
+    if base:
+        parts.append(f"Тикер: {base.strip().upper()}")
+    parts.append(analysis)
+    await msg.answer("\n\n".join(parts), reply_markup=with_back(kb))
+    if annotated:
+        await msg.answer_photo(
+            BufferedInputFile(annotated.getvalue(), filename="chart.png"),
+            reply_markup=with_back(kb),
+        )
     await state.clear()
 
 
@@ -6544,8 +7194,8 @@ async def pa_manual_add(cb: types.CallbackQuery, state: FSMContext):
     await cb.answer()
     if not await require_basic(cb.message, cb.from_user.id):
         return
-    await state.update_data(pa_trade_id=None, pa_edit_id=None, pa_symbol=None)
-    await cb.message.answer("Введи тикер (например BTC):")
+    await state.update_data(pa_trade_id=None, pa_edit_id=None, pa_symbol=None, pa_manual=1)
+    await cb.message.answer("Введите тикер (например BTC):")
     await state.set_state(PriceAlertState.enter_symbol)
 
 
@@ -6558,12 +7208,10 @@ async def pa_manual_symbol(msg: types.Message, state: FSMContext):
         return
     price = await fetch_price(base)
     if price is None:
-        await msg.answer(
-            f"Монета {base} не найдена. Убедитесь, что она торгуется на Bybit и введите корректный тикер."
-        )
+        await msg.answer("❌ Такого тикера не найдено на Bybit.")
         return
     await state.update_data(pa_symbol=base)
-    await msg.answer("Введи цену для уведомления:")
+    await msg.answer("Введите цену, при достижении которой нужно прислать уведомление:")
     await state.set_state(PriceAlertState.waiting_price)
 
 
@@ -6574,12 +7222,12 @@ async def pa_edit(cb: types.CallbackQuery, state: FSMContext):
         return
     aid = int(cb.data.split("_")[2])
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT trade_id, price, symbol FROM price_alerts WHERE id=?", (aid,)).fetchone()
+        row = conn.execute("SELECT trade_id, price, symbol, manual FROM price_alerts WHERE id=?", (aid,)).fetchone()
     if not row:
         await cb.message.answer("Уведомление не найдено.")
         return
-    tid, price, sym = row
-    await state.update_data(pa_trade_id=tid, pa_edit_id=aid, pa_symbol=sym)
+    tid, price, sym, manual = row
+    await state.update_data(pa_trade_id=tid, pa_edit_id=aid, pa_symbol=sym, pa_manual=manual)
     await cb.message.answer(f"Текущая цена: {price}\nВведи новую цену:")
     await state.set_state(PriceAlertState.waiting_price)
 
@@ -6591,14 +7239,14 @@ async def pa_del(cb: types.CallbackQuery):
         return
     aid = int(cb.data.split("_")[2])
     with sqlite3.connect(DB_PATH) as conn:
-        row = conn.execute("SELECT trade_id, user_id FROM price_alerts WHERE id=?", (aid,)).fetchone()
+        row = conn.execute("SELECT trade_id, user_id, manual FROM price_alerts WHERE id=?", (aid,)).fetchone()
         if row:
             conn.execute("DELETE FROM price_alerts WHERE id=?", (aid,))
             conn.commit()
     if not row:
         await cb.message.answer("Уведомление не найдено.")
         return
-    tid = row[0]
+    tid, _, _ = row
     await cb.message.answer("🗑 Уведомление удалено.")
     if tid:
         await send_notif_config(cb.message, cb.from_user.id, tid)
@@ -6613,7 +7261,10 @@ async def pa_manual_disable_all(cb: types.CallbackQuery):
         return
     uid = cb.from_user.id
     with sqlite3.connect(DB_PATH) as conn:
-        conn.execute("DELETE FROM price_alerts WHERE user_id=? AND manual=1", (uid,))
+        conn.execute(
+            "DELETE FROM price_alerts WHERE user_id=? AND manual=1",
+            (uid,),
+        )
         conn.commit()
     await cb.message.answer("🔕 Вне-сделочные уведомления отключены.")
     await show_manual_alerts(uid, cb.message)
@@ -6659,7 +7310,7 @@ async def pa_mode_cb(cb: types.CallbackQuery, state: FSMContext):
         await cb.message.answer("Насколько близко уведомлять?", reply_markup=with_back(kb))
         await state.set_state(PriceAlertState.choose_sensitivity)
     else:
-        await save_price_alert(cb.message, state)
+        await save_price_alert(cb.message, state, cb.from_user.id)
 
 
 @dp.callback_query(PriceAlertState.choose_sensitivity)
@@ -6671,7 +7322,7 @@ async def pa_sens_cb(cb: types.CallbackQuery, state: FSMContext):
     else:
         pct = float(cb.data.split("_")[2])
         await state.update_data(pa_near_pct=pct)
-        await save_price_alert(cb.message, state)
+        await save_price_alert(cb.message, state, cb.from_user.id)
 
 
 @dp.message(PriceAlertState.enter_custom)
